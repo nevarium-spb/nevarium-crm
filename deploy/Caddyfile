@@ -1,0 +1,16 @@
+# Замените example.ru на ваш домен — Caddy сам получит HTTPS-сертификат.
+example.ru {
+	encode gzip
+
+	# API → Node
+	handle /api/* {
+		reverse_proxy app:3001
+	}
+
+	# SPA: статика + rewrite на index.html для /crm/*, /start и прочих маршрутов
+	handle {
+		root * /srv/dist
+		try_files {path} /index.html
+		file_server
+	}
+}

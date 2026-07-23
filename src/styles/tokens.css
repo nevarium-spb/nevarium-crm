@@ -1,0 +1,48 @@
+:root {
+  /* Палитра «Невариум Лаб ИИ» — синяя гамма фирменного знака */
+  --bg-0: #070a14;
+  --bg-1: #0b0f1e;
+  --bg-2: #111730;
+  --text-1: #f2f4ff;
+  --text-2: #aab1cc;
+  --text-3: #6f7794;
+  --accent-1: #2f6bff; /* фиолетовый */
+  --accent-2: #22d3ee; /* циан */
+  --accent-3: #f472b6; /* розовый */
+  --gradient-accent: linear-gradient(135deg, var(--accent-1), var(--accent-2));
+  --gradient-text: linear-gradient(100deg, #9cc3ff 0%, #2f6bff 35%, #22d3ee 100%);
+
+  /* Поверхности */
+  --glass-bg: rgba(255, 255, 255, 0.045);
+  --glass-bg-strong: rgba(13, 18, 38, 0.82);
+  --glass-border: rgba(255, 255, 255, 0.1);
+  --glass-blur: 16px;
+  --tile-glow-violet: radial-gradient(120% 90% at 15% 0%, rgba(47, 107, 255, 0.16), transparent 60%);
+  --tile-glow-cyan: radial-gradient(120% 90% at 85% 0%, rgba(34, 211, 238, 0.13), transparent 60%);
+  --tile-glow-pink: radial-gradient(120% 90% at 50% 100%, rgba(244, 114, 182, 0.12), transparent 60%);
+
+  /* Типографика: Unbounded — заголовки, Golos Text — текст */
+  --font-display: 'Unbounded', system-ui, sans-serif;
+  --font-body: 'Golos Text', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --fs-giant: clamp(2.4rem, 1.1rem + 5.6vw, 5.4rem);
+  --fs-h1: clamp(1.9rem, 1.1rem + 3.2vw, 3.4rem);
+  --fs-h2: clamp(1.4rem, 1rem + 1.9vw, 2.3rem);
+  --fs-h3: clamp(1.05rem, 0.95rem + 0.55vw, 1.3rem);
+  --fs-body: clamp(0.98rem, 0.94rem + 0.18vw, 1.06rem);
+  --fs-small: 0.87rem;
+  --fs-index: clamp(4.5rem, 3rem + 7vw, 9rem); /* контурные номера секций */
+
+  /* Ритм и форма */
+  --space-1: 0.5rem;
+  --space-2: 1rem;
+  --space-3: 1.5rem;
+  --space-4: 2.5rem;
+  --space-5: 4rem;
+  --space-6: 7rem;
+  --container: 1200px;
+  --radius: 14px;      /* основная форма v2 — скруглённый прямоугольник */
+  --radius-l: 22px;
+  --radius-pill: 999px; /* только для нав-капсулы и чипов */
+
+  --transition: 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}

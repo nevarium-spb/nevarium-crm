@@ -1,0 +1,342 @@
+// @vitest-environment node
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { buildApp } from './app.js'
+import { hashPassword, resetThrottle } from './auth.js'
+import { now } from './db.js'
+import { leadMessage, startOutboxWorker } from './telegram.js'
+
+let app, cookie
+
+async function login(email = 'a@a.ru', password = 'password123') {
+  const res = await app.inject({ method: 'POST', url: '/api/auth/login', payload: { email, password } })
+  return res
+}
+
+beforeEach(async () => {
+  resetThrottle()
+  app = buildApp({ secure: false })
+  app.db
+    .prepare('INSERT INTO users (name,email,password_hash,role,created_at) VALUES (?,?,?,?,?)')
+    .run('Админ', 'a@a.ru', await hashPassword('password123'), 'admin', now())
+  await app.ready()
+  cookie = (await login()).headers['set-cookie']
+})
+
+afterEach(() => app.close())
+
+describe('auth', () => {
+  it('логин выдаёт cookie, /me работает, logout сбрасывает', async () => {
+    const me = await app.inject({ method: 'GET', url: '/api/auth/me', headers: { cookie } })
+    expect(me.statusCode).toBe(200)
+    expect(JSON.parse(me.body).email).toBe('a@a.ru')
+    const out = await app.inject({ method: 'POST', url: '/api/auth/logout', headers: { cookie } })
+    expect(out.headers['set-cookie']).toMatch(/nv_session=;/)
+  })
+
+  it('verifyToken отклоняет подделку, просрочку и мусор', async () => {
+    const { signToken, verifyToken } = await import('./auth.js')
+    const good = signToken({ uid: 1, tokenVersion: 0 }, 'secret-a')
+    expect(verifyToken(good, 'secret-a')).toMatchObject({ uid: 1 })
+    expect(verifyToken(good, 'secret-b')).toBeNull() // чужой секрет
+    const [payload] = good.split('.')
+    expect(verifyToken(`${payload}.forged`, 'secret-a')).toBeNull()
+    const expired = signToken({ uid: 1, tokenVersion: 0 }, 'secret-a', -1)
+    expect(verifyToken(expired, 'secret-a')).toBeNull()
+    expect(verifyToken('мусор', 'secret-a')).toBeNull()
+    expect(verifyToken(null, 'secret-a')).toBeNull()
+  })
+
+  it('неверный пароль → 401 с обезличенной ошибкой', async () => {
+    const res = await login('a@a.ru', 'wrong-password')
+    expect(res.statusCode).toBe(401)
+    expect(JSON.parse(res.body).error).toBe('invalid_credentials')
+  })
+
+  it('троттлинг: после 5 неудач — 429', async () => {
+    for (let i = 0; i < 5; i++) await login('a@a.ru', 'wrong-password')
+    const res = await login('a@a.ru', 'wrong-password')
+    expect(res.statusCode).toBe(429)
+  })
+
+  it('без cookie /api/crm/* → 401', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/crm/contacts' })
+    expect(res.statusCode).toBe(401)
+  })
+
+  it('смена пароля инвалидирует старую сессию (tokenVersion)', async () => {
+    await app.inject({ method: 'PATCH', url: '/api/crm/users/1', payload: { password: 'newpassword1' }, headers: { cookie } })
+    const me = await app.inject({ method: 'GET', url: '/api/auth/me', headers: { cookie } })
+    expect(me.statusCode).toBe(401)
+  })
+
+  it('Origin за прокси сверяется с X-Forwarded-Host', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/crm/contacts',
+      payload: { name: 'Прокси' },
+      headers: { cookie, origin: 'http://localhost:58959', host: 'localhost:3001', 'x-forwarded-host': 'localhost:58959' },
+    })
+    expect(res.statusCode).toBe(200)
+  })
+
+  it('чужой Origin на мутации → 403', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/crm/contacts',
+      payload: { name: 'X' },
+      headers: { cookie, origin: 'https://evil.example', host: 'crm.nevarium.ru' },
+    })
+    expect(res.statusCode).toBe(403)
+  })
+})
+
+describe('CRUD + конфликты', () => {
+  it('создание контакта и сделки, перевод в терминальный этап ставит closed_at', async () => {
+    const c = await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+    expect(c.statusCode).toBe(200)
+    const d = await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'Пилот', amount: 5000 }, headers: { cookie } })
+    expect(d.statusCode).toBe(200)
+    const paid = await app.inject({ method: 'PATCH', url: '/api/crm/deals/1', payload: { stage: 'Оплачено' }, headers: { cookie } })
+    expect(JSON.parse(paid.body).item.closed_at).toBeTruthy()
+    const back = await app.inject({ method: 'PATCH', url: '/api/crm/deals/1', payload: { stage: 'Переговоры' }, headers: { cookie } })
+    expect(JSON.parse(back.body).item.closed_at).toBeNull()
+  })
+
+  it('устаревший expectedUpdatedAt → 409 с актуальной записью', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+    const res = await app.inject({ method: 'PATCH', url: '/api/crm/contacts/1', payload: { note: 'x', expectedUpdatedAt: 'stale' }, headers: { cookie } })
+    expect(res.statusCode).toBe(409)
+    expect(JSON.parse(res.body).current.name).toBe('Иванов')
+  })
+
+  it('контакт со сделками не удаляется (архив), без сделок — удаляется', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'Пилот' }, headers: { cookie } })
+    const blocked = await app.inject({ method: 'DELETE', url: '/api/crm/contacts/1', headers: { cookie } })
+    expect(blocked.statusCode).toBe(409)
+    await app.inject({ method: 'DELETE', url: '/api/crm/deals/1', headers: { cookie } })
+    const ok = await app.inject({ method: 'DELETE', url: '/api/crm/contacts/1', headers: { cookie } })
+    expect(ok.statusCode).toBe(200)
+  })
+
+  it('дубликат по телефону/email даёт предупреждение', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов', phone: '+7 999' }, headers: { cookie } })
+    const dup = await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Другой', phone: '+7 999' }, headers: { cookie } })
+    expect(JSON.parse(dup.body).duplicateOf?.name).toBe('Иванов')
+  })
+
+  it('неверный этап отклоняется', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'X' }, headers: { cookie } })
+    const res = await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'X', stage: 'Выдумка' }, headers: { cookie } })
+    expect(res.statusCode).toBe(400)
+  })
+
+  it('сделка на несуществующий контакт → 400, а не 500', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 999, title: 'X' }, headers: { cookie } })
+    expect(res.statusCode).toBe(400)
+    expect(JSON.parse(res.body).error).toBe('bad_reference')
+  })
+
+  it('нечисловой id → 400, а не 500', async () => {
+    const res = await app.inject({ method: 'PATCH', url: '/api/crm/contacts/abc', payload: { note: 'x' }, headers: { cookie } })
+    expect(res.statusCode).toBe(400)
+    const del = await app.inject({ method: 'DELETE', url: '/api/crm/contacts/abc', headers: { cookie } })
+    expect(del.statusCode).toBe(400)
+  })
+})
+
+describe('приём лидов', () => {
+  it('форма: контакт + сделка «Новый», Telegram в outbox', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/leads', payload: { task: 'внедрение ИИ', scale: 'отдел', name: 'Марина', contact: 'm@x.ru', note: 'срочно', source: 'start-wizard' } })
+    expect(res.statusCode).toBe(204)
+    const contact = app.db.prepare('SELECT * FROM contacts WHERE id = 1').get()
+    expect(contact).toMatchObject({ name: 'Марина', email: 'm@x.ru', source: 'site-form', suspicious: 0 })
+    const deal = app.db.prepare('SELECT * FROM deals WHERE id = 1').get()
+    expect(deal.title).toContain('внедрение ИИ')
+    expect(deal.stage).toBe('Новый')
+    expect(app.db.prepare("SELECT COUNT(*) c FROM outbox WHERE kind = 'lead' AND sent_at IS NULL").get().c).toBe(1)
+  })
+
+  it('чат: detail → заметка сделки, handle → messenger и имя', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/leads', payload: { task: 'чат-бот', detail: 'для клиники', contact: '@tg_user', source: 'chat' } })
+    expect(res.statusCode).toBe(204)
+    const contact = app.db.prepare('SELECT * FROM contacts WHERE id = 1').get()
+    expect(contact).toMatchObject({ name: '@tg_user', messenger: '@tg_user', source: 'site-chat' })
+    expect(app.db.prepare('SELECT note FROM deals WHERE id = 1').get().note).toBe('для клиники')
+  })
+
+  it('honeypot принимается, но помечается подозрительным', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Бот', contact: 'bot@x.ru', website: 'spam.com' } })
+    expect(res.statusCode).toBe(204)
+    expect(app.db.prepare('SELECT suspicious FROM contacts WHERE id = 1').get().suspicious).toBe(1)
+  })
+
+  it('rate limit не отбрасывает: 5-й лид с одного IP — подозрительный', async () => {
+    for (let i = 0; i < 5; i++) {
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: `Гость ${i}`, contact: `g${i}@x.ru` }, remoteAddress: '10.1.1.1' })
+    }
+    expect(app.db.prepare('SELECT COUNT(*) c FROM contacts').get().c).toBe(5)
+    expect(app.db.prepare('SELECT suspicious FROM contacts WHERE id = 5').get().suspicious).toBe(1)
+  })
+
+  it('пустой лид отбрасывается без записи', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: {} })
+    expect(app.db.prepare('SELECT COUNT(*) c FROM contacts').get().c).toBe(0)
+  })
+})
+
+describe('outbox: лид не теряется при падении Telegram', () => {
+  it('ошибка отправки увеличивает attempts, успех ставит sent_at', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru' } })
+    let calls = 0
+    const failingSend = async () => {
+      calls++
+      if (calls === 1) throw new Error('Telegram down')
+    }
+    const worker = startOutboxWorker(app.db, { intervalMs: 10_000_000, send: failingSend, log: { warn() {} }, autoStart: false })
+    worker.stop()
+    await worker.tick()
+    let row = app.db.prepare('SELECT * FROM outbox WHERE id = 1').get()
+    expect(row.attempts).toBe(1)
+    expect(row.sent_at).toBeNull()
+    await worker.tick()
+    row = app.db.prepare('SELECT * FROM outbox WHERE id = 1').get()
+    expect(row.sent_at).toBeTruthy()
+  })
+
+  it('после 20 попыток запись не берётся в обработку (мёртвая, видна в очереди)', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru' } })
+    app.db.prepare('UPDATE outbox SET attempts = 20 WHERE id = 1').run()
+    let calls = 0
+    const worker = startOutboxWorker(app.db, { send: async () => { calls++ }, log: { warn() {} }, autoStart: false })
+    worker.stop()
+    await worker.tick()
+    expect(calls).toBe(0)
+    expect(app.db.prepare('SELECT sent_at FROM outbox WHERE id = 1').get().sent_at).toBeNull()
+  })
+
+  it('leadMessage экранирует HTML', () => {
+    expect(leadMessage({ name: '<script>', title: 'a & b' })).toContain('&lt;script&gt;')
+  })
+})
+
+describe('экспорт / импорт / CSV', () => {
+  it('раунд-трип: экспорт → wipe → импорт', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов', phone: '+7 999' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'Пилот', amount: 777 }, headers: { cookie } })
+    const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+    expect(dump.contacts).toHaveLength(1)
+    const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })
+    expect(res.statusCode).toBe(200)
+    expect(app.db.prepare('SELECT name FROM contacts WHERE id = 1').get().name).toBe('Иванов')
+    expect(app.db.prepare('SELECT amount FROM deals WHERE id = 1').get().amount).toBe(777)
+  })
+
+  it('битый файл отклоняется атомарно', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Живой' }, headers: { cookie } })
+    const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload: { version: 1, contacts: [{ nonsense: true }] }, headers: { cookie } })
+    expect(res.statusCode).toBe(400)
+    // старые данные не тронуты
+    expect(app.db.prepare('SELECT COUNT(*) c FROM contacts').get().c).toBe(1)
+  })
+
+  it('файл новее версии приложения отклоняется', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload: { version: 99, contacts: [] }, headers: { cookie } })
+    expect(JSON.parse(res.body).error).toBe('newer_version')
+  })
+
+  it('импорт с чужеродным именем колонки отклоняется (не SQL-инъекция)', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Живой' }, headers: { cookie } })
+    const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload: { version: 1, contacts: [{ 'name) VALUES (1); DROP TABLE contacts; --': 'x', name: 'Злой' }] }, headers: { cookie } })
+    expect(res.statusCode).toBe(400)
+    expect(app.db.prepare('SELECT COUNT(*) c FROM contacts').get().c).toBe(1)
+  })
+
+  it('CSV нейтрализует формулы из публичных лидов (=/+/-/@)', async () => {
+    // имя приходит с публичного endpoint — Excel исполнил бы =HYPERLINK(...)
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: '=HYPERLINK("http://evil")', contact: 'e@x.ru' } })
+    const csv = (await app.inject({ method: 'GET', url: '/api/crm/contacts.csv', headers: { cookie } })).body
+    expect(csv).toContain("'=HYPERLINK")
+    expect(csv).not.toMatch(/(^|;|")=HYPERLINK/)
+  })
+
+  it('демо-данные исключены из экспорта; CSV экранирует кавычки и точки с запятой', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/demo-seed', headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'ООО "Ромашка"; и точка' }, headers: { cookie } })
+    const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+    expect(dump.contacts).toHaveLength(1)
+    const csv = (await app.inject({ method: 'GET', url: '/api/crm/contacts.csv', headers: { cookie } })).body
+    expect(csv).toContain('"ООО ""Ромашка""; и точка"')
+    // демо-контактов в CSV нет
+    expect(csv).not.toContain('Балтика')
+  })
+
+  it('очистка демо удаляет только помеченные записи', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/demo-seed', headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Настоящий' }, headers: { cookie } })
+    await app.inject({ method: 'DELETE', url: '/api/crm/demo', headers: { cookie } })
+    const rows = app.db.prepare('SELECT name FROM contacts').all()
+    expect(rows).toHaveLength(1)
+    expect(rows[0].name).toBe('Настоящий')
+  })
+})
+
+describe('дашборд', () => {
+  it('воронка считает только открытые, терминальные отдельно, просрочка по МСК', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'A', amount: 100, stage: 'Переговоры' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'B', amount: 200 }, headers: { cookie } })
+    await app.inject({ method: 'PATCH', url: '/api/crm/deals/2', payload: { stage: 'Оплачено' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/tasks', payload: { title: 'Просроченная', contact_id: 1, due_date: '2020-01-01' }, headers: { cookie } })
+    const dash = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/dashboard', headers: { cookie } })).body)
+    expect(dash.funnel.find((f) => f.stage === 'Переговоры').sum).toBe(100)
+    expect(dash.funnel.some((f) => f.stage === 'Оплачено')).toBe(false)
+    expect(dash.terminal.find((t) => t.stage === 'Оплачено').sum).toBe(200)
+    expect(dash.counts.overdue).toBe(1)
+    expect(dash.tasksToday[0].title).toBe('Просроченная')
+  })
+
+  it('граница суток считается по Москве, а не по UTC', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'X' }, headers: { cookie } })
+    // задача на 2026-07-10; момент времени 2026-07-09 22:00 UTC = уже 2026-07-10 01:00 МСК
+    await app.inject({ method: 'POST', url: '/api/crm/tasks', payload: { title: 'Сегодня по МСК', contact_id: 1, due_date: '2026-07-10' }, headers: { cookie } })
+    const nowMs = Date.parse('2026-07-09T22:00:00Z')
+    const dash = JSON.parse((await app.inject({ method: 'GET', url: `/api/crm/dashboard?_now=${nowMs}`, headers: { cookie } })).body)
+    expect(dash.today).toBe('2026-07-10')
+    expect(dash.tasksToday.some((t) => t.title === 'Сегодня по МСК')).toBe(true)
+  })
+
+  it('экспорт и CSV доступны только админу', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/users', payload: { name: 'Мария', email: 'm@a.ru', password: 'password123', role: 'member' }, headers: { cookie } })
+    const memberCookie = (await login('m@a.ru', 'password123')).headers['set-cookie']
+    expect((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie: memberCookie } })).statusCode).toBe(403)
+    expect((await app.inject({ method: 'GET', url: '/api/crm/contacts.csv', headers: { cookie: memberCookie } })).statusCode).toBe(403)
+    expect((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).statusCode).toBe(200)
+  })
+})
+
+describe('пользователи', () => {
+  it('не-админ не управляет пользователями (create/patch/delete)', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/users', payload: { name: 'Мария', email: 'm@a.ru', password: 'password123', role: 'member' }, headers: { cookie } })
+    const memberCookie = (await login('m@a.ru', 'password123')).headers['set-cookie']
+    const create = await app.inject({ method: 'POST', url: '/api/crm/users', payload: { name: 'X', email: 'x@a.ru', password: 'password123' }, headers: { cookie: memberCookie } })
+    expect(create.statusCode).toBe(403)
+    const patch = await app.inject({ method: 'PATCH', url: '/api/crm/users/1', payload: { password: 'newpassword1' }, headers: { cookie: memberCookie } })
+    expect(patch.statusCode).toBe(403)
+    const del = await app.inject({ method: 'DELETE', url: '/api/crm/users/1', headers: { cookie: memberCookie } })
+    expect(del.statusCode).toBe(403)
+  })
+
+  it('удаление пользователя закрывает его сессии', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/users', payload: { name: 'Мария', email: 'm@a.ru', password: 'password123' }, headers: { cookie } })
+    const memberCookie = (await login('m@a.ru', 'password123')).headers['set-cookie']
+    await app.inject({ method: 'DELETE', url: '/api/crm/users/2', headers: { cookie } })
+    const res = await app.inject({ method: 'GET', url: '/api/crm/contacts', headers: { cookie: memberCookie } })
+    expect(res.statusCode).toBe(401)
+  })
+
+  it('нельзя удалить себя', async () => {
+    const res = await app.inject({ method: 'DELETE', url: '/api/crm/users/1', headers: { cookie } })
+    expect(res.statusCode).toBe(400)
+  })
+})
