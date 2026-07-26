@@ -108,12 +108,31 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   // ---------- generic CRUD ----------
   const ENTITIES = {
     contacts: {
-      fields: ['name', 'company', 'phone', 'email', 'messenger', 'note', 'source', 'suspicious', 'archived'],
+      fields: ['name', 'company', 'phone', 'email', 'messenger', 'note', 'source', 'suspicious', 'archived', 'project_id'],
       required: ['name'],
     },
-    deals: { fields: ['contact_id', 'title', 'stage', 'amount', 'note'], required: ['contact_id', 'title'] },
+    deals: { fields: ['contact_id', 'title', 'stage', 'amount', 'note', 'project_id'], required: ['contact_id', 'title'] },
     tasks: { fields: ['title', 'contact_id', 'deal_id', 'due_date', 'done'], required: ['title'] },
     interactions: { fields: ['contact_id', 'deal_id', 'type', 'note', 'happened_at'], required: ['contact_id'] },
+  }
+
+  // Проект есть только у сущностей-носителей заявки; задачи и взаимодействия
+  // наследуют его через контакт — иначе появился бы второй источник правды.
+  const PROJECT_SCOPED = new Set(['contacts', 'deals'])
+
+  /**
+   * Проект по slug («nevarium1») или числовому id.
+   * null — фильтр не запрошен; undefined — запрошен несуществующий проект (→ 400).
+   */
+  function resolveProjectId(value) {
+    const raw = trim(value, 100)
+    if (!raw || raw === 'all') return null
+    const asId = Number(raw)
+    const row =
+      Number.isInteger(asId) && asId > 0
+        ? db.prepare('SELECT id FROM projects WHERE id = ?').get(asId)
+        : db.prepare('SELECT id FROM projects WHERE slug = ?').get(raw)
+    return row ? row.id : undefined
   }
 
   function pick(body, spec) {
@@ -126,9 +145,16 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   }
 
   for (const [name, spec] of Object.entries(ENTITIES)) {
-    app.get(`/api/crm/${name}`, async (req) => {
+    app.get(`/api/crm/${name}`, async (req, reply) => {
       const q = trim(req.query?.q, 100).toLowerCase()
-      let rows = db.prepare(`SELECT * FROM ${name} ORDER BY updated_at DESC LIMIT ${LIST_SCAN_LIMIT}`).all()
+      const projectId = resolveProjectId(req.query?.project)
+      if (projectId === undefined) return reply.code(400).send({ error: 'unknown_project' })
+      const scoped = projectId !== null && PROJECT_SCOPED.has(name)
+      let rows = db
+        .prepare(
+          `SELECT * FROM ${name} ${scoped ? 'WHERE project_id = ?' : ''} ORDER BY updated_at DESC LIMIT ${LIST_SCAN_LIMIT}`
+        )
+        .all(...(scoped ? [projectId] : []))
       if (q && name === 'contacts')
         rows = rows.filter((r) => [r.name, r.company, r.phone, r.email, r.messenger].join(' ').toLowerCase().includes(q))
       return { items: rows.slice(0, LIST_PAGE_SIZE), total: rows.length }
@@ -138,6 +164,17 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       const data = pick(req.body ?? {}, spec)
       for (const f of spec.required) if (!data[f]) return reply.code(400).send({ error: `field_required`, field: f })
       if (name === 'deals' && data.stage && !STAGES.includes(data.stage)) return reply.code(400).send({ error: 'bad_stage' })
+      if (PROJECT_SCOPED.has(name)) {
+        if (data.project_id !== undefined) {
+          const pid = resolveProjectId(data.project_id)
+          if (!pid) return reply.code(400).send({ error: 'bad_project' })
+          data.project_id = pid
+        } else if (name === 'deals') {
+          // сделка наследует проект своего контакта — чтобы они не разъехались
+          const owner = db.prepare('SELECT project_id FROM contacts WHERE id = ?').get(data.contact_id)
+          if (owner) data.project_id = owner.project_id
+        }
+      }
       if (name === 'interactions') data.happened_at = data.happened_at || now()
       const ts = now()
       // предупреждение о дубликате контакта по телефону/email
@@ -177,6 +214,11 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
         if (!STAGES.includes(data.stage)) return reply.code(400).send({ error: 'bad_stage' })
         data.closed_at = TERMINAL_STAGES.includes(data.stage) ? now() : null
       }
+      if (PROJECT_SCOPED.has(name) && data.project_id !== undefined) {
+        const pid = resolveProjectId(data.project_id)
+        if (!pid) return reply.code(400).send({ error: 'bad_project' })
+        data.project_id = pid
+      }
       if (name === 'tasks' && data.done !== undefined) data.done_at = data.done ? now() : null
       const cols = Object.keys(data)
       if (!cols.length) return { item: existing }
@@ -215,6 +257,13 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       interactions: db.prepare('SELECT * FROM interactions WHERE contact_id = ? ORDER BY happened_at DESC LIMIT 200').all(id),
     }
   })
+
+  // ---------- проекты ----------
+  // Только чтение: проекты заводятся миграцией. Удаление через API не даём —
+  // осиротевшие контакты выпали бы из отфильтрованного инбокса.
+  app.get('/api/crm/projects', async () => ({
+    items: db.prepare('SELECT id, slug, display_name, archived FROM projects WHERE archived = 0 ORDER BY id').all(),
+  }))
 
   // ---------- dashboard (один агрегирующий запрос, время МСК) ----------
   app.get('/api/crm/dashboard', async (req) => {
@@ -355,18 +404,22 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   // ---------- демо-данные ----------
   app.post('/api/crm/demo-seed', async (req) => {
     const ts = now()
+    const LAB = 1
+    const VIZOR = 2
     const seed = db.transaction(() => {
       const c = (name, company, extra = {}) =>
-        db.prepare("INSERT INTO contacts (name, company, phone, email, source, demo, created_at, updated_at, created_by) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)")
-          .run(name, company, extra.phone ?? '', extra.email ?? '', extra.source ?? 'manual', ts, ts, req.user.id).lastInsertRowid
+        db.prepare("INSERT INTO contacts (name, company, phone, email, source, project_id, demo, created_at, updated_at, created_by) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)")
+          .run(name, company, extra.phone ?? '', extra.email ?? '', extra.source ?? 'manual', extra.project ?? LAB, ts, ts, req.user.id).lastInsertRowid
       const id1 = c('Марина Соколова', 'ООО «Северный свет»', { phone: '+7 921 555-14-88', source: 'site-form' })
       const id2 = c('Дмитрий Иванов', '«Балтика-Транс»', { email: 'd.ivanov@baltika.ru' })
       const id3 = c('Арсений', '', { source: 'site-chat' })
-      const d = (cid, title, stage, amount) =>
-        db.prepare('INSERT INTO deals (contact_id, title, stage, amount, demo, created_at, updated_at, created_by) VALUES (?, ?, ?, ?, 1, ?, ?, ?)').run(cid, title, stage, amount, ts, ts, req.user.id).lastInsertRowid
+      const id4 = c('Ольга Р.', 'ЖК «Приморский»', { phone: '+7 911 204-77-31', source: 'site-form', project: VIZOR })
+      const d = (cid, title, stage, amount, project = LAB) =>
+        db.prepare('INSERT INTO deals (contact_id, title, stage, amount, project_id, demo, created_at, updated_at, created_by) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)').run(cid, title, stage, amount, project, ts, ts, req.user.id).lastInsertRowid
       d(id1, 'Внедрение ИИ в документооборот', 'Новый', 340000)
       const deal2 = d(id2, 'Пилот: ассистент для логистики', 'Переговоры', 780000)
       d(id3, 'Чат-бот для клиники', 'Контакт', 210000)
+      d(id4, 'Контроль отделки квартиры по фото', 'Новый', 45000, VIZOR)
       db.prepare('INSERT INTO tasks (title, contact_id, deal_id, due_date, demo, created_at, updated_at, created_by) VALUES (?, ?, ?, ?, 1, ?, ?, ?)').run('Позвонить Иванову по пилоту', id2, deal2, mskToday(-1), ts, ts, req.user.id)
       db.prepare('INSERT INTO tasks (title, contact_id, due_date, demo, created_at, updated_at, created_by) VALUES (?, ?, ?, 1, ?, ?, ?)').run('Отправить КП «Северный свет»', id1, mskToday(), ts, ts, req.user.id)
       db.prepare('INSERT INTO interactions (contact_id, deal_id, type, note, happened_at, demo, created_at, updated_at, created_by) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)').run(id2, deal2, 'звонок', 'Обсудили пилот, ждёт КП до пятницы', ts, ts, ts, req.user.id)

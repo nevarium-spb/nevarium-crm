@@ -1,8 +1,12 @@
 // @vitest-environment node
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import Database from 'better-sqlite3'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { buildApp } from './app.js'
 import { hashPassword, resetThrottle } from './auth.js'
-import { now } from './db.js'
+import { MIGRATIONS, now, openDb } from './db.js'
 import { leadMessage, startOutboxWorker } from './telegram.js'
 
 let app, cookie
@@ -338,5 +342,74 @@ describe('пользователи', () => {
   it('нельзя удалить себя', async () => {
     const res = await app.inject({ method: 'DELETE', url: '/api/crm/users/1', headers: { cookie } })
     expect(res.statusCode).toBe(400)
+  })
+})
+
+describe('мультипроектность', () => {
+  it('миграция на существующей базе не теряет данные и проставляет проект по умолчанию', () => {
+    const file = path.join(os.tmpdir(), `nv-migrate-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`)
+    try {
+      // база в состоянии «до мультипроектности»: применяем только v1 и v2
+      const old = new Database(file)
+      old.pragma('foreign_keys = ON')
+      old.exec(MIGRATIONS[0])
+      old.exec(MIGRATIONS[1])
+      old.pragma('user_version = 2')
+      const ts = now()
+      old.prepare('INSERT INTO contacts (name, source, created_at, updated_at) VALUES (?,?,?,?)').run('Старый лид', 'site-form', ts, ts)
+      old.prepare('INSERT INTO deals (contact_id, title, created_at, updated_at) VALUES (?,?,?,?)').run(1, 'Старая сделка', ts, ts)
+      old.close()
+
+      // открываем актуальным кодом — должна догнаться только недостающая миграция
+      const db = openDb(file)
+      expect(db.pragma('user_version', { simple: true })).toBe(MIGRATIONS.length)
+      expect(db.prepare('SELECT name, project_id FROM contacts').get()).toEqual({ name: 'Старый лид', project_id: 1 })
+      expect(db.prepare('SELECT title, project_id FROM deals').get()).toEqual({ title: 'Старая сделка', project_id: 1 })
+      expect(db.prepare('SELECT slug FROM projects ORDER BY id').all().map((p) => p.slug)).toEqual(['nevarium1', 'nevarium-vizor'])
+      db.close()
+    } finally {
+      for (const suffix of ['', '-wal', '-shm']) fs.rmSync(file + suffix, { force: true })
+    }
+  })
+
+  it('список проектов отдаёт оба бизнеса', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/crm/projects', headers: { cookie } })
+    expect(res.statusCode).toBe(200)
+    expect(JSON.parse(res.body).items.map((p) => p.slug)).toEqual(['nevarium1', 'nevarium-vizor'])
+  })
+
+  it('фильтр отдаёт только свой проект, «all» — всё', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Клиент Лаба' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Клиент Визора', project_id: 'nevarium-vizor' }, headers: { cookie } })
+    const vizor = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/contacts?project=nevarium-vizor', headers: { cookie } })).body)
+    expect(vizor.items.map((c) => c.name)).toEqual(['Клиент Визора'])
+    const lab = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/contacts?project=nevarium1', headers: { cookie } })).body)
+    expect(lab.items.map((c) => c.name)).toEqual(['Клиент Лаба'])
+    const all = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/contacts?project=all', headers: { cookie } })).body)
+    expect(all.items).toHaveLength(2)
+  })
+
+  it('неизвестный проект в фильтре — 400, а не тихий показ чужих заявок', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/crm/contacts?project=нет-такого', headers: { cookie } })
+    expect(res.statusCode).toBe(400)
+    expect(JSON.parse(res.body).error).toBe('unknown_project')
+  })
+
+  it('сделка наследует проект своего контакта', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Клиент Визора', project_id: 2 }, headers: { cookie } })
+    const res = await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'Осмотр объекта' }, headers: { cookie } })
+    expect(JSON.parse(res.body).item.project_id).toBe(2)
+  })
+
+  it('несуществующий проект при создании — 400', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'X', project_id: 999 }, headers: { cookie } })
+    expect(res.statusCode).toBe(400)
+    expect(JSON.parse(res.body).error).toBe('bad_project')
+  })
+
+  it('контакт можно перенести в другой проект', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Ошибочно в Лабе' }, headers: { cookie } })
+    const res = await app.inject({ method: 'PATCH', url: '/api/crm/contacts/1', payload: { project_id: 'nevarium-vizor' }, headers: { cookie } })
+    expect(JSON.parse(res.body).item.project_id).toBe(2)
   })
 })

@@ -1,27 +1,32 @@
-# Развёртывание: сайт Невариум + CRM на VPS
+# Развёртывание: Невариум CRM на Timeweb Cloud
 
-Один VPS (~300–500 ₽/мес, 1 ГБ RAM достаточно) хостит и публичный сайт, и CRM, и приём лидов.
+Хостинг — **Timeweb Cloud** (ADR-004 в `docs/DECISIONS.md`): дешевле и проще для одной
+Docker-машины с постоянным диском под SQLite, чем Яндекс.Cloud. Один VPS/Cloud App
+(~450 ₽/мес, 1 ГБ RAM достаточно) хостит бэкенд CRM, приём лидов и фронт CRM (`/crm`).
+Маркетинговые сайты (nevarium1, nevarium_vizor) — отдельные проекты, хостятся отдельно
+(Vercel), сюда только шлют заявки через `POST /api/leads`.
 
 ## Что нужно от вас (один раз)
 
-1. **Домен** — если ещё нет, купите (например, reg.ru).
-2. **VPS в РФ** — Timeweb Cloud / Selectel / beget: Ubuntu 22.04+, 1–2 ГБ RAM, Docker уже установлен или `curl -fsSL https://get.docker.com | sh`.
-3. **Telegram-бот**: напишите @BotFather → `/newbot` → получите токен. Добавьте бота в рабочую группу. Узнайте chat_id группы: добавьте туда @getmyid_bot (он покажет id вида `-100…`) и удалите его.
-4. **DNS**: A-запись домена → IP VPS.
+1. **Аккаунт Timeweb Cloud** — создать самостоятельно (я не создаю аккаунты за вас), timeweb.cloud.
+2. **Домен/поддомен** для CRM (например, `crm.nevarium-lab.ru` — как поддомен уже купленного nevarium-lab.ru, DNS через Ru-Center) или отдельный.
+3. **VPS или Cloud App в Timeweb**: Ubuntu 22.04+, 1–2 ГБ RAM, Docker (на VPS — `curl -fsSL https://get.docker.com | sh`; Cloud Apps ставит сам).
+4. **Telegram-бот**: напишите @BotFather → `/newbot` → получите токен. Добавьте бота в рабочую группу. Узнайте chat_id группы: добавьте туда @getmyid_bot (он покажет id вида `-100…`) и удалите его.
+5. **DNS**: A-запись поддомена → IP VPS (или CNAME, если Cloud Apps даёт свой адрес).
 
 ## Установка (на VPS)
 
 ```bash
-git clone <ваш-репозиторий> nevarium && cd nevarium
+git clone https://github.com/nevarium-spb/nevarium-crm.git && cd nevarium-crm
 
 # 1. Секреты
 cp deploy/.env.example deploy/.env
 nano deploy/.env          # JWT_SECRET (openssl rand -hex 32), TG_BOT_TOKEN, TG_CHAT_ID
 
 # 2. Домен
-nano deploy/Caddyfile     # замените example.ru на ваш домен
+nano deploy/Caddyfile     # замените example.ru на ваш поддомен CRM
 
-# 3. Сборка статики сайта (на VPS или локально с копированием dist/)
+# 3. Сборка фронта CRM (на VPS или локально с копированием dist/)
 docker run --rm -v "$PWD":/app -w /app node:20-alpine sh -c "npm ci --ignore-scripts && npm run build"
 
 # 4. Запуск

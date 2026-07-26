@@ -2,7 +2,8 @@ import Database from 'better-sqlite3'
 export { STAGES, TERMINAL_STAGES } from '../src/shared/stages.js'
 
 // Порядок миграций фиксирован; PRAGMA user_version хранит номер последней применённой.
-const MIGRATIONS = [
+// Экспортируется, чтобы тесты могли поднять базу в состоянии «до миграции».
+export const MIGRATIONS = [
   `
   CREATE TABLE users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,7 +92,33 @@ const MIGRATIONS = [
   CREATE INDEX idx_interactions_updated ON interactions(updated_at);
   CREATE INDEX idx_contacts_inbox ON contacts(source, archived, created_at);
   `,
+  // v3: мультипроектность — заявки разных бизнесов в одном инбоксе.
+  // project_id объявлен NOT NULL DEFAULT 1 БЕЗ REFERENCES намеренно: SQLite запрещает
+  // ADD COLUMN с REFERENCES и ненулевым дефолтом («Cannot add a REFERENCES column with
+  // non-NULL default value»), а nullable-колонка допускала бы заявку без проекта — такая
+  // выпала бы из отфильтрованного инбокса, то есть потерялась. Гарантия «у каждой заявки
+  // есть проект» важнее ссылочной целостности: проекты не удаляются (UI для этого нет).
+  // Существующие строки дефолт проставляет сам — отдельный backfill не нужен.
+  `
+  CREATE TABLE projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    archived INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+  );
+  INSERT INTO projects (id, slug, display_name, created_at) VALUES
+    (1, 'nevarium1', 'Невариум Лаб ИИ', strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    (2, 'nevarium-vizor', 'Невариум Визор', strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+  ALTER TABLE contacts ADD COLUMN project_id INTEGER NOT NULL DEFAULT 1;
+  ALTER TABLE deals ADD COLUMN project_id INTEGER NOT NULL DEFAULT 1;
+  CREATE INDEX idx_contacts_project ON contacts(project_id, archived, created_at);
+  CREATE INDEX idx_deals_project ON deals(project_id, stage);
+  `,
 ]
+
+/** Проект по умолчанию для строк без явной привязки (совпадает с DEFAULT в схеме). */
+export const DEFAULT_PROJECT_ID = 1
 
 export function openDb(file) {
   const db = new Database(file)
