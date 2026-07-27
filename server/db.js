@@ -115,6 +115,17 @@ export const MIGRATIONS = [
   CREATE INDEX idx_contacts_project ON contacts(project_id, archived, created_at);
   CREATE INDEX idx_deals_project ON deals(project_id, stage);
   `,
+  // v4: origins проекта — источники, с которых принимаются заявки.
+  // Один список решает две задачи: CORS-допуск публичного /api/leads и
+  // определение проекта по домену сайта (запасной путь, если форма не
+  // передала project). Через запятую, без слеша на конце, в нижнем регистре.
+  // У Визора пусто: сайт ещё не развёрнут, домен неизвестен — заполнить перед
+  // подключением его форм, иначе браузер заблокирует отправку (CORS).
+  `
+  ALTER TABLE projects ADD COLUMN origins TEXT NOT NULL DEFAULT '';
+  UPDATE projects SET origins = 'https://nevarium-lab.ru,https://www.nevarium-lab.ru,https://nevarium1.vercel.app'
+    WHERE slug = 'nevarium1';
+  `,
 ]
 
 /** Проект по умолчанию для строк без явной привязки (совпадает с DEFAULT в схеме). */

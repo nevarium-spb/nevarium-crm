@@ -20,14 +20,22 @@ export async function sendTelegram(text, env = process.env) {
   if (!res.ok) throw new Error(`Telegram HTTP ${res.status}`)
 }
 
-export function leadMessage(lead) {
+/**
+ * Уведомление о заявке — БЕЗ персональных данных.
+ * Telegram — зарубежный сервис, а имя и телефон клиента по 152-ФЗ должны
+ * оставаться в российском контуре. Поэтому здесь только проект, источник и
+ * ссылка на карточку: сами данные открываются в CRM после входа.
+ * Менять формат — только не возвращая сюда поля клиента.
+ */
+export function leadMessage(lead, env = process.env) {
   const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  const base = String(env.CRM_BASE_URL || '').trim().replace(/\/+$/, '')
+  const link = base && lead.contactId ? `${base}/crm/contacts/${lead.contactId}` : null
   const lines = [
-    `🔵 <b>Новый лид с сайта</b>${lead.suspicious ? ' ⚠️ подозрительный' : ''}`,
-    `<b>${esc(lead.name)}</b>${lead.company ? ` · ${esc(lead.company)}` : ''}`,
-    lead.title ? esc(lead.title) : null,
-    lead.contactInfo ? `Контакт: ${esc(lead.contactInfo)}` : null,
-    lead.note ? esc(lead.note) : null,
+    `🔵 <b>Новая заявка</b>${lead.suspicious ? ' ⚠️ подозрительная' : ''}`,
+    lead.projectName ? `Проект: <b>${esc(lead.projectName)}</b>` : null,
+    lead.source ? `Источник: ${esc(lead.source)}` : null,
+    link ? `Открыть: ${esc(link)}` : 'Детали — в CRM, карточка заявки',
   ]
   return lines.filter(Boolean).join('\n')
 }

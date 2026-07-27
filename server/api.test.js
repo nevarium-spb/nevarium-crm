@@ -187,6 +187,39 @@ describe('приём лидов', () => {
     await app.inject({ method: 'POST', url: '/api/leads', payload: {} })
     expect(app.db.prepare('SELECT COUNT(*) c FROM contacts').get().c).toBe(0)
   })
+
+  it('проект берётся из поля формы — контакт и сделка попадают в него', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Клиент', contact: 'k@x.ru', project: 'nevarium-vizor' } })
+    expect(app.db.prepare('SELECT project_id FROM contacts WHERE id = 1').get().project_id).toBe(2)
+    expect(app.db.prepare('SELECT project_id FROM deals WHERE id = 1').get().project_id).toBe(2)
+  })
+
+  it('без поля формы проект определяется по домену сайта', async () => {
+    app.db.prepare("UPDATE projects SET origins = 'https://vizor.example.ru' WHERE slug = 'nevarium-vizor'").run()
+    await app.inject({
+      method: 'POST',
+      url: '/api/leads',
+      payload: { name: 'Клиент', contact: 'k@x.ru' },
+      headers: { origin: 'https://vizor.example.ru' },
+    })
+    expect(app.db.prepare('SELECT project_id FROM contacts WHERE id = 1').get().project_id).toBe(2)
+  })
+
+  it('неизвестный проект не теряет заявку — уходит в проект по умолчанию', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Клиент', contact: 'k@x.ru', project: 'опечатка' } })
+    expect(res.statusCode).toBe(204)
+    expect(app.db.prepare('SELECT project_id FROM contacts WHERE id = 1').get().project_id).toBe(1)
+  })
+
+  it('CORS: чужой домен не проходит preflight, свой — проходит', async () => {
+    app.db.prepare("UPDATE projects SET origins = 'https://vizor.example.ru' WHERE slug = 'nevarium-vizor'").run()
+    const alien = await app.inject({ method: 'OPTIONS', url: '/api/leads', headers: { origin: 'https://evil.example' } })
+    expect(alien.statusCode).toBe(403)
+    expect(alien.headers['access-control-allow-origin']).toBeUndefined()
+    const ours = await app.inject({ method: 'OPTIONS', url: '/api/leads', headers: { origin: 'https://vizor.example.ru' } })
+    expect(ours.statusCode).toBe(204)
+    expect(ours.headers['access-control-allow-origin']).toBe('https://vizor.example.ru')
+  })
 })
 
 describe('outbox: лид не теряется при падении Telegram', () => {
@@ -220,7 +253,28 @@ describe('outbox: лид не теряется при падении Telegram', 
   })
 
   it('leadMessage экранирует HTML', () => {
-    expect(leadMessage({ name: '<script>', title: 'a & b' })).toContain('&lt;script&gt;')
+    expect(leadMessage({ projectName: '<script>' })).toContain('&lt;script&gt;')
+  })
+
+  it('уведомление не содержит персональных данных, только проект, источник и ссылку', async () => {
+    await app.inject({
+      method: 'POST',
+      url: '/api/leads',
+      payload: { name: 'Марина Соколова', contact: '+7 921 555-14-88', task: 'секретная задача', note: 'подробности' },
+    })
+    const payload = JSON.parse(app.db.prepare('SELECT payload FROM outbox WHERE id = 1').get().payload)
+    // в очереди не остаётся ПДн — она уедет в зарубежный Telegram
+    expect(JSON.stringify(payload)).not.toMatch(/Марина|555-14-88|секретная|подробности/)
+    const text = leadMessage(payload, { CRM_BASE_URL: 'https://crm.example.ru/' })
+    expect(text).not.toMatch(/Марина|555-14-88|секретная|подробности/)
+    expect(text).toContain('Невариум Лаб ИИ')
+    expect(text).toContain('https://crm.example.ru/crm/contacts/1')
+  })
+
+  it('без CRM_BASE_URL уведомление всё равно уходит, просто без ссылки', () => {
+    const text = leadMessage({ projectName: 'Невариум Визор', source: 'форма', contactId: 7 }, {})
+    expect(text).toContain('Невариум Визор')
+    expect(text).not.toContain('http')
   })
 })
 

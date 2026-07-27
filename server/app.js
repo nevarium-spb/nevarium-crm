@@ -1,6 +1,6 @@
 import Fastify from 'fastify'
 import cookie from '@fastify/cookie'
-import { openDb, now, STAGES, TERMINAL_STAGES } from './db.js'
+import { DEFAULT_PROJECT_ID, openDb, now, STAGES, TERMINAL_STAGES } from './db.js'
 import { hashPassword, verifyPassword, signToken, verifyToken, loginThrottle, loginFailed, loginSucceeded, SESSION_TTL_DAYS } from './auth.js'
 import { enqueue } from './telegram.js'
 
@@ -119,6 +119,23 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   // Проект есть только у сущностей-носителей заявки; задачи и взаимодействия
   // наследуют его через контакт — иначе появился бы второй источник правды.
   const PROJECT_SCOPED = new Set(['contacts', 'deals'])
+
+  /** Проект по origin сайта (см. колонку projects.origins). null — не наш домен. */
+  function projectByOrigin(origin) {
+    const o = trim(origin, 200).toLowerCase().replace(/\/+$/, '')
+    if (!o) return null
+    const rows = db.prepare("SELECT id, slug, display_name, origins FROM projects WHERE archived = 0 AND origins != ''").all()
+    return (
+      rows.find((p) =>
+        p.origins
+          .toLowerCase()
+          .split(',')
+          .map((s) => s.trim().replace(/\/+$/, ''))
+          .filter(Boolean)
+          .includes(o)
+      ) || null
+    )
+  }
 
   /**
    * Проект по slug («nevarium1») или числовому id.
@@ -446,7 +463,35 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   }))
 
   // ---------- публичный приём лидов ----------
+  // Единственная точка без авторизации, поэтому CORS ровно для неё и строго по
+  // списку origins проектов (+ localhost в dev). Без этого браузер не даст сайтам
+  // отправить форму на другой домен.
+  function leadOriginAllowed(origin) {
+    const o = trim(origin, 200)
+    if (!o) return false
+    if (!secure && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(o)) return true
+    return Boolean(projectByOrigin(o))
+  }
+
+  function applyLeadCors(req, reply) {
+    reply.header('vary', 'Origin')
+    if (leadOriginAllowed(req.headers.origin)) reply.header('access-control-allow-origin', req.headers.origin)
+  }
+
+  app.options('/api/leads', async (req, reply) => {
+    if (!leadOriginAllowed(req.headers.origin)) return reply.header('vary', 'Origin').code(403).send()
+    return reply
+      .header('vary', 'Origin')
+      .header('access-control-allow-origin', req.headers.origin)
+      .header('access-control-allow-methods', 'POST, OPTIONS')
+      .header('access-control-allow-headers', 'content-type')
+      .header('access-control-max-age', '86400')
+      .code(204)
+      .send()
+  })
+
   app.post('/api/leads', async (req, reply) => {
+    applyLeadCors(req, reply)
     const b = req.body ?? {}
     // honeypot: боты заполняют поле website — принимаем, но помечаем
     const suspicious = Boolean(b.website) || leadSuspicious(req.ip)
@@ -456,18 +501,41 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     const title = isChat ? trim(b.task, 300) || 'Заявка из чата' : [trim(b.task, 200), b.scale ? `масштаб: ${trim(b.scale, 100)}` : ''].filter(Boolean).join(', ') || 'Заявка с сайта'
     const note = isChat ? trim(b.detail, 1000) : trim(b.note, 1000)
     if (!contactInfo && name === 'Без имени') return reply.code(204).send()
+
+    // Проект: явное поле формы → домен сайта → проект по умолчанию.
+    // Заявку не отвергаем никогда: потерянный лид хуже, чем лид не в том проекте —
+    // второе видно в CRM и правится одним кликом, первое не восстановить.
+    const byOrigin = projectByOrigin(req.headers.origin)
+    let projectId = byOrigin ? byOrigin.id : DEFAULT_PROJECT_ID
+    const asked = trim(b.project, 100)
+    if (asked) {
+      const pid = resolveProjectId(asked)
+      if (pid) projectId = pid
+      else app.log?.warn?.({ asked, origin: req.headers.origin }, 'lead: неизвестный проект, беру запасной')
+    }
+
     const ts = now()
     const contactId = db.transaction(() => {
       const isEmail = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(contactInfo)
       const email = isEmail ? contactInfo : ''
       const messenger = isEmail ? '' : contactInfo
-      const cid = db.prepare('INSERT INTO contacts (name, email, messenger, note, source, suspicious, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(name, email, messenger, '', isChat ? 'site-chat' : 'site-form', suspicious ? 1 : 0, ts, ts).lastInsertRowid
-      db.prepare('INSERT INTO deals (contact_id, title, stage, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(cid, title, 'Новый', note, ts, ts)
+      const cid = db.prepare('INSERT INTO contacts (name, email, messenger, note, source, suspicious, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(name, email, messenger, '', isChat ? 'site-chat' : 'site-form', suspicious ? 1 : 0, projectId, ts, ts).lastInsertRowid
+      db.prepare('INSERT INTO deals (contact_id, title, stage, note, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(cid, title, 'Новый', note, projectId, ts, ts)
       return cid
     })()
-    enqueue(db, 'lead', { name, company: '', title, contactInfo, note, suspicious })
-    app.log?.info?.({ contactId, suspicious }, 'lead accepted')
+
+    // В уведомление кладём только обезличенное: проект, источник, ссылку на карточку.
+    // Имя, контакт и текст заявки остаются в CRM на российском сервере — Telegram
+    // зарубежный, и отправка туда ПДн была бы трансграничной передачей (152-ФЗ).
+    const project = db.prepare('SELECT display_name FROM projects WHERE id = ?').get(projectId)
+    enqueue(db, 'lead', {
+      projectName: project?.display_name || '',
+      source: isChat ? 'чат' : 'форма',
+      contactId,
+      suspicious,
+    })
+    app.log?.info?.({ contactId, projectId, suspicious }, 'lead accepted')
     return reply.code(204).send()
   })
 

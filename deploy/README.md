@@ -36,7 +36,27 @@ cd deploy && docker compose up -d --build
 docker compose exec app node server/seed-admin.js
 ```
 
-Проверка: откройте `https://ваш-домен/crm` → логин → дашборд. Отправьте тестовую заявку с `/start` — она должна прийти в Telegram-группу и появиться во «Новых лидах».
+### 6. Домены сайтов, с которых принимаются заявки
+
+Без этого браузер заблокирует отправку формы (CORS), а заявка не определит свой проект.
+Домены хранятся в БД, в колонке `projects.origins` — через запятую, без слеша на конце:
+
+```bash
+docker compose exec app node -e "
+  const { openDb } = await import('./server/db.js');
+  const db = openDb(process.env.DB_FILE || '/data/crm.sqlite');
+  db.prepare(\"UPDATE projects SET origins = ? WHERE slug = ?\")
+    .run('https://nevarium-lab.ru,https://www.nevarium-lab.ru', 'nevarium1');
+  db.prepare(\"UPDATE projects SET origins = ? WHERE slug = ?\")
+    .run('https://домен-визора', 'nevarium-vizor');
+  console.log(db.prepare('SELECT slug, origins FROM projects').all());
+"
+```
+
+У «Невариум Лаб ИИ» домены уже прописаны миграцией; **у Визора пусто — впишите его домен
+перед подключением форм этого сайта.**
+
+Проверка: откройте `https://ваш-домен/crm` → логин → дашборд. Отправьте тестовую заявку с сайта — она должна появиться в «Новых лидах», а в Telegram-группу придёт обезличенное уведомление со ссылкой на карточку (имя и телефон в уведомление не попадают — так требует 152-ФЗ, см. ADR-006).
 
 > **Docker Hub из РФ**: если `docker compose build` не может скачать образы, раскомментируйте зеркало в `deploy/Dockerfile` (mirror.gcr.io) или настройте registry-mirror в `/etc/docker/daemon.json` (huecker.io, dockerhub.timeweb.cloud).
 
