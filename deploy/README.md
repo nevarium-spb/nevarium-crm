@@ -38,23 +38,21 @@ docker compose exec app node server/seed-admin.js
 
 ### 6. Домены сайтов, с которых принимаются заявки
 
-Без этого браузер заблокирует отправку формы (CORS), а заявка не определит свой проект.
-Домены хранятся в БД, в колонке `projects.origins` — через запятую, без слеша на конце:
+Домены обоих проектов уже прописаны миграциями — `nevarium-lab.ru` и `nevarium-vizor.ru`
+(каждый с www), плюс `nevarium1.vercel.app`. Отдельных действий не требуется.
+
+Проверить, что видит сервер:
 
 ```bash
 docker compose exec app node -e "
   const { openDb } = await import('./server/db.js');
   const db = openDb(process.env.DB_FILE || '/data/crm.sqlite');
-  db.prepare(\"UPDATE projects SET origins = ? WHERE slug = ?\")
-    .run('https://nevarium-lab.ru,https://www.nevarium-lab.ru', 'nevarium1');
-  db.prepare(\"UPDATE projects SET origins = ? WHERE slug = ?\")
-    .run('https://домен-визора', 'nevarium-vizor');
   console.log(db.prepare('SELECT slug, origins FROM projects').all());
 "
 ```
 
-У «Невариум Лаб ИИ» домены уже прописаны миграцией; **у Визора пусто — впишите его домен
-перед подключением форм этого сайта.**
+Добавить адрес (например, превью-домен) — дописать через запятую, без слеша на конце.
+**Домена нет в списке → браузер заблокирует отправку формы (CORS), заявка не дойдёт.**
 
 Проверка: откройте `https://ваш-домен/crm` → логин → дашборд. Отправьте тестовую заявку с сайта — она должна появиться в «Новых лидах», а в Telegram-группу придёт обезличенное уведомление со ссылкой на карточку (имя и телефон в уведомление не попадают — так требует 152-ФЗ, см. ADR-006).
 

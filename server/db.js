@@ -126,6 +126,13 @@ export const MIGRATIONS = [
   UPDATE projects SET origins = 'https://nevarium-lab.ru,https://www.nevarium-lab.ru,https://nevarium1.vercel.app'
     WHERE slug = 'nevarium1';
   `,
+  // v5: домен сайта Визора стал известен. Заводим оба варианта — с www и без:
+  // лишний origin безвреден (просто никогда не совпадёт), а недостающий тихо
+  // ломает отправку формы. Если сайт будет ещё и на *.vercel.app — дописать туда же.
+  `
+  UPDATE projects SET origins = 'https://nevarium-vizor.ru,https://www.nevarium-vizor.ru'
+    WHERE slug = 'nevarium-vizor';
+  `,
 ]
 
 /** Проект по умолчанию для строк без явной привязки (совпадает с DEFAULT в схеме). */
