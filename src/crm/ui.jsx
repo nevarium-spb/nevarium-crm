@@ -54,6 +54,9 @@ export function Modal({ title, onClose, children }) {
 }
 
 // ---------- форматирование ----------
+/** Откуда пришёл контакт — человеческие названия для машинных значений source. */
+export const SOURCE_LABEL = { 'site-form': 'сайт', 'site-chat': 'чат Невы', manual: 'вручную', import: 'импорт' }
+
 export const fmtMoney = (n) =>
   n == null ? '— ₽' : `${Number(n).toLocaleString('ru-RU')} ₽`
 

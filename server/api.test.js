@@ -461,6 +461,60 @@ describe('мультипроектность', () => {
     expect(JSON.parse(res.body).error).toBe('bad_project')
   })
 
+  it('дашборд считает только выбранный проект', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Лаб', source: 'site-form' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Визор', source: 'site-form', project_id: 2 }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'Сделка Лаба', amount: 100 }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 2, title: 'Сделка Визора', amount: 700 }, headers: { cookie } })
+
+    const vizor = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/dashboard?project=nevarium-vizor', headers: { cookie } })).body)
+    expect(vizor.counts).toMatchObject({ contacts: 1, deals: 1 })
+    expect(vizor.inbox.map((c) => c.name)).toEqual(['Визор'])
+    expect(vizor.funnel.find((f) => f.stage === 'Новый').sum).toBe(700)
+
+    const all = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/dashboard', headers: { cookie } })).body)
+    expect(all.counts).toMatchObject({ contacts: 2, deals: 2 })
+    expect(all.funnel.find((f) => f.stage === 'Новый').sum).toBe(800)
+  })
+
+  it('задачи фильтруются через контакт, а общие видны в любом проекте', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Лаб' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Визор', project_id: 2 }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/tasks', payload: { title: 'Позвонить в Лаб', contact_id: 1, due_date: '2020-01-01' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/tasks', payload: { title: 'Позвонить в Визор', contact_id: 2, due_date: '2020-01-01' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/tasks', payload: { title: 'Общая задача', due_date: '2020-01-01' }, headers: { cookie } })
+
+    const vizor = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/dashboard?project=nevarium-vizor', headers: { cookie } })).body)
+    // чужая задача скрыта, своя и общая — на месте (пропущенная задача хуже лишней строки)
+    expect(vizor.tasksToday.map((t) => t.title).sort()).toEqual(['Общая задача', 'Позвонить в Визор'])
+    expect(vizor.counts.overdue).toBe(2)
+
+    const lab = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/dashboard?project=nevarium1', headers: { cookie } })).body)
+    expect(lab.tasksToday.map((t) => t.title).sort()).toEqual(['Общая задача', 'Позвонить в Лаб'])
+  })
+
+  it('аналитика: разбивка заявок по проектам и источникам', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'A', contact: 'a@x.ru', project: 'nevarium1' } })
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'B', contact: 'b@x.ru', project: 'nevarium-vizor' } })
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { task: 'из чата', detail: 'подробности', contact: '@tg', source: 'chat', project: 'nevarium-vizor' } })
+
+    const all = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/dashboard', headers: { cookie } })).body)
+    expect(all.stats.days).toBe(30)
+    expect(all.stats.byProject.map((r) => [r.name, r.n])).toEqual([
+      ['Невариум Визор', 2],
+      ['Невариум Лаб ИИ', 1],
+    ])
+    expect(Object.fromEntries(all.stats.bySource.map((r) => [r.source, r.n]))).toEqual({ 'site-form': 2, 'site-chat': 1 })
+
+    const vizor = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/dashboard?project=nevarium-vizor', headers: { cookie } })).body)
+    expect(vizor.stats.byProject.map((r) => r.n)).toEqual([2])
+  })
+
+  it('дашборд с неизвестным проектом — 400', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/crm/dashboard?project=нет-такого', headers: { cookie } })
+    expect(res.statusCode).toBe(400)
+  })
+
   it('контакт можно перенести в другой проект', async () => {
     await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Ошибочно в Лабе' }, headers: { cookie } })
     const res = await app.inject({ method: 'PATCH', url: '/api/crm/contacts/1', payload: { project_id: 'nevarium-vizor' }, headers: { cookie } })

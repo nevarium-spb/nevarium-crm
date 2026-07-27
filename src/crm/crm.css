@@ -516,6 +516,13 @@
 }
 .deal-card .badge.proj { margin-top: 8px; display: inline-block; }
 
+/* аналитика заявок: две колонки на широком экране, одна на узком */
+.stats-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 32px; }
+.stats-cap { color: var(--text-3); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
+@media (max-width: 767px) {
+  .stats-cols { grid-template-columns: 1fr; gap: 18px; }
+}
+
 /* Бейдж проекта — третий в строке, на узких экранах группа должна переноситься,
    иначе крайний («сайт», «чат Невы») уезжает за край и обрезается. */
 .row-badges { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }

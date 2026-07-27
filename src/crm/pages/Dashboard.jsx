@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useOutletContext } from 'react-router-dom'
 import { repo } from '../api.js'
-import { apiErrorToast, fmtMoney, onRefresh, relTime } from '../ui.jsx'
+import { ProjectBadge, ProjectFilter, shortProject, useProjectFilter } from '../projects.jsx'
+import { SOURCE_LABEL, apiErrorToast, fmtMoney, onRefresh, relTime } from '../ui.jsx'
 
 const GREETINGS = [
   [5, 'Доброе утро'],
@@ -19,10 +20,17 @@ function greeting(name) {
 export default function Dashboard() {
   const [data, setData] = useState(null)
   const { user: me } = useOutletContext()
+  const [project, setProject] = useProjectFilter()
 
+  // Нумеруем запросы: медленный ответ по прошлому проекту не должен затереть свежий.
+  const reqId = useRef(0)
   const load = useCallback(() => {
-    repo.dashboard().then(setData).catch(apiErrorToast)
-  }, [])
+    const id = ++reqId.current
+    repo
+      .dashboard({ project })
+      .then((d) => id === reqId.current && setData(d))
+      .catch((e) => id === reqId.current && apiErrorToast(e))
+  }, [project])
 
   useEffect(load, [load])
   useEffect(() => onRefresh(load), [load])
@@ -56,10 +64,21 @@ export default function Dashboard() {
   const maxSum = Math.max(...data.funnel.map((f) => f.sum || 0), 1)
   const totalOpen = data.funnel.reduce((s, f) => s + (f.sum || 0), 0)
 
+  // Подстраховка от рассинхрона версий: во время обновления сервера свежий
+  // фронтенд может пару минут ходить в старый API без stats. Лучше показать
+  // дашборд без блока аналитики, чем белый экран.
+  const stats = data.stats || { days: 0, byProject: [], bySource: [] }
+  const totalLeads = stats.byProject.reduce((s, r) => s + r.n, 0)
+
   return (
     <>
-      <h1 className="crm-h1">{greeting(me?.name)}</h1>
-      <div className="crm-sub">{dayLine}</div>
+      <div className="crm-head">
+        <div>
+          <h1 className="crm-h1">{greeting(me?.name)}</h1>
+          <div className="crm-sub">{dayLine}</div>
+        </div>
+        <ProjectFilter value={project} onChange={setProject} />
+      </div>
       <div className="crm-grid">
         <section className="tile" aria-label="Новые лиды">
           <div className="tile-title"><span className="tile-num">01</span><h2>Новые лиды</h2></div>
@@ -76,7 +95,10 @@ export default function Dashboard() {
                   {lead.deal_title || 'без сделки'} · {lead.source === 'site-chat' ? 'из чата Невы' : 'с сайта'}, {relTime(lead.created_at)}
                 </div>
               </div>
-              <span className={`badge${lead.suspicious ? ' warn' : ''}`}>{lead.suspicious ? 'подозрительный' : 'новый'}</span>
+              <span className="row-badges">
+                <ProjectBadge id={lead.project_id} when={project === 'all'} />
+                <span className={`badge${lead.suspicious ? ' warn' : ''}`}>{lead.suspicious ? 'подозрительный' : 'новый'}</span>
+              </span>
             </div>
           ))}
         </section>
@@ -125,8 +147,44 @@ export default function Dashboard() {
             </div>
           ))}
         </section>
+
+        <section className="tile span2" aria-label="Аналитика заявок">
+          <div className="tile-title">
+            <span className="tile-num">05</span>
+            <h2>Заявки за {stats.days} дней · {totalLeads}</h2>
+          </div>
+          {totalLeads === 0 && <div className="empty">За этот период заявок не было.</div>}
+          {totalLeads > 0 && (
+            <div className="stats-cols">
+              <div>
+                <div className="stats-cap">По проектам</div>
+                {stats.byProject.map((r) => (
+                  <StatRow key={r.id} label={shortProject(r.name)} n={r.n} total={totalLeads} />
+                ))}
+              </div>
+              <div>
+                <div className="stats-cap">Откуда пришли</div>
+                {stats.bySource.map((r) => (
+                  <StatRow key={r.source} label={SOURCE_LABEL[r.source] || r.source} n={r.n} total={totalLeads} />
+                ))}
+              </div>
+            </div>
+          )}
+        </section>
       </div>
     </>
+  )
+}
+
+function StatRow({ label, n, total }) {
+  return (
+    <div className="funnel-row">
+      <span className="funnel-label">{label}</span>
+      <div className="funnel-bar-wrap">
+        <div className="funnel-bar" style={{ width: `${Math.max(4, (n / total) * 100)}%` }} />
+      </div>
+      <span className="funnel-sum">{n}</span>
+    </div>
   )
 }
 

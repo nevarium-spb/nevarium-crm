@@ -282,25 +282,61 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     items: db.prepare('SELECT id, slug, display_name, archived FROM projects WHERE archived = 0 ORDER BY id').all(),
   }))
 
-  // ---------- dashboard (один агрегирующий запрос, время МСК) ----------
-  app.get('/api/crm/dashboard', async (req) => {
+  // ---------- dashboard (агрегаты, время МСК) ----------
+  // Фильтр по проекту прошивается во все запросы. У задач и взаимодействий своего
+  // project_id нет — он берётся через контакт (ADR-005). Задачи без контакта —
+  // общие: показываем их в любом проекте, потому что пропущенная задача хуже
+  // лишней строки в списке.
+  const STATS_DAYS = 30
+
+  app.get('/api/crm/dashboard', async (req, reply) => {
     // _now: только для тестов границы суток МСК; в проде игнорируется
     const nowMs = Number(req.query?._now) || Date.now()
     const today = mskToday(0, nowMs)
+    const pid = resolveProjectId(req.query?.project)
+    if (pid === undefined) return reply.code(400).send({ error: 'unknown_project' })
+    const pf = (sql) => (pid ? sql : '') // фрагмент включается только при фильтре
+    const arg = pid ? [pid] : []
+    const since = new Date(nowMs - STATS_DAYS * 864e5).toISOString()
+
     const termMarks = TERMINAL_STAGES.map(() => '?').join(',')
-    const open = db.prepare(`SELECT stage, COUNT(*) n, SUM(COALESCE(amount,0)) sum, SUM(amount IS NULL) noAmount FROM deals WHERE stage NOT IN (${termMarks}) GROUP BY stage`).all(...TERMINAL_STAGES)
-    const closed = db.prepare(`SELECT stage, COUNT(*) n, SUM(COALESCE(amount,0)) sum FROM deals WHERE stage IN (${termMarks}) GROUP BY stage`).all(...TERMINAL_STAGES)
+    const open = db
+      .prepare(`SELECT stage, COUNT(*) n, SUM(COALESCE(amount,0)) sum, SUM(amount IS NULL) noAmount FROM deals WHERE stage NOT IN (${termMarks}) ${pf('AND project_id = ?')} GROUP BY stage`)
+      .all(...TERMINAL_STAGES, ...arg)
+    const closed = db
+      .prepare(`SELECT stage, COUNT(*) n, SUM(COALESCE(amount,0)) sum FROM deals WHERE stage IN (${termMarks}) ${pf('AND project_id = ?')} GROUP BY stage`)
+      .all(...TERMINAL_STAGES, ...arg)
+
     return {
       today,
-      inbox: db.prepare("SELECT c.*, d.title deal_title, d.id deal_id FROM contacts c LEFT JOIN deals d ON d.contact_id = c.id AND d.stage = 'Новый' WHERE c.source IN ('site-form','site-chat') AND c.archived = 0 ORDER BY c.created_at DESC LIMIT 8").all(),
-      tasksToday: db.prepare('SELECT t.*, c.name contact_name FROM tasks t LEFT JOIN contacts c ON c.id = t.contact_id WHERE t.done = 0 AND t.due_date IS NOT NULL AND t.due_date <= ? ORDER BY t.due_date LIMIT 20').all(today),
+      projectId: pid,
+      inbox: db
+        .prepare(`SELECT c.*, d.title deal_title, d.id deal_id FROM contacts c LEFT JOIN deals d ON d.contact_id = c.id AND d.stage = 'Новый' WHERE c.source IN ('site-form','site-chat') AND c.archived = 0 ${pf('AND c.project_id = ?')} ORDER BY c.created_at DESC LIMIT 8`)
+        .all(...arg),
+      tasksToday: db
+        .prepare(`SELECT t.*, c.name contact_name FROM tasks t LEFT JOIN contacts c ON c.id = t.contact_id WHERE t.done = 0 AND t.due_date IS NOT NULL AND t.due_date <= ? ${pf('AND (t.contact_id IS NULL OR c.project_id = ?)')} ORDER BY t.due_date LIMIT 20`)
+        .all(today, ...arg),
       funnel: STAGES.filter((s) => !TERMINAL_STAGES.includes(s)).map((s) => open.find((r) => r.stage === s) || { stage: s, n: 0, sum: 0, noAmount: 0 }),
       terminal: TERMINAL_STAGES.map((s) => closed.find((r) => r.stage === s) || { stage: s, n: 0, sum: 0 }),
-      activity: db.prepare('SELECT i.*, c.name contact_name, u.name user_name FROM interactions i LEFT JOIN contacts c ON c.id = i.contact_id LEFT JOIN users u ON u.id = i.created_by ORDER BY i.happened_at DESC LIMIT 10').all(),
+      activity: db
+        .prepare(`SELECT i.*, c.name contact_name, u.name user_name FROM interactions i LEFT JOIN contacts c ON c.id = i.contact_id LEFT JOIN users u ON u.id = i.created_by ${pf('WHERE c.project_id = ?')} ORDER BY i.happened_at DESC LIMIT 10`)
+        .all(...arg),
       counts: {
-        contacts: db.prepare('SELECT COUNT(*) c FROM contacts WHERE archived = 0').get().c,
-        deals: db.prepare('SELECT COUNT(*) c FROM deals').get().c,
-        overdue: db.prepare('SELECT COUNT(*) c FROM tasks WHERE done = 0 AND due_date < ?').get(today).c,
+        contacts: db.prepare(`SELECT COUNT(*) c FROM contacts WHERE archived = 0 ${pf('AND project_id = ?')}`).get(...arg).c,
+        deals: db.prepare(`SELECT COUNT(*) c FROM deals ${pid ? 'WHERE project_id = ?' : ''}`).get(...arg).c,
+        overdue: db
+          .prepare(`SELECT COUNT(*) c FROM tasks t LEFT JOIN contacts c2 ON c2.id = t.contact_id WHERE t.done = 0 AND t.due_date < ? ${pf('AND (t.contact_id IS NULL OR c2.project_id = ?)')}`)
+          .get(today, ...arg).c,
+      },
+      // Аналитика: сколько заявок пришло за период и откуда.
+      stats: {
+        days: STATS_DAYS,
+        byProject: db
+          .prepare(`SELECT p.id, p.display_name name, COUNT(*) n FROM contacts c JOIN projects p ON p.id = c.project_id WHERE c.created_at >= ? AND c.archived = 0 ${pf('AND c.project_id = ?')} GROUP BY p.id ORDER BY n DESC`)
+          .all(since, ...arg),
+        bySource: db
+          .prepare(`SELECT source, COUNT(*) n FROM contacts WHERE created_at >= ? AND archived = 0 ${pf('AND project_id = ?')} GROUP BY source ORDER BY n DESC`)
+          .all(since, ...arg),
       },
     }
   })

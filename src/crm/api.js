@@ -50,6 +50,6 @@ export const repo = {
   update: (entity, id, data) => api(`/crm/${entity}/${id}`, { method: 'PATCH', body: data }),
   remove: (entity, id) => api(`/crm/${entity}/${id}`, { method: 'DELETE' }),
   contactCard: (id) => api(`/crm/contacts/${id}`),
-  dashboard: () => api('/crm/dashboard'),
+  dashboard: ({ project } = {}) => api(`/crm/dashboard${project && project !== 'all' ? `?project=${encodeURIComponent(project)}` : ''}`),
   diagnostics: () => api('/crm/diagnostics'),
 }

@@ -3,9 +3,7 @@ import { Link } from 'react-router-dom'
 import { repo } from '../api.js'
 import { EntityModal } from '../forms.jsx'
 import { ProjectBadge, ProjectFilter, useProjectFilter } from '../projects.jsx'
-import { apiErrorToast, onRefresh } from '../ui.jsx'
-
-const SOURCE_LABEL = { 'site-form': 'сайт', 'site-chat': 'чат Невы', manual: 'вручную', import: 'импорт' }
+import { SOURCE_LABEL, apiErrorToast, onRefresh } from '../ui.jsx'
 
 export default function Contacts() {
   const [data, setData] = useState(null)
