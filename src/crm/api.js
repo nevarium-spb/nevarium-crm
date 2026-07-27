@@ -37,7 +37,15 @@ export async function api(path, { method = 'GET', body } = {}) {
 }
 
 export const repo = {
-  list: (entity, q) => api(`/crm/${entity}${q ? `?q=${encodeURIComponent(q)}` : ''}`),
+  // project: slug проекта либо 'all'/пусто — «все проекты» (фильтр не отправляем)
+  list: (entity, { q, project } = {}) => {
+    const p = new URLSearchParams()
+    if (q) p.set('q', q)
+    if (project && project !== 'all') p.set('project', project)
+    const qs = p.toString()
+    return api(`/crm/${entity}${qs ? `?${qs}` : ''}`)
+  },
+  projects: () => api('/crm/projects'),
   create: (entity, data) => api(`/crm/${entity}`, { method: 'POST', body: data }),
   update: (entity, id, data) => api(`/crm/${entity}/${id}`, { method: 'PATCH', body: data }),
   remove: (entity, id) => api(`/crm/${entity}/${id}`, { method: 'DELETE' }),

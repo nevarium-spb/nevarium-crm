@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { repo } from '../api.js'
 import { EntityModal } from '../forms.jsx'
+import { ProjectBadge, ProjectFilter, useProjectFilter } from '../projects.jsx'
 import { apiErrorToast, onRefresh } from '../ui.jsx'
 
 const SOURCE_LABEL = { 'site-form': 'сайт', 'site-chat': 'чат Невы', manual: 'вручную', import: 'импорт' }
@@ -10,10 +11,21 @@ export default function Contacts() {
   const [data, setData] = useState(null)
   const [q, setQ] = useState('')
   const [modal, setModal] = useState(false)
+  const [project, setProject] = useProjectFilter()
 
-  const load = useCallback((query = '') => {
-    repo.list('contacts', query).then(setData).catch(apiErrorToast)
-  }, [])
+  // Считаем запросы: при быстром переключении проекта ответы могут прийти не по
+  // порядку, и медленный старый затёр бы свежий — на экране оказался бы чужой проект.
+  const reqId = useRef(0)
+  const load = useCallback(
+    (query = '') => {
+      const id = ++reqId.current
+      repo
+        .list('contacts', { q: query, project })
+        .then((d) => id === reqId.current && setData(d))
+        .catch((e) => id === reqId.current && apiErrorToast(e))
+    },
+    [project]
+  )
 
   useEffect(() => {
     const t = setTimeout(() => load(q), q ? 250 : 0)
@@ -30,18 +42,24 @@ export default function Contacts() {
         </div>
         <button className="btn primary" onClick={() => setModal(true)}>+ Контакт</button>
       </div>
-      <input
-        className="crm-search"
-        placeholder="Поиск: имя, компания, телефон, email…"
-        value={q}
-        onChange={(e) => setQ(e.target.value)}
-        aria-label="Поиск контактов"
-      />
+      <div className="crm-filters">
+        <input
+          className="crm-search"
+          placeholder="Поиск: имя, компания, телефон, email…"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          aria-label="Поиск контактов"
+        />
+        <ProjectFilter value={project} onChange={setProject} />
+      </div>
       <div className="tile" style={{ marginTop: 16 }}>
         {!data && <><div className="skeleton" /><div className="skeleton" /><div className="skeleton" style={{ width: '70%' }} /></>}
         {data && data.items.length === 0 && (
-          <div className="empty">{q ? 'Ничего не найдено — уточните запрос.' : 'Контактов пока нет.'}<br />
-            {!q && <button className="btn" onClick={() => setModal(true)}>Создать первый контакт</button>}
+          <div className="empty">
+            {q ? 'Ничего не найдено — уточните запрос.' : project !== 'all' ? 'В этом проекте контактов пока нет.' : 'Контактов пока нет.'}
+            <br />
+            {!q && project !== 'all' && <button className="btn" onClick={() => setProject('all')}>Показать все проекты</button>}
+            {!q && project === 'all' && <button className="btn" onClick={() => setModal(true)}>Создать первый контакт</button>}
           </div>
         )}
         {data?.items.map((c) => (
@@ -50,7 +68,8 @@ export default function Contacts() {
               <div className="row-name"><Link to={`/crm/contacts/${c.id}`}>{c.name}</Link>{c.company ? <span className="row-meta"> · {c.company}</span> : null}</div>
               <div className="row-meta">{[c.phone, c.email, c.messenger].filter(Boolean).join(' · ') || 'без контактов'}</div>
             </div>
-            <span style={{ display: 'flex', gap: 6 }}>
+            <span className="row-badges">
+              <ProjectBadge id={c.project_id} when={project === 'all'} />
               {c.suspicious ? <span className="badge warn">подозрительный</span> : null}
               {c.archived ? <span className="badge gray">архив</span> : <span className="badge gray">{SOURCE_LABEL[c.source] || c.source}</span>}
             </span>

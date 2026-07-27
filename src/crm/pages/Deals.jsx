@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { repo } from '../api.js'
 import { EntityModal } from '../forms.jsx'
 import { STAGES, TERMINAL_STAGES as TERMINAL } from '../../shared/stages.js'
+import { ProjectBadge, ProjectFilter, useProjectFilter } from '../projects.jsx'
 import { apiErrorToast, fmtMoney, onRefresh, toast } from '../ui.jsx'
 
 export default function Deals() {
@@ -11,15 +12,22 @@ export default function Deals() {
   const [modal, setModal] = useState(null) // {initial}
   const [menuFor, setMenuFor] = useState(null)
   const dragId = useRef(null)
+  const [project, setProject] = useProjectFilter()
 
+  // Считаем запросы: при быстром переключении проекта ответы могут прийти не по
+  // порядку, и медленный старый затёр бы свежий — на доске оказался бы чужой проект.
+  const reqId = useRef(0)
   const load = useCallback(() => {
-    Promise.all([repo.list('deals'), repo.list('contacts')])
+    const id = ++reqId.current
+    // контакты — для подписи «чей это лид», их берём по тому же фильтру
+    Promise.all([repo.list('deals', { project }), repo.list('contacts', { project })])
       .then(([d, c]) => {
+        if (id !== reqId.current) return
         setDeals(d.items)
         setContacts(c.items)
       })
-      .catch(apiErrorToast)
-  }, [])
+      .catch((e) => id === reqId.current && apiErrorToast(e))
+  }, [project])
   useEffect(load, [load])
   useEffect(() => onRefresh(load), [load])
 
@@ -76,7 +84,10 @@ export default function Deals() {
           <h1 className="crm-h1">Сделки</h1>
           <div className="crm-sub">{deals.filter((d) => !TERMINAL.includes(d.stage)).length} в работе · {fmtMoney(deals.filter((d) => !TERMINAL.includes(d.stage)).reduce((s, d) => s + (d.amount || 0), 0))}</div>
         </div>
-        <button className="btn primary" onClick={() => setModal({ initial: {} })}>+ Сделка</button>
+        <div className="crm-head-actions">
+          <ProjectFilter value={project} onChange={setProject} />
+          <button className="btn primary" onClick={() => setModal({ initial: {} })}>+ Сделка</button>
+        </div>
       </div>
       <div className="kanban">
         {STAGES.map((stage) => {
@@ -107,6 +118,7 @@ export default function Deals() {
                     <Link to={`/crm/contacts/${deal.contact_id}`}>{contactName(deal.contact_id)}</Link>
                     <span className="deal-amount">{fmtMoney(deal.amount)}</span>
                   </div>
+                  <ProjectBadge id={deal.project_id} when={project === 'all'} />
                   <button
                     className="deal-move"
                     aria-label="Переместить или изменить"
