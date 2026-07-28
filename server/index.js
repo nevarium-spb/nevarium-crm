@@ -1,4 +1,7 @@
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { buildApp } from './app.js'
+import { bootstrapAdmin } from './bootstrap.js'
 import { startOutboxWorker } from './telegram.js'
 import { scheduleBackups } from './backup.js'
 
@@ -8,12 +11,19 @@ if (!secret || secret.length < 16) {
   process.exit(1)
 }
 
+// server/ и dist/ лежат рядом в собранном образе (см. deploy/Dockerfile) — путь
+// считаем от расположения этого файла, а не от текущей рабочей директории.
+const staticDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist')
+
 const app = buildApp({
   dbFile: process.env.DB_FILE || './data/crm.sqlite',
   secret,
   secure: process.env.NODE_ENV !== 'development',
   logger: true,
+  staticDir,
 })
+
+await bootstrapAdmin(app.db, { log: app.log })
 
 startOutboxWorker(app.db, { log: app.log })
 scheduleBackups(app.db, { log: app.log })

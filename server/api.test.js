@@ -5,7 +5,8 @@ import path from 'node:path'
 import Database from 'better-sqlite3'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { buildApp, mskToday } from './app.js'
-import { hashPassword, resetThrottle } from './auth.js'
+import { hashPassword, resetThrottle, verifyPassword } from './auth.js'
+import { bootstrapAdmin } from './bootstrap.js'
 import { MIGRATIONS, now, openDb } from './db.js'
 import { leadMessage, startOutboxWorker } from './telegram.js'
 
@@ -474,6 +475,45 @@ describe('воронка возврата после отказа', () => {
     await toStage(id, 'Контакт') // отмена серии не должна задеть обычную задачу
     const plain = app.db.prepare("SELECT * FROM tasks WHERE title = 'Обычная задача'").get()
     expect(plain.winback_sequence_id).toBeNull()
+  })
+})
+
+describe('bootstrapAdmin — первый админ без shell-доступа', () => {
+  const silent = { warn() {}, error() {}, info() {} }
+
+  it('без переменных окружения ничего не делает', async () => {
+    const created = await bootstrapAdmin(app.db, { log: silent, env: {} })
+    expect(created).toBe(false)
+  })
+
+  it('создаёт админа на пустой базе и пароль реально проверяется', async () => {
+    app.db.exec('DELETE FROM users') // beforeEach уже создал тестового пользователя
+    const env = { BOOTSTRAP_ADMIN_EMAIL: 'Boss@Example.ru', BOOTSTRAP_ADMIN_PASSWORD: 'supersecret1' }
+    const created = await bootstrapAdmin(app.db, { log: silent, env })
+    expect(created).toBe(true)
+    const user = app.db.prepare('SELECT * FROM users WHERE email = ?').get('boss@example.ru')
+    expect(user).toMatchObject({ role: 'admin', name: 'Админ' })
+    expect(await verifyPassword('supersecret1', user.password_hash)).toBe(true)
+  })
+
+  it('не трогает базу, если пользователи уже есть', async () => {
+    const before = app.db.prepare('SELECT COUNT(*) c FROM users').get().c
+    const created = await bootstrapAdmin(app.db, {
+      log: silent,
+      env: { BOOTSTRAP_ADMIN_EMAIL: 'x@x.ru', BOOTSTRAP_ADMIN_PASSWORD: 'supersecret1' },
+    })
+    expect(created).toBe(false)
+    expect(app.db.prepare('SELECT COUNT(*) c FROM users').get().c).toBe(before)
+  })
+
+  it('слишком короткий пароль — админ не создаётся', async () => {
+    app.db.exec('DELETE FROM users')
+    const created = await bootstrapAdmin(app.db, {
+      log: silent,
+      env: { BOOTSTRAP_ADMIN_EMAIL: 'x@x.ru', BOOTSTRAP_ADMIN_PASSWORD: 'short' },
+    })
+    expect(created).toBe(false)
+    expect(app.db.prepare('SELECT COUNT(*) c FROM users').get().c).toBe(0)
   })
 })
 

@@ -1,5 +1,7 @@
+import fs from 'node:fs'
 import Fastify from 'fastify'
 import cookie from '@fastify/cookie'
+import staticPlugin from '@fastify/static'
 import { DEFAULT_PROJECT_ID, WINBACK_STEPS, openDb, now, STAGES, TERMINAL_STAGES } from './db.js'
 import { hashPassword, verifyPassword, signToken, verifyToken, loginThrottle, loginFailed, loginSucceeded, SESSION_TTL_DAYS } from './auth.js'
 import { enqueue } from './telegram.js'
@@ -18,7 +20,7 @@ export function mskToday(offsetDays = 0, nowMs = Date.now()) {
 
 const trim = (v, max = 500) => String(v ?? '').trim().slice(0, max)
 
-export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = true, logger = false } = {}) {
+export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = true, logger = false, staticDir = null } = {}) {
   const db = openDb(dbFile)
   const app = Fastify({ logger, trustProxy: true })
   app.register(cookie)
@@ -641,6 +643,19 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   })
 
   app.get('/api/health', async () => ({ ok: true }))
+
+  // ---------- статика фронта (для App Platform: один контейнер вместо app+Caddy) ----------
+  // staticDir передаётся только в проде (server/index.js), когда dist/ реально собран —
+  // на тестах и в dev-режиме (Vite proxy) эта ветка не активируется вообще.
+  if (staticDir && fs.existsSync(staticDir)) {
+    app.register(staticPlugin, { root: staticDir })
+    app.setNotFoundHandler((req, reply) => {
+      // /api/* без совпавшего роута — настоящий 404, не отдаём под него HTML
+      if (req.raw.url.startsWith('/api/')) return reply.code(404).send({ error: 'not_found' })
+      // SPA-роутинг (react-router): любой другой путь — index.html, дальше решает браузер
+      reply.sendFile('index.html')
+    })
+  }
 
   return app
 }

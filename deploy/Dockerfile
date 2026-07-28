@@ -14,5 +14,8 @@ ENV NODE_ENV=production
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/server ./server
 COPY --from=build /app/package.json ./
+# Собранный фронт — раньше собирался и терялся: сервер сам отдаёт его
+# (server/index.js → staticDir), лишний контейнер с Caddy для App Platform не нужен.
+COPY --from=build /app/dist ./dist
 EXPOSE 3001
 CMD ["node", "server/index.js"]
