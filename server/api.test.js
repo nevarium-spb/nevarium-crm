@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { buildApp } from './app.js'
+import { buildApp, mskToday } from './app.js'
 import { hashPassword, resetThrottle } from './auth.js'
 import { MIGRATIONS, now, openDb } from './db.js'
 import { leadMessage, startOutboxWorker } from './telegram.js'
@@ -396,6 +396,84 @@ describe('пользователи', () => {
   it('нельзя удалить себя', async () => {
     const res = await app.inject({ method: 'DELETE', url: '/api/crm/users/1', headers: { cookie } })
     expect(res.statusCode).toBe(400)
+  })
+})
+
+describe('воронка возврата после отказа', () => {
+  // создаём контакт + сделку, возвращаем id сделки
+  async function makeDeal() {
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Отказавшийся' }, headers: { cookie } })
+    const res = await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'Пилот' }, headers: { cookie } })
+    return JSON.parse(res.body).item.id
+  }
+  const toStage = (id, stage, extra = {}) =>
+    app.inject({ method: 'PATCH', url: `/api/crm/deals/${id}`, payload: { stage, ...extra }, headers: { cookie } })
+
+  it('перевод в «Проиграно» заводит серию задач на два месяца', async () => {
+    const id = await makeDeal()
+    const res = await toStage(id, 'Проиграно', { lostReason: 'дорого' })
+    expect(JSON.parse(res.body).winback).toMatchObject({ started: true, tasks: 3 })
+
+    const seq = app.db.prepare('SELECT * FROM winback_sequences').get()
+    expect(seq).toMatchObject({ deal_id: id, contact_id: 1, reason: 'дорого', status: 'active' })
+
+    const tasks = app.db.prepare('SELECT * FROM tasks WHERE winback_sequence_id = ? ORDER BY due_date').all(seq.id)
+    expect(tasks).toHaveLength(3)
+    // задачи привязаны к клиенту и сделке, а сроки — в будущем и по возрастанию
+    expect(tasks.every((t) => t.contact_id === 1 && t.deal_id === id && t.done === 0)).toBe(true)
+    const today = mskToday()
+    expect(tasks[0].due_date > today).toBe(true)
+    expect(tasks[2].due_date > tasks[0].due_date).toBe(true)
+  })
+
+  it('возврат сделки в работу отменяет незакрытые напоминания, выполненные оставляет', async () => {
+    const id = await makeDeal()
+    await toStage(id, 'Проиграно')
+    const seqId = app.db.prepare('SELECT id FROM winback_sequences').get().id
+    // менеджер успел закрыть первую задачу до возврата сделки
+    const firstTask = app.db.prepare('SELECT id FROM tasks WHERE winback_sequence_id = ? ORDER BY due_date').get(seqId)
+    await app.inject({ method: 'PATCH', url: `/api/crm/tasks/${firstTask.id}`, payload: { done: 1 }, headers: { cookie } })
+
+    const res = await toStage(id, 'Переговоры')
+    expect(JSON.parse(res.body).winback).toMatchObject({ cancelled: true, tasks: 2 })
+
+    const left = app.db.prepare('SELECT * FROM tasks WHERE winback_sequence_id = ?').all(seqId)
+    expect(left).toHaveLength(1) // осталась только выполненная — это история работы
+    expect(left[0].done).toBe(1)
+    expect(app.db.prepare('SELECT status FROM winback_sequences WHERE id = ?').get(seqId).status).toBe('cancelled')
+  })
+
+  it('повторный перевод в «Проиграно» не плодит дубли задач', async () => {
+    const id = await makeDeal()
+    await toStage(id, 'Проиграно')
+    await toStage(id, 'Проиграно') // тот же статус — смены стадии нет
+    expect(app.db.prepare('SELECT COUNT(*) c FROM winback_sequences').get().c).toBe(1)
+    expect(app.db.prepare('SELECT COUNT(*) c FROM tasks WHERE winback_sequence_id IS NOT NULL').get().c).toBe(3)
+  })
+
+  it('другие терминальные стадии воронку не запускают', async () => {
+    const id = await makeDeal()
+    const res = await toStage(id, 'Оплачено')
+    expect(JSON.parse(res.body).winback).toBeNull()
+    expect(app.db.prepare('SELECT COUNT(*) c FROM winback_sequences').get().c).toBe(0)
+  })
+
+  it('удаление сделки с воронкой не падает и убирает её задачи', async () => {
+    const id = await makeDeal()
+    await toStage(id, 'Проиграно')
+    const del = await app.inject({ method: 'DELETE', url: `/api/crm/deals/${id}`, headers: { cookie } })
+    expect(del.statusCode).toBe(200)
+    expect(app.db.prepare('SELECT COUNT(*) c FROM winback_sequences').get().c).toBe(0)
+    expect(app.db.prepare('SELECT COUNT(*) c FROM tasks WHERE winback_sequence_id IS NOT NULL').get().c).toBe(0)
+  })
+
+  it('обычные задачи серией не помечены и живут своей жизнью', async () => {
+    const id = await makeDeal()
+    await app.inject({ method: 'POST', url: '/api/crm/tasks', payload: { title: 'Обычная задача', contact_id: 1 }, headers: { cookie } })
+    await toStage(id, 'Проиграно')
+    await toStage(id, 'Контакт') // отмена серии не должна задеть обычную задачу
+    const plain = app.db.prepare("SELECT * FROM tasks WHERE title = 'Обычная задача'").get()
+    expect(plain.winback_sequence_id).toBeNull()
   })
 })
 

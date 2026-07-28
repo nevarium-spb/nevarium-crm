@@ -1,6 +1,6 @@
 import Fastify from 'fastify'
 import cookie from '@fastify/cookie'
-import { DEFAULT_PROJECT_ID, openDb, now, STAGES, TERMINAL_STAGES } from './db.js'
+import { DEFAULT_PROJECT_ID, WINBACK_STEPS, openDb, now, STAGES, TERMINAL_STAGES } from './db.js'
 import { hashPassword, verifyPassword, signToken, verifyToken, loginThrottle, loginFailed, loginSucceeded, SESSION_TTL_DAYS } from './auth.js'
 import { enqueue } from './telegram.js'
 
@@ -119,6 +119,52 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   // Проект есть только у сущностей-носителей заявки; задачи и взаимодействия
   // наследуют его через контакт — иначе появился бы второй источник правды.
   const PROJECT_SCOPED = new Set(['contacts', 'deals'])
+
+  const LOST_STAGE = 'Проиграно'
+
+  /**
+   * Воронка возврата: сделка ушла в «Проиграно» — заводим серию задач-напоминаний
+   * на 2 месяца. Отказ сегодня не значит отказ навсегда, но без напоминаний о таких
+   * клиентах просто забывают.
+   * Повторно серию не создаём: если активная уже есть, значит сделку уже отказывали.
+   */
+  function startWinback(dealId, userId, reason = '') {
+    const deal = db.prepare('SELECT contact_id FROM deals WHERE id = ?').get(dealId)
+    if (!deal) return null
+    const active = db.prepare("SELECT id FROM winback_sequences WHERE deal_id = ? AND status = 'active'").get(dealId)
+    if (active) return active.id
+
+    const ts = now()
+    return db.transaction(() => {
+      const seqId = db
+        .prepare('INSERT INTO winback_sequences (deal_id, contact_id, reason, started_at, created_by) VALUES (?, ?, ?, ?, ?)')
+        .run(dealId, deal.contact_id, trim(reason, 500), ts, userId ?? null).lastInsertRowid
+      const insert = db.prepare(
+        'INSERT INTO tasks (title, contact_id, deal_id, due_date, winback_sequence_id, created_at, updated_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+      )
+      for (const step of WINBACK_STEPS) {
+        insert.run(step.title, deal.contact_id, dealId, mskToday(step.days), seqId, ts, ts, userId ?? null)
+      }
+      return seqId
+    })()
+  }
+
+  /**
+   * Сделку вернули из «Проиграно» в работу — незакрытые напоминания больше не нужны.
+   * Выполненные задачи не трогаем: это уже история работы с клиентом.
+   */
+  function cancelWinback(dealId) {
+    const active = db.prepare("SELECT id FROM winback_sequences WHERE deal_id = ? AND status = 'active'").all(dealId)
+    if (!active.length) return 0
+    return db.transaction(() => {
+      let removed = 0
+      for (const seq of active) {
+        removed += db.prepare('DELETE FROM tasks WHERE winback_sequence_id = ? AND done = 0').run(seq.id).changes
+        db.prepare("UPDATE winback_sequences SET status = 'cancelled', finished_at = ? WHERE id = ?").run(now(), seq.id)
+      }
+      return removed
+    })()
+  }
 
   /** Проект по origin сайта (см. колонку projects.origins). null — не наш домен. */
   function projectByOrigin(origin) {
@@ -243,7 +289,20 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
         `UPDATE ${name} SET ${cols.map((c) => `${c} = @${c}`).join(', ')}, updated_at = @updated_at WHERE id = @id`
       ).run({ ...data, updated_at: now(), id })
       audit(req, 'update', name, id)
-      return { item: db.prepare(`SELECT * FROM ${name} WHERE id = ?`).get(id) }
+
+      // Воронка возврата — только на смене стадии сделки, и только когда стадия
+      // действительно поменялась (повторный PATCH тем же значением ничего не заводит).
+      let winback = null
+      if (name === 'deals' && data.stage && data.stage !== existing.stage) {
+        if (data.stage === LOST_STAGE) {
+          const seqId = startWinback(id, req.user.id, req.body?.lostReason)
+          if (seqId) winback = { started: true, tasks: WINBACK_STEPS.length }
+        } else if (existing.stage === LOST_STAGE) {
+          const removed = cancelWinback(id)
+          if (removed) winback = { cancelled: true, tasks: removed }
+        }
+      }
+      return { item: db.prepare(`SELECT * FROM ${name} WHERE id = ?`).get(id), winback }
     })
 
     app.delete(`/api/crm/${name}/:id`, async (req, reply) => {
@@ -255,7 +314,13 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
         db.prepare('DELETE FROM tasks WHERE contact_id = ?').run(id)
         db.prepare('DELETE FROM interactions WHERE contact_id = ?').run(id)
       }
-      if (name === 'deals') db.prepare('UPDATE tasks SET deal_id = NULL WHERE deal_id = ?').run(id)
+      if (name === 'deals') {
+        // Серии возврата ссылаются на сделку внешним ключом — без этой уборки
+        // удаление сделки упало бы на FOREIGN KEY.
+        db.prepare('DELETE FROM tasks WHERE winback_sequence_id IN (SELECT id FROM winback_sequences WHERE deal_id = ?)').run(id)
+        db.prepare('DELETE FROM winback_sequences WHERE deal_id = ?').run(id)
+        db.prepare('UPDATE tasks SET deal_id = NULL WHERE deal_id = ?').run(id)
+      }
       db.prepare(`DELETE FROM ${name} WHERE id = ?`).run(id)
       audit(req, 'delete', name, id)
       return { ok: true }

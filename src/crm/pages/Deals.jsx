@@ -4,13 +4,58 @@ import { repo } from '../api.js'
 import { EntityModal } from '../forms.jsx'
 import { STAGES, TERMINAL_STAGES as TERMINAL } from '../../shared/stages.js'
 import { ProjectBadge, ProjectFilter, useProjectFilter } from '../projects.jsx'
-import { apiErrorToast, fmtMoney, onRefresh, toast } from '../ui.jsx'
+import { Modal, apiErrorToast, fmtMoney, onRefresh, toast } from '../ui.jsx'
+
+const LOST = 'Проиграно'
+
+const LOST_REASONS = ['Дорого', 'Выбрали другого', 'Отложили', 'Не отвечает', 'Не наша задача']
+
+/**
+ * Подтверждение отказа. Нужно по двум причинам: карточку легко утащить в «Проиграно»
+ * случайно, и причина отказа — самое ценное, что остаётся от несостоявшейся сделки.
+ */
+function LostDialog({ deal, onCancel, onConfirm }) {
+  const [reason, setReason] = useState('')
+  return (
+    <Modal title="Отметить как проигранную" onClose={onCancel}>
+      <div className="crm-form">
+        <p className="lost-lead">
+          Сделка «{deal.title}» уйдёт в «Проиграно». CRM поставит три напоминания вернуться
+          к клиенту — через неделю, месяц и два.
+        </p>
+        <label>
+          Причина отказа
+          <input
+            autoFocus
+            value={reason}
+            maxLength={500}
+            placeholder="Своими словами или выберите ниже"
+            onChange={(e) => setReason(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && onConfirm(reason)}
+          />
+        </label>
+        <div className="lost-reasons">
+          {LOST_REASONS.map((r) => (
+            <button key={r} type="button" className={reason === r ? 'on' : ''} onClick={() => setReason(r)}>
+              {r}
+            </button>
+          ))}
+        </div>
+        <div className="crm-form-actions">
+          <button type="button" className="btn" onClick={onCancel}>Отмена</button>
+          <button type="button" className="btn primary" onClick={() => onConfirm(reason)}>Отметить проигранной</button>
+        </div>
+      </div>
+    </Modal>
+  )
+}
 
 export default function Deals() {
   const [deals, setDeals] = useState(null)
   const [contacts, setContacts] = useState([])
   const [modal, setModal] = useState(null) // {initial}
   const [menuFor, setMenuFor] = useState(null)
+  const [lostFor, setLostFor] = useState(null) // {deal, stage} — диалог причины отказа
   const dragId = useRef(null)
   const [project, setProject] = useProjectFilter()
 
@@ -40,13 +85,21 @@ export default function Deals() {
   const contactById = useMemo(() => new Map(contacts.map((c) => [c.id, c.name])), [contacts])
   const contactName = (id) => contactById.get(id) || '—'
 
-  const move = async (deal, stage) => {
+  const move = async (deal, stage, lostReason) => {
     setMenuFor(null)
     if (deal.stage === stage) return
+    // «Проиграно» запускает двухмесячную воронку возврата, поэтому спрашиваем причину —
+    // заодно это защита от случайного перетаскивания карточки на канбане.
+    if (stage === LOST && lostReason === undefined) {
+      setLostFor({ deal, stage })
+      return
+    }
     const prev = deals
     setDeals((ds) => ds.map((d) => (d.id === deal.id ? { ...d, stage } : d)))
     try {
-      await repo.update('deals', deal.id, { stage, expectedUpdatedAt: deal.updated_at })
+      const res = await repo.update('deals', deal.id, { stage, lostReason, expectedUpdatedAt: deal.updated_at })
+      if (res?.winback?.started) toast(`Запланировано ${res.winback.tasks} напоминания вернуться к клиенту`)
+      if (res?.winback?.cancelled) toast('Сделка в работе — напоминания о возврате сняты')
       load()
     } catch (err) {
       setDeals(prev)
@@ -142,6 +195,17 @@ export default function Deals() {
           )
         })}
       </div>
+      {lostFor && (
+        <LostDialog
+          deal={lostFor.deal}
+          onCancel={() => setLostFor(null)}
+          onConfirm={(reason) => {
+            const { deal, stage } = lostFor
+            setLostFor(null)
+            move(deal, stage, reason)
+          }}
+        />
+      )}
       {modal && <EntityModal entity="deals" initial={modal.initial} onSaved={load} onClose={() => setModal(null)} />}
     </>
   )

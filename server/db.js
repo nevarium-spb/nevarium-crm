@@ -133,6 +133,40 @@ export const MIGRATIONS = [
   UPDATE projects SET origins = 'https://nevarium-vizor.ru,https://www.nevarium-vizor.ru'
     WHERE slug = 'nevarium-vizor';
   `,
+  // v6: воронка возврата («отказы»). Когда сделка уходит в «Проиграно», CRM заводит
+  // серию задач-напоминаний на 2 месяца: связаться с клиентом и узнать, не изменилось
+  // ли что-то. Писем не шлём — только задачи менеджеру (почтового сервиса у нас нет).
+  //
+  // tasks.winback_sequence_id объявлен БЕЗ REFERENCES по той же причине, что и
+  // project_id в v3: SQLite не даёт добавить колонку с REFERENCES иначе как с
+  // DEFAULT NULL, а здесь дефолт NULL как раз и нужен (обычные задачи вне серий) —
+  // но ради единообразия и простоты чтения оставляем без внешнего ключа, целостность
+  // держит приложение: серия удаляется вместе со своими задачами в одной транзакции.
+  `
+  CREATE TABLE winback_sequences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    deal_id INTEGER NOT NULL REFERENCES deals(id),
+    contact_id INTEGER NOT NULL REFERENCES contacts(id),
+    reason TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    created_by INTEGER
+  );
+  ALTER TABLE tasks ADD COLUMN winback_sequence_id INTEGER;
+  CREATE INDEX idx_winback_deal ON winback_sequences(deal_id, status);
+  CREATE INDEX idx_tasks_winback ON tasks(winback_sequence_id);
+  `,
+]
+
+/**
+ * Расписание воронки возврата: через сколько дней после отказа ставим задачу.
+ * Два месяца, три касания — чаще превращается в рутину, которую перестают замечать.
+ */
+export const WINBACK_STEPS = [
+  { days: 7, title: 'Написать клиенту: уточнить причину отказа' },
+  { days: 30, title: 'Позвонить клиенту: узнать, не изменилась ли ситуация' },
+  { days: 60, title: 'Финальное касание: предложить вернуться к задаче' },
 ]
 
 /** Проект по умолчанию для строк без явной привязки (совпадает с DEFAULT в схеме). */
