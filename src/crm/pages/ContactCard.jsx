@@ -134,7 +134,10 @@ export default function ContactCard({ user }) {
           {shown.map((e) => (
             <div className="act-line" key={`${e.kind}-${e.item.id}`}>
               <span className="act-dot" style={e.kind === 'task' ? { background: 'var(--accent-3)', boxShadow: '0 0 8px var(--accent-3)' } : undefined} />
-              <div>
+              {/* pre-wrap обязателен: транскрипты чата и записи о повторных заявках
+                  многострочные, без него весь диалог схлопывается в одну строку.
+                  break-word — на случай длинных ссылок в переписке. */}
+              <div style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
                 {e.kind === 'interaction'
                   ? `${e.item.type[0].toUpperCase()}${e.item.type.slice(1)}${e.item.note ? ` — ${e.item.note}` : ''}`
                   : `Задача: ${e.item.title}${e.item.done ? ' ✓' : ''}`}

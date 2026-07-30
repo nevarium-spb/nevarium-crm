@@ -104,12 +104,24 @@ export function leadMessage(lead, env = process.env) {
   const base = String(env.CRM_BASE_URL || '').trim().replace(/\/+$/, '')
   const link = base && lead.contactId ? `${base}/crm/contacts/${lead.contactId}` : null
   const lines = [
-    `🔵 <b>Новая заявка</b>${lead.suspicious ? ' ⚠️ подозрительная' : ''}`,
+    `${leadHeader(lead)}${lead.suspicious ? ' ⚠️ подозрительная' : ''}`,
     lead.projectName ? `Проект: <b>${esc(lead.projectName)}</b>` : null,
     lead.source ? `Источник: ${esc(lead.source)}` : null,
     link ? `Открыть: ${esc(link)}` : 'Детали — в CRM, карточка заявки',
   ]
   return lines.filter(Boolean).join('\n')
+}
+
+/**
+ * Заголовок уведомления. Повторное обращение и возврат ушедшего клиента — разные
+ * поводы: первое значит «не заводите вторую карточку, всё уже в одной», второе —
+ * «человек вернулся сам, напоминания сняты». Персональных данных в заголовке нет,
+ * поэтому он одинаков для Telegram и MAX.
+ */
+function leadHeader(lead) {
+  if (lead.returned) return '🟢 <b>Клиент вернулся сам</b>'
+  if (lead.repeat) return '🔁 <b>Повторная заявка</b>'
+  return '🔵 <b>Новая заявка</b>'
 }
 
 /**
@@ -127,7 +139,7 @@ export function leadMessageFull(lead, db, env = process.env) {
   const link = base && lead.contactId ? `${base}/crm/contacts/${lead.contactId}` : null
   const contactLine = contact ? [contact.phone, contact.email, contact.messenger].filter(Boolean).join(' · ') : ''
   const lines = [
-    `🔵 <b>Новая заявка</b>${lead.suspicious ? ' ⚠️ подозрительная' : ''}`,
+    `${leadHeader(lead)}${lead.suspicious ? ' ⚠️ подозрительная' : ''}`,
     lead.projectName ? `Проект: <b>${esc(lead.projectName)}</b>` : null,
     lead.source ? `Источник: ${esc(lead.source)}` : null,
     contact?.name ? `Клиент: <b>${esc(contact.name)}</b>` : null,

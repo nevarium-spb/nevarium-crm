@@ -796,6 +796,42 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       .send()
   })
 
+  /**
+   * Телефон к сравнимому виду: только цифры, российская «восьмёрка» → 7,
+   * дальше сравниваем последние 10 цифр. Так «+7 921 555-14-88», «89215551488»
+   * и «921 5551488» опознаются как один номер.
+   */
+  function phoneKey(raw) {
+    let d = String(raw || '').replace(/\D/g, '')
+    if (d.length === 11 && d.startsWith('8')) d = '7' + d.slice(1)
+    return d.length >= 10 ? d.slice(-10) : ''
+  }
+
+  /**
+   * Тот же человек уже писал? Ищем строго по точному совпадению контакта —
+   * почта, телефон или ник. По имени НЕ ищем: «Иван» без фамилии есть у каждого,
+   * и склеить двух разных клиентов хуже, чем завести им две карточки.
+   *
+   * Ищем только внутри проекта: Лаб ИИ и Визор — разные бизнесы, и один человек
+   * может быть клиентом обоих независимо. Обезличенных пропускаем: они отозвали
+   * согласие, и если пишут снова — это новое согласие и новая карточка (ADR-011).
+   *
+   * Перебор в JS, а не в SQL: нормализацию телефона на SQLite не выразить без
+   * лишней колонки. Контактов у малого бизнеса тысячи, не миллионы — приемлемо.
+   */
+  function findExistingContact(contactInfo, projectId) {
+    const raw = trim(contactInfo, 300).toLowerCase()
+    if (!raw) return null
+    const key = phoneKey(raw)
+    const rows = db
+      .prepare('SELECT id, name, email, phone, messenger, archived FROM contacts WHERE project_id = ? AND anonymized_at IS NULL ORDER BY id DESC')
+      .all(projectId)
+    return rows.find((c) => {
+      if (key) return [c.phone, c.messenger].some((v) => phoneKey(v) === key)
+      return [c.email, c.messenger].some((v) => String(v || '').toLowerCase() === raw)
+    }) || null
+  }
+
   app.post('/api/leads', async (req, reply) => {
     applyLeadCors(req, reply)
     const b = req.body ?? {}
@@ -824,19 +860,73 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       else app.log?.warn?.({ asked, origin: req.headers.origin }, 'lead: неизвестный проект, беру запасной')
     }
 
+    // Дубли: тот же человек мог заполнить форму, а потом написать в чат. Две карточки
+    // на одного клиента рвут историю пополам, поэтому вторую не заводим — привязываем
+    // заявку к существующей (ADR-014). Ошибочную склейку видно сразу и она поправима:
+    // у сделки и у действия можно сменить контакт в обычной форме редактирования.
+    const existing = findExistingContact(contactInfo, projectId)
     const ts = now()
-    const contactId = db.transaction(() => {
-      const isEmail = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(contactInfo)
-      const email = isEmail ? contactInfo : ''
-      const messenger = isEmail ? '' : contactInfo
-      const cid = db.prepare('INSERT INTO contacts (name, email, messenger, note, source, suspicious, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(name, email, messenger, '', isChat ? 'site-chat' : 'site-form', suspicious ? 1 : 0, projectId, ts, ts).lastInsertRowid
-      db.prepare('INSERT INTO deals (contact_id, title, stage, note, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(cid, title, 'Новый', note, projectId, ts, ts)
-      if (transcript) {
-        db.prepare('INSERT INTO interactions (contact_id, type, note, happened_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(cid, 'сообщение', transcript, ts, ts, ts)
+    const result = db.transaction(() => {
+      if (!existing) {
+        const isEmail = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(contactInfo)
+        const email = isEmail ? contactInfo : ''
+        const messenger = isEmail ? '' : contactInfo
+        const cid = db.prepare('INSERT INTO contacts (name, email, messenger, note, source, suspicious, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(name, email, messenger, '', isChat ? 'site-chat' : 'site-form', suspicious ? 1 : 0, projectId, ts, ts).lastInsertRowid
+        db.prepare('INSERT INTO deals (contact_id, title, stage, note, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(cid, title, 'Новый', note, projectId, ts, ts)
+        if (transcript) {
+          db.prepare('INSERT INTO interactions (contact_id, type, note, happened_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(cid, 'сообщение', transcript, ts, ts, ts)
+        }
+        return { contactId: cid, repeat: false }
       }
-      return cid
+
+      const cid = existing.id
+      // Из архива возвращаем: иначе повторная заявка не покажется в инбоксе,
+      // то есть тихо потеряется — а терять заявки нам нельзя ни при каких условиях.
+      if (existing.archived) db.prepare('UPDATE contacts SET archived = 0, updated_at = ? WHERE id = ?').run(ts, cid)
+      else db.prepare('UPDATE contacts SET updated_at = ? WHERE id = ?').run(ts, cid)
+
+      // Открытая сделка уже есть — значит это то же самое обращение, а не новое:
+      // второй карточкой в воронке та же возможность считалась бы дважды.
+      const termMarks = TERMINAL_STAGES.map(() => '?').join(',')
+      const openDeal = db
+        .prepare(`SELECT id FROM deals WHERE contact_id = ? AND stage NOT IN (${termMarks}) ORDER BY id DESC LIMIT 1`)
+        .get(cid, ...TERMINAL_STAGES)
+      let dealId
+      if (openDeal) {
+        dealId = openDeal.id
+        db.prepare('UPDATE deals SET updated_at = ? WHERE id = ?').run(ts, dealId)
+      } else {
+        // Все сделки закрыты — человек вернулся с новой задачей, это новая сделка.
+        dealId = db.prepare('INSERT INTO deals (contact_id, title, stage, note, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+          .run(cid, title, 'Новый', note, projectId, ts, ts).lastInsertRowid
+      }
+
+      // Повторное обращение записываем в историю целиком: заголовок и заметка
+      // новой заявки иначе потерялись бы, ведь сделку мы переиспользовали.
+      const lines = [
+        openDeal ? 'Повторная заявка (сделка уже в работе)' : 'Клиент вернулся с новой заявкой',
+        title ? `Задача: ${title}` : '',
+        note ? `Заметка: ${note}` : '',
+        `Источник: ${isChat ? 'чат Невы' : 'форма на сайте'}`,
+      ].filter(Boolean).join('\n')
+      db.prepare('INSERT INTO interactions (contact_id, deal_id, type, note, happened_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(cid, dealId, 'сообщение', lines, ts, ts, ts)
+      if (transcript) {
+        db.prepare('INSERT INTO interactions (contact_id, deal_id, type, note, happened_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+          .run(cid, dealId, 'сообщение', transcript, ts, ts, ts)
+      }
+
+      // Клиент написал сам — напоминания «узнать, не передумал ли» больше не нужны
+      // и выглядели бы невнимательностью. Снимаем незакрытые, выполненные не трогаем.
+      const seqs = db.prepare("SELECT id FROM winback_sequences WHERE contact_id = ? AND status = 'active'").all(cid)
+      for (const seq of seqs) {
+        db.prepare('DELETE FROM tasks WHERE winback_sequence_id = ? AND done = 0').run(seq.id)
+        db.prepare("UPDATE winback_sequences SET status = 'cancelled', finished_at = ? WHERE id = ?").run(ts, seq.id)
+      }
+      return { contactId: cid, repeat: true, returned: seqs.length > 0 }
     })()
+    const contactId = result.contactId
 
     // В уведомление кладём только обезличенное: проект, источник, ссылку на карточку.
     // Имя, контакт и текст заявки остаются в CRM на российском сервере — Telegram
@@ -847,8 +937,11 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       source: isChat ? 'чат' : 'форма',
       contactId,
       suspicious,
+      // repeat/returned — не ПДн: это про историю обращения, а не про человека
+      repeat: Boolean(result.repeat),
+      returned: Boolean(result.returned),
     })
-    app.log?.info?.({ contactId, projectId, suspicious }, 'lead accepted')
+    app.log?.info?.({ contactId, projectId, suspicious, repeat: result.repeat }, 'lead accepted')
     return reply.code(204).send()
   })
 

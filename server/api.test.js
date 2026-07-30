@@ -227,6 +227,95 @@ describe('приём лидов', () => {
     expect(app.db.prepare('SELECT project_id FROM contacts WHERE id = 1').get().project_id).toBe(1)
   })
 
+  describe('дубли: тот же человек не заводит вторую карточку', () => {
+    const lead = (payload) => app.inject({ method: 'POST', url: '/api/leads', payload })
+    const count = (t) => app.db.prepare(`SELECT COUNT(*) c FROM ${t}`).get().c
+
+    it('форма, потом чат с тем же адресом — один контакт и одна сделка', async () => {
+      await lead({ name: 'Марина', contact: 'm@x.ru', task: 'внедрение ИИ' })
+      await lead({ contact: 'M@X.RU', task: 'уточняю по чат-боту', detail: 'ещё вопрос', source: 'chat' })
+      expect(count('contacts')).toBe(1)
+      expect(count('deals')).toBe(1)
+      // текст второго обращения не потерялся — он в истории
+      const notes = app.db.prepare('SELECT note FROM interactions WHERE contact_id = 1').all().map((r) => r.note).join('\n')
+      expect(notes).toContain('Повторная заявка')
+      expect(notes).toContain('уточняю по чат-боту')
+    })
+
+    it('телефон опознаётся в разных записях: +7, 8 и без кода', async () => {
+      await lead({ name: 'Марина', contact: '+7 921 555-14-88' })
+      await lead({ name: 'Марина', contact: '8 (921) 555-14-88' })
+      await lead({ name: 'Марина', contact: '9215551488' })
+      expect(count('contacts')).toBe(1)
+    })
+
+    it('разные люди не склеиваются', async () => {
+      await lead({ name: 'Марина', contact: 'm@x.ru' })
+      await lead({ name: 'Пётр', contact: 'p@x.ru' })
+      await lead({ name: 'Иван', contact: '+7 921 000-00-01' })
+      expect(count('contacts')).toBe(3)
+    })
+
+    it('совпадение имени без совпадения контакта не склеивает', async () => {
+      await lead({ name: 'Иван Иванов', contact: 'ivan1@x.ru' })
+      await lead({ name: 'Иван Иванов', contact: 'ivan2@x.ru' })
+      expect(count('contacts')).toBe(2)
+    })
+
+    it('одинаковый контакт в разных проектах — разные карточки: это разные бизнесы', async () => {
+      await lead({ name: 'Марина', contact: 'm@x.ru', project: 'nevarium1' })
+      await lead({ name: 'Марина', contact: 'm@x.ru', project: 'nevarium-vizor' })
+      expect(count('contacts')).toBe(2)
+    })
+
+    it('обезличенный контакт не подхватывается — новое обращение это новое согласие', async () => {
+      await lead({ name: 'Марина', contact: 'm@x.ru' })
+      await app.inject({ method: 'POST', url: '/api/crm/contacts/1/anonymize', headers: { cookie } })
+      await lead({ name: 'Марина', contact: 'm@x.ru' })
+      expect(count('contacts')).toBe(2)
+    })
+
+    it('если все сделки закрыты — заводится новая, а не переиспользуется', async () => {
+      await lead({ name: 'Марина', contact: 'm@x.ru', task: 'первый проект' })
+      await app.inject({ method: 'PATCH', url: '/api/crm/deals/1', payload: { stage: 'Оплачено' }, headers: { cookie } })
+      await lead({ name: 'Марина', contact: 'm@x.ru', task: 'второй проект' })
+      expect(count('contacts')).toBe(1)
+      expect(count('deals')).toBe(2)
+      expect(app.db.prepare('SELECT stage FROM deals WHERE id = 2').get().stage).toBe('Новый')
+    })
+
+    it('вернувшийся клиент снимает напоминания воронки возврата', async () => {
+      await lead({ name: 'Марина', contact: 'm@x.ru' })
+      await app.inject({ method: 'PATCH', url: '/api/crm/deals/1', payload: { stage: 'Проиграно', reason: 'дорого' }, headers: { cookie } })
+      expect(app.db.prepare('SELECT COUNT(*) c FROM tasks WHERE done = 0').get().c).toBe(3)
+
+      await lead({ name: 'Марина', contact: 'm@x.ru', task: 'всё-таки решились' })
+      expect(app.db.prepare('SELECT COUNT(*) c FROM tasks WHERE done = 0').get().c).toBe(0)
+      expect(app.db.prepare('SELECT status FROM winback_sequences WHERE id = 1').get().status).toBe('cancelled')
+      // и уведомление говорит именно о возврате, а не о «новой заявке»
+      const payload = JSON.parse(app.db.prepare('SELECT payload FROM outbox ORDER BY id DESC LIMIT 1').get().payload)
+      expect(leadMessage(payload)).toContain('Клиент вернулся сам')
+    })
+
+    it('архивный контакт возвращается из архива, иначе заявка пропала бы из инбокса', async () => {
+      await lead({ name: 'Марина', contact: 'm@x.ru' })
+      await app.inject({ method: 'PATCH', url: '/api/crm/contacts/1', payload: { archived: 1 }, headers: { cookie } })
+      await lead({ name: 'Марина', contact: 'm@x.ru' })
+      expect(app.db.prepare('SELECT archived FROM contacts WHERE id = 1').get().archived).toBe(0)
+      const dash = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/dashboard', headers: { cookie } })).body)
+      expect(dash.inbox.some((c) => c.id === 1)).toBe(true)
+    })
+
+    it('повторная заявка помечена в уведомлении, но ПДн в Telegram по-прежнему нет', async () => {
+      await lead({ name: 'Марина Соколова', contact: 'm@x.ru' })
+      await lead({ name: 'Марина Соколова', contact: 'm@x.ru', task: 'секретная задача' })
+      const payload = JSON.parse(app.db.prepare('SELECT payload FROM outbox ORDER BY id DESC LIMIT 1').get().payload)
+      const text = leadMessage(payload)
+      expect(text).toContain('Повторная заявка')
+      expect(text).not.toMatch(/Марина|секретная/)
+    })
+  })
+
   it('CORS: чужой домен не проходит preflight, свой — проходит', async () => {
     app.db.prepare("UPDATE projects SET origins = 'https://vizor.example.ru' WHERE slug = 'nevarium-vizor'").run()
     const alien = await app.inject({ method: 'OPTIONS', url: '/api/leads', headers: { origin: 'https://evil.example' } })

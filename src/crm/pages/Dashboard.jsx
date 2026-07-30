@@ -186,7 +186,7 @@ export default function Dashboard() {
             <div className="act-line" key={a.id}>
               <span className="act-dot" />
               <div>
-                {a.type[0].toUpperCase() + a.type.slice(1)}{a.contact_name ? ` с ${a.contact_name}` : ''}{a.note ? ` — ${a.note}` : ''}
+                {a.type[0].toUpperCase() + a.type.slice(1)}{a.contact_name ? ` с ${a.contact_name}` : ''}{a.note ? ` — ${feedNote(a.note)}` : ''}
                 <span className="act-time">{a.user_name || 'система'} · {relTime(a.happened_at)}</span>
               </div>
             </div>
@@ -222,6 +222,16 @@ export default function Dashboard() {
       )}
     </>
   )
+}
+
+/**
+ * Заметка для ленты действий: переносы строк в « · », длинное обрезаем.
+ * Транскрипт чата бывает на несколько тысяч знаков — целиком он превратил бы
+ * плитку в простыню. Полный текст всегда виден на карточке контакта.
+ */
+function feedNote(note, limit = 140) {
+  const oneLine = String(note).replace(/\s*\n+\s*/g, ' · ').trim()
+  return oneLine.length > limit ? `${oneLine.slice(0, limit).trimEnd()}…` : oneLine
 }
 
 function StatRow({ label, n, total }) {
