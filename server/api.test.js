@@ -7,7 +7,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { buildApp, mskToday } from './app.js'
 import { hashPassword, resetThrottle, verifyPassword } from './auth.js'
 import { bootstrapAdmin } from './bootstrap.js'
-import { MIGRATIONS, now, openDb } from './db.js'
+import { runBackup } from './backup.js'
+import { MIGRATIONS, addWorkdays, now, openDb } from './db.js'
 import { leadMessage, startOutboxWorker } from './telegram.js'
 
 let app, cookie
@@ -159,7 +160,7 @@ describe('приём лидов', () => {
     const deal = app.db.prepare('SELECT * FROM deals WHERE id = 1').get()
     expect(deal.title).toContain('внедрение ИИ')
     expect(deal.stage).toBe('Новый')
-    expect(app.db.prepare("SELECT COUNT(*) c FROM outbox WHERE kind = 'lead' AND sent_at IS NULL").get().c).toBe(1)
+    expect(app.db.prepare("SELECT COUNT(*) c FROM outbox WHERE kind = 'lead' AND tg_sent_at IS NULL AND max_sent_at IS NULL").get().c).toBe(1)
   })
 
   it('чат: detail → заметка сделки, handle → messenger и имя', async () => {
@@ -168,6 +169,20 @@ describe('приём лидов', () => {
     const contact = app.db.prepare('SELECT * FROM contacts WHERE id = 1').get()
     expect(contact).toMatchObject({ name: '@tg_user', messenger: '@tg_user', source: 'site-chat' })
     expect(app.db.prepare('SELECT note FROM deals WHERE id = 1').get().note).toBe('для клиники')
+  })
+
+  it('чат: transcript → полная переписка во взаимодействиях, а не в note сделки', async () => {
+    const transcript = 'Нева: Здравствуйте!\nКлиент: хочу чат-бота\nНева: на какой масштаб?'
+    const res = await app.inject({ method: 'POST', url: '/api/leads', payload: { task: 'чат-бот', detail: 'для клиники', transcript, contact: '@tg_user', source: 'chat' } })
+    expect(res.statusCode).toBe(204)
+    expect(app.db.prepare('SELECT note FROM deals WHERE id = 1').get().note).toBe('для клиники')
+    const interaction = app.db.prepare('SELECT * FROM interactions WHERE contact_id = 1').get()
+    expect(interaction).toMatchObject({ type: 'сообщение', note: transcript })
+  })
+
+  it('форма без transcript не создаёт взаимодействие', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Клиент', contact: 'k@x.ru' } })
+    expect(app.db.prepare('SELECT COUNT(*) c FROM interactions').get().c).toBe(0)
   })
 
   it('honeypot принимается, но помечается подозрительным', async () => {
@@ -223,34 +238,41 @@ describe('приём лидов', () => {
   })
 })
 
-describe('outbox: лид не теряется при падении Telegram', () => {
-  it('ошибка отправки увеличивает attempts, успех ставит sent_at', async () => {
+describe('outbox: лид не теряется при падении Telegram или MAX', () => {
+  it('ошибка отправки увеличивает attempts, успех ставит sent_at — независимо по каналам', async () => {
     await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru' } })
-    let calls = 0
-    const failingSend = async () => {
-      calls++
-      if (calls === 1) throw new Error('Telegram down')
+    let tgCalls = 0
+    const failingTg = async () => {
+      tgCalls++
+      if (tgCalls === 1) throw new Error('Telegram down')
     }
-    const worker = startOutboxWorker(app.db, { intervalMs: 10_000_000, send: failingSend, log: { warn() {} }, autoStart: false })
+    const okMax = async () => {}
+    const worker = startOutboxWorker(app.db, { intervalMs: 10_000_000, senders: { tg: failingTg, max: okMax }, log: { warn() {} }, autoStart: false })
     worker.stop()
     await worker.tick()
     let row = app.db.prepare('SELECT * FROM outbox WHERE id = 1').get()
-    expect(row.attempts).toBe(1)
-    expect(row.sent_at).toBeNull()
+    expect(row.tg_attempts).toBe(1)
+    expect(row.tg_sent_at).toBeNull()
+    // MAX не зависит от Telegram — уже отправлено с первой попытки
+    expect(row.max_sent_at).toBeTruthy()
     await worker.tick()
     row = app.db.prepare('SELECT * FROM outbox WHERE id = 1').get()
-    expect(row.sent_at).toBeTruthy()
+    expect(row.tg_sent_at).toBeTruthy()
   })
 
-  it('после 20 попыток запись не берётся в обработку (мёртвая, видна в очереди)', async () => {
+  it('после 20 попыток запись не берётся в обработку по этому каналу (мёртвая, видна в очереди)', async () => {
     await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru' } })
-    app.db.prepare('UPDATE outbox SET attempts = 20 WHERE id = 1').run()
-    let calls = 0
-    const worker = startOutboxWorker(app.db, { send: async () => { calls++ }, log: { warn() {} }, autoStart: false })
+    app.db.prepare('UPDATE outbox SET tg_attempts = 20 WHERE id = 1').run()
+    let tgCalls = 0
+    let maxCalls = 0
+    const worker = startOutboxWorker(app.db, { senders: { tg: async () => { tgCalls++ }, max: async () => { maxCalls++ } }, log: { warn() {} }, autoStart: false })
     worker.stop()
     await worker.tick()
-    expect(calls).toBe(0)
-    expect(app.db.prepare('SELECT sent_at FROM outbox WHERE id = 1').get().sent_at).toBeNull()
+    expect(tgCalls).toBe(0)
+    expect(app.db.prepare('SELECT tg_sent_at FROM outbox WHERE id = 1').get().tg_sent_at).toBeNull()
+    // MAX не исчерпал попытки — продолжает отправляться
+    expect(maxCalls).toBe(1)
+    expect(app.db.prepare('SELECT max_sent_at FROM outbox WHERE id = 1').get().max_sent_at).toBeTruthy()
   })
 
   it('leadMessage экранирует HTML', () => {
@@ -277,18 +299,71 @@ describe('outbox: лид не теряется при падении Telegram', 
     expect(text).toContain('Невариум Визор')
     expect(text).not.toContain('http')
   })
+
+  it('условный заказ клиента: в MAX уходит с ФИО и контактом, в Telegram — обезличено', async () => {
+    await app.inject({
+      method: 'POST',
+      url: '/api/leads',
+      payload: { task: 'внедрение чат-бота', name: 'Марина Соколова', contact: '+7 921 555-14-88', note: 'нужен запуск до конца месяца' },
+    })
+    let tgText = ''
+    let maxText = ''
+    const worker = startOutboxWorker(app.db, {
+      senders: {
+        tg: async (text) => { tgText = text },
+        max: async (text) => { maxText = text },
+      },
+      log: { warn() {} },
+      autoStart: false,
+    })
+    worker.stop()
+    await worker.tick()
+
+    expect(tgText).not.toMatch(/Марина|555-14-88|внедрение чат-бота|нужен запуск/)
+    expect(maxText).toContain('Марина Соколова')
+    expect(maxText).toContain('555-14-88')
+    expect(maxText).toContain('внедрение чат-бота')
+    expect(maxText).toContain('нужен запуск до конца месяца')
+  })
 })
 
 describe('экспорт / импорт / CSV', () => {
-  it('раунд-трип: экспорт → wipe → импорт', async () => {
+  // Раунд-трип обязан покрывать ВСЕ четыре сущности: экспорт отдаёт `SELECT *`, а импорт
+  // сверяет колонки с белым списком, поэтому забытая в списке колонка ломает импорт
+  // своего же экспорта. Так уже случалось дважды — с `winback_sequence_id` (Веха 7)
+  // и `anonymized_at` (права ПДн), и оба раза только на задачах/контактах.
+  it('раунд-трип: экспорт → wipe → импорт, все сущности и все колонки', async () => {
     await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов', phone: '+7 999' }, headers: { cookie } })
     await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'Пилот', amount: 777 }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/tasks', payload: { title: 'Позвонить', contact_id: 1, due_date: '2026-08-01' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/interactions', payload: { contact_id: 1, type: 'звонок', note: 'обсудили' }, headers: { cookie } })
     const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
     expect(dump.contacts).toHaveLength(1)
+    expect(dump.tasks).toHaveLength(1)
+    expect(dump.interactions).toHaveLength(1)
     const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })
     expect(res.statusCode).toBe(200)
     expect(app.db.prepare('SELECT name FROM contacts WHERE id = 1').get().name).toBe('Иванов')
     expect(app.db.prepare('SELECT amount FROM deals WHERE id = 1').get().amount).toBe(777)
+    expect(app.db.prepare('SELECT title FROM tasks WHERE id = 1').get().title).toBe('Позвонить')
+    expect(app.db.prepare('SELECT note FROM interactions WHERE id = 1').get().note).toBe('обсудили')
+  })
+
+  it('раунд-трип переживает обезличенный контакт и задачу из воронки возврата', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru' } })
+    await app.inject({ method: 'PATCH', url: '/api/crm/deals/1', payload: { stage: 'Проиграно', reason: 'дорого' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Пётр' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/contacts/2/anonymize', headers: { cookie } })
+    expect(app.db.prepare('SELECT COUNT(*) c FROM tasks WHERE winback_sequence_id IS NOT NULL').get().c).toBe(3)
+
+    const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+    const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })
+    expect(res.statusCode).toBe(200)
+    // признак обезличивания сохранился — восстановление не «расконсервирует» человека
+    expect(app.db.prepare('SELECT name, anonymized_at FROM contacts WHERE id = 2').get().anonymized_at).toBeTruthy()
+    // задачи серии на месте, но ссылка на серию обнулена: самих серий в дампе нет
+    expect(app.db.prepare('SELECT COUNT(*) c FROM tasks').get().c).toBe(3)
+    expect(app.db.prepare('SELECT COUNT(*) c FROM tasks WHERE winback_sequence_id IS NOT NULL').get().c).toBe(0)
   })
 
   it('битый файл отклоняется атомарно', async () => {
@@ -363,6 +438,73 @@ describe('дашборд', () => {
     const dash = JSON.parse((await app.inject({ method: 'GET', url: `/api/crm/dashboard?_now=${nowMs}`, headers: { cookie } })).body)
     expect(dash.today).toBe('2026-07-10')
     expect(dash.tasksToday.some((t) => t.title === 'Сегодня по МСК')).toBe(true)
+  })
+
+  describe('«остывают» — сделки, о которых забыли', () => {
+    // Сделку «состариваем» прямой правкой created_at: через API этого не сделать,
+    // а ждать трое суток в тесте не вариант.
+    const age = (table, id, daysAgo) =>
+      app.db.prepare(`UPDATE ${table} SET created_at = ? WHERE id = ?`)
+        .run(new Date(Date.now() - daysAgo * 864e5).toISOString(), id)
+
+    const cooling = async () =>
+      JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/dashboard', headers: { cookie } })).body).cooling
+
+    it('сделка без единого взаимодействия попадает в блок, свежая — нет', async () => {
+      await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Забытый' }, headers: { cookie } })
+      await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'Тихая' }, headers: { cookie } })
+      age('deals', 1, 5)
+      await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Свежий' }, headers: { cookie } })
+      await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 2, title: 'Свежая' }, headers: { cookie } })
+
+      const rows = await cooling()
+      expect(rows.map((r) => r.title)).toEqual(['Тихая'])
+      expect(rows[0].no_touch).toBe(1)
+      expect(rows[0].contact_name).toBe('Забытый')
+    })
+
+    it('свежее взаимодействие снимает сделку с «остывающих»', async () => {
+      await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Клиент' }, headers: { cookie } })
+      await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'Сделка' }, headers: { cookie } })
+      age('deals', 1, 5)
+      expect((await cooling())).toHaveLength(1)
+      await app.inject({ method: 'POST', url: '/api/crm/interactions', payload: { contact_id: 1, type: 'звонок', note: 'связались' }, headers: { cookie } })
+      expect((await cooling())).toHaveLength(0)
+    })
+
+    it('открытая задача означает «договорились» — сделка не остывает, закрытая не спасает', async () => {
+      await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Клиент' }, headers: { cookie } })
+      await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'Сделка' }, headers: { cookie } })
+      age('deals', 1, 5)
+      await app.inject({ method: 'POST', url: '/api/crm/tasks', payload: { title: 'Позвонить в среду', contact_id: 1 }, headers: { cookie } })
+      expect((await cooling())).toHaveLength(0)
+      await app.inject({ method: 'PATCH', url: '/api/crm/tasks/1', payload: { done: 1 }, headers: { cookie } })
+      expect((await cooling())).toHaveLength(1)
+    })
+
+    it('закрытые и обезличенные в блок не попадают', async () => {
+      await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Выигранный' }, headers: { cookie } })
+      await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'Оплаченная' }, headers: { cookie } })
+      await app.inject({ method: 'PATCH', url: '/api/crm/deals/1', payload: { stage: 'Оплачено' }, headers: { cookie } })
+      age('deals', 1, 5)
+
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Ушедший', contact: 'u@x.ru' } })
+      age('deals', 2, 5)
+      await app.inject({ method: 'POST', url: '/api/crm/contacts/2/anonymize', headers: { cookie } })
+
+      expect((await cooling())).toHaveLength(0)
+    })
+
+    it('блок уважает фильтр по проекту', async () => {
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Лаб', contact: 'l@x.ru', project: 'nevarium1' } })
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Визор', contact: 'v@x.ru', project: 'nevarium-vizor' } })
+      age('deals', 1, 5)
+      age('deals', 2, 5)
+      const all = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/dashboard?project=all', headers: { cookie } })).body).cooling
+      expect(all).toHaveLength(2)
+      const vizor = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/dashboard?project=nevarium-vizor', headers: { cookie } })).body).cooling
+      expect(vizor.map((r) => r.contact_name)).toEqual(['Визор'])
+    })
   })
 
   it('экспорт и CSV доступны только админу', async () => {
@@ -514,6 +656,205 @@ describe('bootstrapAdmin — первый админ без shell-доступа
     })
     expect(created).toBe(false)
     expect(app.db.prepare('SELECT COUNT(*) c FROM users').get().c).toBe(0)
+  })
+})
+
+describe('права субъекта ПДн (152-ФЗ)', () => {
+  it('дедлайн считается в рабочих днях, выходные пропускаются', () => {
+    // 2026-07-30 — четверг; +10 рабочих дней = 2026-08-13 (два уик-энда позади)
+    expect(addWorkdays('2026-07-30', 10)).toBe('2026-08-13')
+    // пятница +1 рабочий день = понедельник, а не суббота
+    expect(addWorkdays('2026-07-31', 1)).toBe('2026-08-03')
+  })
+
+  it('запрос с сайта регистрируется, сам находит клиента по email и ставит срок', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'marina@x.ru' } })
+    const res = await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'marina@x.ru', kind: 'delete' } })
+    expect(res.statusCode).toBe(204)
+    const row = app.db.prepare('SELECT * FROM pd_requests WHERE id = 1').get()
+    expect(row).toMatchObject({ contact_id: 1, kind: 'delete', status: 'new', source: 'site-form' })
+    expect(row.due_date).toBe(addWorkdays(mskToday()))
+  })
+
+  it('незнакомый адрес не теряется — запрос заводится без привязки к контакту', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'кто-то@ещё.ru' } })
+    expect(res.statusCode).toBe(204)
+    expect(app.db.prepare('SELECT contact_id FROM pd_requests WHERE id = 1').get().contact_id).toBeNull()
+  })
+
+  it('уведомление о запросе обезличено для обоих каналов', async () => {
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'marina@secret.ru', note: 'прошу удалить всё' } })
+    const payload = JSON.parse(app.db.prepare("SELECT payload FROM outbox WHERE kind = 'text' ORDER BY id DESC LIMIT 1").get().payload)
+    expect(payload.text).not.toMatch(/marina@secret\.ru|прошу удалить/)
+    expect(payload.text).toContain('Запрос по персональным данным')
+  })
+
+  it('без контакта запрос не принимается', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { note: 'без адреса' } })
+    expect(res.statusCode).toBe(400)
+  })
+
+  it('обезличивание стирает ПДн, но сохраняет сделку и её стадию', async () => {
+    await app.inject({
+      method: 'POST',
+      url: '/api/leads',
+      payload: { name: 'Марина Соколова', contact: '+7 921 555-14-88', task: 'внедрение ИИ', note: 'звонить после 18', transcript: 'Клиент: меня зовут Марина, телефон 555-14-88', source: 'chat' },
+    })
+    app.db.prepare("INSERT INTO tasks (title, contact_id, created_at, updated_at) VALUES ('Позвонить Марине', 1, ?, ?)").run(now(), now())
+    const res = await app.inject({ method: 'POST', url: '/api/crm/contacts/1/anonymize', headers: { cookie } })
+    expect(res.statusCode).toBe(200)
+
+    const contact = app.db.prepare('SELECT * FROM contacts WHERE id = 1').get()
+    expect(contact.name).toBe('Удалённый контакт #1')
+    expect([contact.phone, contact.email, contact.messenger, contact.note]).toEqual(['', '', '', ''])
+    expect(contact.anonymized_at).toBeTruthy()
+
+    // сделка на месте — воронка за прошлые периоды не поехала
+    const deal = app.db.prepare('SELECT * FROM deals WHERE contact_id = 1').get()
+    expect(deal.stage).toBe('Новый')
+    expect(deal.note).toBe('')
+    // транскрипт затёрт, но строка взаимодействия осталась для статистики активности
+    const inter = app.db.prepare('SELECT * FROM interactions WHERE contact_id = 1').get()
+    expect(inter.note).toBe('')
+    // задачи удалены: обработку требовали прекратить
+    expect(app.db.prepare('SELECT COUNT(*) c FROM tasks WHERE contact_id = 1').get().c).toBe(0)
+    // и всё это попало в журнал
+    expect(app.db.prepare("SELECT COUNT(*) c FROM audit_log WHERE action = 'anonymize'").get().c).toBe(1)
+  })
+
+  it('обезличивание отменяет активную воронку возврата', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Пётр', contact: 'p@x.ru' } })
+    await app.inject({ method: 'PATCH', url: '/api/crm/deals/1', payload: { stage: 'Проиграно', reason: 'дорого' }, headers: { cookie } })
+    expect(app.db.prepare("SELECT COUNT(*) c FROM winback_sequences WHERE status = 'active'").get().c).toBe(1)
+    await app.inject({ method: 'POST', url: '/api/crm/contacts/1/anonymize', headers: { cookie } })
+    expect(app.db.prepare("SELECT status FROM winback_sequences WHERE id = 1").get().status).toBe('cancelled')
+    expect(app.db.prepare('SELECT COUNT(*) c FROM tasks WHERE contact_id = 1').get().c).toBe(0)
+  })
+
+  it('повторное обезличивание безвредно и не портит заглушку', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru' } })
+    await app.inject({ method: 'POST', url: '/api/crm/contacts/1/anonymize', headers: { cookie } })
+    const first = app.db.prepare('SELECT anonymized_at FROM contacts WHERE id = 1').get().anonymized_at
+    const res = await app.inject({ method: 'POST', url: '/api/crm/contacts/1/anonymize', headers: { cookie } })
+    expect(res.statusCode).toBe(200)
+    expect(app.db.prepare('SELECT name, anonymized_at FROM contacts WHERE id = 1').get())
+      .toEqual({ name: 'Удалённый контакт #1', anonymized_at: first })
+  })
+
+  it('исполнение запроса из списка: статус done + обезличивание одним действием', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'marina@x.ru' } })
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'marina@x.ru' } })
+    const res = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'done', anonymize: true }, headers: { cookie } })
+    expect(res.statusCode).toBe(200)
+    expect(JSON.parse(res.body).anonymized.name).toBe('Удалённый контакт #1')
+    const row = app.db.prepare('SELECT * FROM pd_requests WHERE id = 1').get()
+    expect(row.status).toBe('done')
+    expect(row.resolved_at).toBeTruthy()
+  })
+
+  it('на запрос «узнать, какие данные есть» обезличивание не срабатывает', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'marina@x.ru' } })
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'marina@x.ru', kind: 'access' } })
+    const res = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { anonymize: true }, headers: { cookie } })
+    expect(res.statusCode).toBe(400)
+    expect(JSON.parse(res.body).error).toBe('kind_not_erasable')
+    expect(app.db.prepare('SELECT anonymized_at FROM contacts WHERE id = 1').get().anonymized_at).toBeNull()
+  })
+
+  it('обезличенный контакт не подхватывается новым запросом по старому адресу', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'marina@x.ru' } })
+    await app.inject({ method: 'POST', url: '/api/crm/contacts/1/anonymize', headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'marina@x.ru' } })
+    expect(app.db.prepare('SELECT contact_id FROM pd_requests WHERE id = 1').get().contact_id).toBeNull()
+  })
+
+  it('журнал действий пишется в базу и доступен только администратору', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Тест' }, headers: { cookie } })
+    const row = app.db.prepare("SELECT * FROM audit_log WHERE entity = 'contacts' ORDER BY id DESC LIMIT 1").get()
+    expect(row).toMatchObject({ action: 'create', entity: 'contacts', user_email: 'a@a.ru' })
+
+    const asAdmin = await app.inject({ method: 'GET', url: '/api/crm/audit', headers: { cookie } })
+    expect(asAdmin.statusCode).toBe(200)
+    expect(JSON.parse(asAdmin.body).items.length).toBeGreaterThan(0)
+
+    app.db.prepare('INSERT INTO users (name,email,password_hash,role,created_at) VALUES (?,?,?,?,?)')
+      .run('Участник', 'm@m.ru', app.db.prepare('SELECT password_hash h FROM users WHERE id = 1').get().h, 'member', now())
+    const memberCookie = (await login('m@m.ru', 'password123')).headers['set-cookie']
+    const asMember = await app.inject({ method: 'GET', url: '/api/crm/audit', headers: { cookie: memberCookie } })
+    expect(asMember.statusCode).toBe(403)
+  })
+})
+
+describe('бэкап: файл базы уходит в MAX, но никогда в Telegram', () => {
+  const silent = { warn() {}, error() {}, info() {} }
+  const maxEnv = { MAX_BOT_TOKEN: 'max-token', MAX_CHAT_ID: '42' }
+  let dir
+
+  beforeEach(() => {
+    dir = path.join(os.tmpdir(), `nv-backup-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+  })
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }))
+
+  it('копия базы создаётся и отправляется документом в MAX', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина Соколова', contact: '+7 921 555-14-88' } })
+    const sent = []
+    const file = await runBackup(app.db, {
+      dir,
+      env: maxEnv,
+      log: silent,
+      sendDocument: async (f, caption) => sent.push({ f, caption }),
+      sendStatus: async () => { throw new Error('статус не нужен, когда всё прошло') },
+    })
+    expect(fs.existsSync(file)).toBe(true)
+    expect(sent).toHaveLength(1)
+    expect(sent[0].f).toBe(file)
+    // в копии действительно лежат ПДн — именно поэтому её нельзя в Telegram
+    const copy = new Database(file, { readonly: true })
+    expect(copy.prepare('SELECT name FROM contacts WHERE id = 1').get().name).toBe('Марина Соколова')
+    copy.close()
+  })
+
+  it('если MAX не настроен — копия остаётся на сервере, статус обезличен, файл никуда не уходит', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина Соколова', contact: '+7 921 555-14-88' } })
+    const docs = []
+    const statuses = []
+    const file = await runBackup(app.db, {
+      dir,
+      env: {},
+      log: silent,
+      sendDocument: async (f) => docs.push(f),
+      sendStatus: async (text) => statuses.push(text),
+    })
+    expect(fs.existsSync(file)).toBe(true)
+    expect(docs).toHaveLength(0)
+    expect(statuses).toHaveLength(1)
+    expect(statuses[0]).not.toMatch(/Марина|555-14-88/)
+  })
+
+  it('ошибка отправки не теряет копию и сообщает обезличенным статусом', async () => {
+    const statuses = []
+    const file = await runBackup(app.db, {
+      dir,
+      env: maxEnv,
+      log: silent,
+      sendDocument: async () => { throw new Error('MAX недоступен') },
+      sendStatus: async (text) => statuses.push(text),
+    })
+    expect(fs.existsSync(file)).toBe(true)
+    expect(statuses[0]).toContain('не отправился')
+  })
+
+  it('ротация оставляет 7 последних копий', async () => {
+    fs.mkdirSync(dir, { recursive: true })
+    for (const d of ['01', '02', '03', '04', '05', '06', '07', '08', '09']) {
+      fs.writeFileSync(path.join(dir, `crm-2026-01-${d}.sqlite`), 'старая копия')
+    }
+    await runBackup(app.db, { dir, env: {}, log: silent, sendDocument: async () => {}, sendStatus: async () => {} })
+    const left = fs.readdirSync(dir).filter((f) => f.startsWith('crm-'))
+    expect(left).toHaveLength(7)
+    // самые старые удалены, сегодняшняя на месте
+    expect(left).not.toContain('crm-2026-01-01.sqlite')
+    expect(left.some((f) => f.includes(new Date().toISOString().slice(0, 10)))).toBe(true)
   })
 })
 

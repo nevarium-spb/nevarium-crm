@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useOutletContext } from 'react-router-dom'
 import { repo } from '../api.js'
+import { EntityModal } from '../forms.jsx'
 import { ProjectBadge, ProjectFilter, shortProject, useProjectFilter } from '../projects.jsx'
 import { SOURCE_LABEL, apiErrorToast, fmtMoney, onRefresh, relTime } from '../ui.jsx'
 
@@ -21,6 +22,7 @@ export default function Dashboard() {
   const [data, setData] = useState(null)
   const { user: me } = useOutletContext()
   const [project, setProject] = useProjectFilter()
+  const [taskModal, setTaskModal] = useState(null)
 
   // Нумеруем запросы: медленный ответ по прошлому проекту не должен затереть свежий.
   const reqId = useRef(0)
@@ -117,8 +119,51 @@ export default function Dashboard() {
           ))}
         </section>
 
+        {/* Блок отвечает на вопрос «я про кого-нибудь забыл?». Сделка уходит отсюда,
+            как только по ней появится взаимодействие или открытая задача — поэтому
+            кнопка «Поставить задачу» здесь и есть способ закрыть строку. */}
+        <section className="tile span2" aria-label="Остывающие сделки">
+          <div className="tile-title">
+            <span className="tile-num">03</span>
+            <h2>Остывают{data.cooling.length ? ` · ${data.cooling.length}` : ''}</h2>
+          </div>
+          {data.cooling.length === 0 && (
+            <div className="empty">Ничего не остывает — по всем живым сделкам есть свежее касание или запланированная задача.</div>
+          )}
+          {data.cooling.length > 0 && (
+            <div className="crm-cap" style={{ marginBottom: 8 }}>
+              Тишина дольше {data.coolingDays} дней. Сделки с открытой задачей сюда не попадают.
+            </div>
+          )}
+          {data.cooling.map((row) => (
+            <div className="row-line" key={row.id}>
+              <div style={{ minWidth: 0 }}>
+                <div className="row-name">
+                  <Link to={`/crm/contacts/${row.contact_id}`}>{row.contact_name}</Link>
+                  {row.amount ? <span className="row-meta"> · {fmtMoney(row.amount)}</span> : null}
+                </div>
+                <div className="row-meta">
+                  {row.title} · {row.stage} · {row.no_touch ? 'ни одного касания с' : 'последнее касание'} {relTime(row.last_touch)}
+                </div>
+              </div>
+              <span className="row-badges">
+                <ProjectBadge id={row.project_id} when={project === 'all'} />
+                <button
+                  className="btn"
+                  style={{ minHeight: 32, fontSize: 12 }}
+                  // Срок по умолчанию — сегодня: иначе задача без даты уходит в «без срока»,
+                  // сделка пропадает из «остывают», и на дашборде не остаётся никакого следа.
+                  onClick={() => setTaskModal({ contact_id: row.contact_id, deal_id: row.id, due_date: data.today, title: `Связаться: ${row.contact_name}` })}
+                >
+                  Поставить задачу
+                </button>
+              </span>
+            </div>
+          ))}
+        </section>
+
         <section className="tile span2" aria-label="Воронка">
-          <div className="tile-title"><span className="tile-num">03</span><h2>Воронка · {fmtMoney(totalOpen)} в работе</h2></div>
+          <div className="tile-title"><span className="tile-num">04</span><h2>Воронка · {fmtMoney(totalOpen)} в работе</h2></div>
           {data.counts.deals === 0 && <div className="empty">Сделок пока нет — создайте первую на канбане.<br /><Link to="/crm/deals" className="btn">К сделкам</Link></div>}
           {data.counts.deals > 0 && data.funnel.map((f) => (
             <div className="funnel-row" key={f.stage}>
@@ -135,7 +180,7 @@ export default function Dashboard() {
         </section>
 
         <section className="tile span2" aria-label="Последние действия">
-          <div className="tile-title"><span className="tile-num">04</span><h2>Последние действия</h2></div>
+          <div className="tile-title"><span className="tile-num">05</span><h2>Последние действия</h2></div>
           {data.activity.length === 0 && <div className="empty">История пуста — залогируйте первый звонок через Неву (Ctrl K).</div>}
           {data.activity.map((a) => (
             <div className="act-line" key={a.id}>
@@ -150,7 +195,7 @@ export default function Dashboard() {
 
         <section className="tile span2" aria-label="Аналитика заявок">
           <div className="tile-title">
-            <span className="tile-num">05</span>
+            <span className="tile-num">06</span>
             <h2>Заявки за {stats.days} дней · {totalLeads}</h2>
           </div>
           {totalLeads === 0 && <div className="empty">За этот период заявок не было.</div>}
@@ -172,6 +217,9 @@ export default function Dashboard() {
           )}
         </section>
       </div>
+      {taskModal && (
+        <EntityModal entity="tasks" initial={taskModal} onSaved={load} onClose={() => setTaskModal(null)} />
+      )}
     </>
   )
 }

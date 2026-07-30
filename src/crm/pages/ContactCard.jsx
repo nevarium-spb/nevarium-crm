@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { repo } from '../api.js'
+import { api, repo } from '../api.js'
 import { EntityModal } from '../forms.jsx'
 import { apiErrorToast, fmtMoney, onRefresh, relTime, toast } from '../ui.jsx'
 
-export default function ContactCard() {
+export default function ContactCard({ user }) {
   const { id } = useParams()
   const navigate = useNavigate()
   const [card, setCard] = useState(null)
@@ -48,6 +48,26 @@ export default function ContactCard() {
     }
   }
 
+  // Обезличивание по требованию клиента (152-ФЗ). Необратимо, поэтому подтверждение
+  // прямо перечисляет, что исчезнет, а что останется — владелец не программист.
+  const anonymize = async () => {
+    if (!window.confirm(
+      `Обезличить контакт «${contact.name}»?\n\n`
+      + 'Будут стёрты: имя, компания, телефон, почта, мессенджер, заметки, тексты действий и переписка с чатом.\n'
+      + 'Останутся: сделки со стадиями и суммами (для статистики), даты действий.\n'
+      + 'Задачи по этому контакту будут удалены, напоминания воронки возврата отменены.\n\n'
+      + 'Отменить это будет НЕЛЬЗЯ.'
+    )) return
+    try {
+      await api(`/crm/contacts/${contact.id}/anonymize`, { method: 'POST' })
+      toast('Контакт обезличен')
+      load()
+    } catch (err) {
+      if (err.data?.error === 'admin_only') toast('Обезличивать может только администратор', 'error')
+      else apiErrorToast(err)
+    }
+  }
+
   const timeline = [
     ...interactions.map((i) => ({ kind: 'interaction', at: i.happened_at, item: i })),
     ...tasks.map((t) => ({ kind: 'task', at: t.due_date || t.created_at, item: t })),
@@ -62,6 +82,7 @@ export default function ContactCard() {
           <div className="crm-sub">
             {[contact.company, contact.phone, contact.email, contact.messenger].filter(Boolean).join(' · ') || 'нет данных'}
             {contact.suspicious ? ' · ⚠ подозрительный' : ''}{contact.archived ? ' · в архиве' : ''}
+            {contact.anonymized_at ? ' · 🔒 обезличен по запросу клиента' : ''}
           </div>
         </div>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -70,6 +91,11 @@ export default function ContactCard() {
           <button className="btn" onClick={() => setModal({ entity: 'tasks', initial: { contact_id: contact.id } })}>+ Задача</button>
           <button className="btn" onClick={() => setModal({ entity: 'deals', initial: { contact_id: contact.id } })}>+ Сделка</button>
           <button className="btn" onClick={archive}>{contact.archived ? 'Из архива' : 'В архив'}</button>
+          {user?.role === 'admin' && !contact.anonymized_at && (
+            <button className="btn danger" onClick={anonymize} title="Исполнить требование клиента об удалении данных (152-ФЗ)">
+              Обезличить
+            </button>
+          )}
           {deals.length === 0 && <button className="btn danger" onClick={remove}>Удалить</button>}
         </div>
       </div>

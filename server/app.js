@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import Fastify from 'fastify'
 import cookie from '@fastify/cookie'
 import staticPlugin from '@fastify/static'
-import { DEFAULT_PROJECT_ID, WINBACK_STEPS, openDb, now, STAGES, TERMINAL_STAGES } from './db.js'
+import { DEFAULT_PROJECT_ID, PD_REQUEST_KINDS, WINBACK_STEPS, addWorkdays, openDb, now, STAGES, TERMINAL_STAGES } from './db.js'
 import { hashPassword, verifyPassword, signToken, verifyToken, loginThrottle, loginFailed, loginSucceeded, SESSION_TTL_DAYS } from './auth.js'
 import { enqueue } from './telegram.js'
 
@@ -75,8 +75,19 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     done()
   })
 
-  const audit = (req, action, entity, id) =>
-    app.log?.info?.({ user: req.user?.email, action, entity, id }, 'mutation')
+  // Пишем и в лог процесса (удобно смотреть вживую), и в таблицу — логи контейнера
+  // на App Platform теряются при передеплое, а след нужен для проверки РКН (ADR-011).
+  const audit = (req, action, entity, id, detail = '') => {
+    app.log?.info?.({ user: req.user?.email, action, entity, id, detail }, 'mutation')
+    try {
+      db.prepare('INSERT INTO audit_log (user_id, user_email, action, entity, entity_id, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(req.user?.id ?? null, req.user?.email ?? '', action, entity, id ?? null, trim(detail, 500), now())
+    } catch (err) {
+      // Журнал не должен ломать сам запрос: потерянная строка аудита хуже, чем
+      // упавшее сохранение контакта, но не настолько, чтобы отменять операцию.
+      app.log?.warn?.(`audit: не удалось записать: ${err}`)
+    }
+  }
 
   // ---------- auth ----------
   app.post('/api/auth/login', async (req, reply) => {
@@ -355,6 +366,10 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   // общие: показываем их в любом проекте, потому что пропущенная задача хуже
   // лишней строки в списке.
   const STATS_DAYS = 30
+  // Сколько дней тишины по сделке считаем «остыванием». Дни календарные, не рабочие:
+  // клиенту, написавшему в пятницу, наши выходные безразличны — к утру понедельника
+  // он уже три дня без ответа.
+  const COOLING_DAYS = 3
 
   app.get('/api/crm/dashboard', async (req, reply) => {
     // _now: только для тестов границы суток МСК; в проде игнорируется
@@ -365,6 +380,7 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     const pf = (sql) => (pid ? sql : '') // фрагмент включается только при фильтре
     const arg = pid ? [pid] : []
     const since = new Date(nowMs - STATS_DAYS * 864e5).toISOString()
+    const coolingBefore = new Date(nowMs - COOLING_DAYS * 864e5).toISOString()
 
     const termMarks = TERMINAL_STAGES.map(() => '?').join(',')
     const open = db
@@ -383,6 +399,30 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       tasksToday: db
         .prepare(`SELECT t.*, c.name contact_name FROM tasks t LEFT JOIN contacts c ON c.id = t.contact_id WHERE t.done = 0 AND t.due_date IS NOT NULL AND t.due_date <= ? ${pf('AND (t.contact_id IS NULL OR c.project_id = ?)')} ORDER BY t.due_date LIMIT 20`)
         .all(today, ...arg),
+      // «Остывают»: живые сделки, по которым давно ничего не происходило. Точка отсчёта —
+      // последнее взаимодействие, а если их не было ни одного, то создание сделки.
+      // Сделки с открытой задачей сюда НЕ попадают: про них не забыли, о них
+      // договорились — иначе блок быстро превратился бы в шум, который перестают читать.
+      // Обезличенные контакты исключены: человек потребовал прекратить обработку,
+      // напоминать о нём нельзя (ADR-011).
+      cooling: db
+        .prepare(`SELECT d.id, d.title, d.stage, d.amount, d.created_at, d.project_id, c.id contact_id, c.name contact_name, c.source,
+            COALESCE(MAX(i.happened_at), d.created_at) last_touch,
+            MAX(i.happened_at) IS NULL no_touch
+          FROM deals d
+          JOIN contacts c ON c.id = d.contact_id
+          LEFT JOIN interactions i ON i.contact_id = c.id
+          WHERE d.stage NOT IN (${termMarks})
+            AND c.archived = 0
+            AND c.anonymized_at IS NULL
+            AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.contact_id = c.id AND t.done = 0)
+            ${pf('AND d.project_id = ?')}
+          GROUP BY d.id
+          HAVING last_touch < ?
+          ORDER BY last_touch
+          LIMIT 8`)
+        .all(...TERMINAL_STAGES, ...arg, coolingBefore),
+      coolingDays: COOLING_DAYS,
       funnel: STAGES.filter((s) => !TERMINAL_STAGES.includes(s)).map((s) => open.find((r) => r.stage === s) || { stage: s, n: 0, sum: 0, noAmount: 0 }),
       terminal: TERMINAL_STAGES.map((s) => closed.find((r) => r.stage === s) || { stage: s, n: 0, sum: 0 }),
       activity: db
@@ -426,11 +466,14 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     const data = req.body
     if (!data || typeof data !== 'object' || !Array.isArray(data.contacts)) return reply.code(400).send({ error: 'bad_file' })
     if (data.version > 1) return reply.code(400).send({ error: 'newer_version' })
-    // имена колонок из файла — недоверенный ввод; только известные схеме
+    // имена колонок из файла — недоверенный ввод; только известные схеме.
+    // ВАЖНО: экспорт отдаёт `SELECT *`, поэтому любая новая колонка обязана попасть
+    // сюда, иначе импорт своего же экспорта падает с «bad_file». Добавляя колонку
+    // в миграции — дописывай её и здесь (и в тест раунд-трипа).
     const EXTRA_COLS = {
-      contacts: ['suspicious', 'archived'],
+      contacts: ['suspicious', 'archived', 'anonymized_at'],
       deals: ['closed_at'],
-      tasks: ['done', 'done_at'],
+      tasks: ['done', 'done_at', 'winback_sequence_id'],
       interactions: ['happened_at'],
     }
     const allowedCols = (n) =>
@@ -438,6 +481,12 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     const counts = {}
     try {
       db.transaction(() => {
+        // winback_sequences ссылается на deals и contacts НАСТОЯЩИМ внешним ключом и в
+        // дамп не входит — без этой очистки его строки блокируют `DELETE FROM deals`
+        // и импорт падает с «FOREIGN KEY constraint failed» на любой базе, где хоть
+        // одна сделка проигрывалась. Серии восстановлению не подлежат: они выводятся
+        // из стадии сделки, а стадия в дампе есть.
+        db.prepare('DELETE FROM winback_sequences').run()
         // удаляем детей раньше родителей (FK), вставляем в прямом порядке
         for (const n of [...ENTITY_NAMES].reverse()) db.prepare(`DELETE FROM ${n}`).run()
         for (const n of ENTITY_NAMES) {
@@ -448,6 +497,12 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
             const cols = Object.keys(row).filter((c) => c !== 'id')
             const unknown = cols.find((c) => !allowed.has(c))
             if (unknown) throw new Error(`неизвестное поле «${unknown}» в ${n}`)
+            // Сами серии возврата в дамп не входят (это не сущность CRUD), поэтому
+            // ссылка на них после импорта указывала бы в пустоту. Обнуляем: задача
+            // остаётся обычной, с прежним заголовком и датой. Стадия «Проиграно»
+            // у сделки сохраняется, так что смысл не теряется — теряется только
+            // авто-снятие напоминаний при возврате сделки в работу.
+            if (n === 'tasks' && row.winback_sequence_id != null) row.winback_sequence_id = null
             const sig = cols.join(',')
             let stmt = stmtCache.get(sig)
             if (!stmt) {
@@ -458,6 +513,11 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
           }
           counts[n] = rows.length
         }
+        // Запросы по ПДн — юридический след, их не удаляем. Но привязку к контакту
+        // рвём: контакты только что заменены целиком, и ссылка могла бы указать на
+        // ДРУГОГО человека с тем же id. Сам запрос остаётся читаемым — в нём есть
+        // адрес заявителя, вид запроса, срок и статус.
+        db.prepare('UPDATE pd_requests SET contact_id = NULL, updated_at = ? WHERE contact_id IS NOT NULL').run(now())
       })()
     } catch (err) {
       return reply.code(400).send({ error: 'bad_file', detail: String(err) })
@@ -557,11 +617,141 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     return { ok: true }
   })
 
+  // ---------- права субъекта ПДн (152-ФЗ) ----------
+  // Политика на сайтах обещает исполнить запрос за 10 рабочих дней. Здесь механизм,
+  // который это обещание выполняет: регистрация запроса → дедлайн → обезличивание.
+  //
+  // Обезличиваем, а не удаляем: сделка со стадией остаётся, чтобы воронка и выручка
+  // за прошлые периоды не поехали задним числом, но опознать человека по базе больше
+  // нельзя. Что именно затирается — в anonymizeContact ниже (ADR-011).
+  const PD_STATUSES = ['new', 'done', 'rejected']
+
+  function anonymizeContact(contactId, req) {
+    const contact = db.prepare('SELECT id, anonymized_at FROM contacts WHERE id = ?').get(contactId)
+    if (!contact) return null
+    if (contact.anonymized_at) return contact // повторный вызов безвреден
+
+    const ts = now()
+    db.transaction(() => {
+      // 1. Сам контакт: имя-заглушка, все опознающие поля пусты
+      db.prepare(`UPDATE contacts SET name = ?, company = '', phone = '', email = '', messenger = '',
+        note = '', anonymized_at = ?, updated_at = ? WHERE id = ?`)
+        .run(`Удалённый контакт #${contactId}`, ts, ts, contactId)
+      // 2. Взаимодействия: текст затираем (там транскрипты переписок), но строки
+      //    оставляем — по ним считается активность на дашборде
+      db.prepare("UPDATE interactions SET note = '', updated_at = ? WHERE contact_id = ?").run(ts, contactId)
+      // 3. Сделки: заметки могут содержать ПДн, затираем; стадия и сумма остаются
+      db.prepare("UPDATE deals SET note = '', updated_at = ? WHERE contact_id = ?").run(ts, contactId)
+      // 4. Задачи удаляем целиком: во-первых, в заголовке может стоять имя, во-вторых,
+      //    человек потребовал прекратить обработку — напоминание «позвонить ему» этому
+      //    прямо противоречит. Вместе с ними закрываем воронку возврата.
+      db.prepare('DELETE FROM tasks WHERE contact_id = ?').run(contactId)
+      db.prepare("UPDATE winback_sequences SET status = 'cancelled', finished_at = ? WHERE contact_id = ? AND status = 'active'")
+        .run(ts, contactId)
+    })()
+    audit(req, 'anonymize', 'contacts', contactId, 'исполнение запроса субъекта ПДн')
+    return db.prepare('SELECT id, name, anonymized_at FROM contacts WHERE id = ?').get(contactId)
+  }
+
+  app.get('/api/crm/pd-requests', async (req) => {
+    const status = trim(req.query?.status, 20)
+    const where = PD_STATUSES.includes(status) ? 'WHERE r.status = ?' : ''
+    const args = where ? [status] : []
+    const items = db
+      .prepare(`SELECT r.*, c.name contact_name, c.anonymized_at, p.display_name project_name
+        FROM pd_requests r
+        LEFT JOIN contacts c ON c.id = r.contact_id
+        LEFT JOIN projects p ON p.id = r.project_id
+        ${where} ORDER BY r.status = 'new' DESC, r.due_date, r.id DESC LIMIT 500`)
+      .all(...args)
+    return { items, kinds: PD_REQUEST_KINDS, today: mskToday() }
+  })
+
+  app.post('/api/crm/pd-requests', async (req, reply) => {
+    const b = req.body ?? {}
+    const kind = PD_REQUEST_KINDS[b.kind] ? b.kind : 'delete'
+    const requester = trim(b.requester, 300)
+    const contactId = b.contact_id === undefined || b.contact_id === null || b.contact_id === '' ? null : Number(b.contact_id)
+    if (contactId !== null && !Number.isInteger(contactId)) return reply.code(400).send({ error: 'bad_input' })
+    if (!requester && contactId === null) return reply.code(400).send({ error: 'bad_input' })
+    if (contactId !== null && !db.prepare('SELECT 1 FROM contacts WHERE id = ?').get(contactId)) {
+      return reply.code(400).send({ error: 'bad_reference' })
+    }
+    const projectId = contactId !== null
+      ? db.prepare('SELECT project_id FROM contacts WHERE id = ?').get(contactId).project_id
+      : resolveProjectId(b.project) || DEFAULT_PROJECT_ID
+    const ts = now()
+    const info = db.prepare(`INSERT INTO pd_requests (contact_id, kind, requester, note, source, project_id, due_date, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(contactId, kind, requester, trim(b.note, 1000), 'manual', projectId, addWorkdays(mskToday()), ts, ts)
+    audit(req, 'create', 'pd_requests', info.lastInsertRowid, kind)
+    return { ok: true, id: info.lastInsertRowid, due_date: addWorkdays(mskToday()) }
+  })
+
+  app.patch('/api/crm/pd-requests/:id', async (req, reply) => {
+    const id = Number(req.params.id)
+    if (!Number.isInteger(id)) return reply.code(400).send({ error: 'bad_input' })
+    const row = db.prepare('SELECT * FROM pd_requests WHERE id = ?').get(id)
+    if (!row) return reply.code(404).send({ error: 'not_found' })
+    const b = req.body ?? {}
+    const ts = now()
+
+    // Привязка к контакту: запрос с сайта приходит без неё, сотрудник находит человека
+    if (b.contact_id !== undefined) {
+      const cid = b.contact_id === null || b.contact_id === '' ? null : Number(b.contact_id)
+      if (cid !== null && !db.prepare('SELECT 1 FROM contacts WHERE id = ?').get(cid)) {
+        return reply.code(400).send({ error: 'bad_reference' })
+      }
+      db.prepare('UPDATE pd_requests SET contact_id = ?, updated_at = ? WHERE id = ?').run(cid, ts, id)
+    }
+    if (b.note !== undefined) db.prepare('UPDATE pd_requests SET note = ?, updated_at = ? WHERE id = ?').run(trim(b.note, 1000), ts, id)
+
+    if (b.status !== undefined) {
+      if (!PD_STATUSES.includes(b.status)) return reply.code(400).send({ error: 'bad_input' })
+      db.prepare('UPDATE pd_requests SET status = ?, resolved_at = ?, resolved_by = ?, updated_at = ? WHERE id = ?')
+        .run(b.status, b.status === 'new' ? null : ts, b.status === 'new' ? null : req.user.id, ts, id)
+      audit(req, 'update', 'pd_requests', id, `статус: ${b.status}`)
+    }
+
+    // Обезличивание — только по явному запросу и только для «удалить»/«прекратить»:
+    // на «узнать, какие данные есть» стирать ничего не надо.
+    let anonymized = null
+    if (b.anonymize === true) {
+      const target = db.prepare('SELECT contact_id, kind FROM pd_requests WHERE id = ?').get(id)
+      if (!target.contact_id) return reply.code(400).send({ error: 'no_contact' })
+      if (!['delete', 'stop'].includes(target.kind)) return reply.code(400).send({ error: 'kind_not_erasable' })
+      anonymized = anonymizeContact(target.contact_id, req)
+    }
+    return { ok: true, anonymized }
+  })
+
+  // Обезличивание прямо из карточки контакта — без регистрации запроса это делать
+  // нельзя: нужен след, по которому видно основание. Поэтому только admin.
+  app.post('/api/crm/contacts/:id/anonymize', async (req, reply) => {
+    if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
+    const id = Number(req.params.id)
+    if (!Number.isInteger(id)) return reply.code(400).send({ error: 'bad_input' })
+    const result = anonymizeContact(id, req)
+    if (!result) return reply.code(404).send({ error: 'not_found' })
+    return { ok: true, contact: result }
+  })
+
+  app.get('/api/crm/audit', async (req, reply) => {
+    if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
+    const items = db
+      .prepare('SELECT * FROM audit_log ORDER BY id DESC LIMIT 300')
+      .all()
+    return { items }
+  })
+
   // ---------- диагностика ----------
   app.get('/api/crm/diagnostics', async () => ({
     schemaVersion: db.pragma('user_version', { simple: true }),
     counts: Object.fromEntries(ENTITY_NAMES.map((n) => [n, db.prepare(`SELECT COUNT(*) c FROM ${n}`).get().c])),
-    outboxPending: db.prepare('SELECT COUNT(*) c FROM outbox WHERE sent_at IS NULL').get().c,
+    outboxPending: {
+      tg: db.prepare('SELECT COUNT(*) c FROM outbox WHERE tg_sent_at IS NULL').get().c,
+      max: db.prepare('SELECT COUNT(*) c FROM outbox WHERE max_sent_at IS NULL').get().c,
+    },
     serverTimeMsk: mskToday(),
   }))
 
@@ -603,6 +793,10 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     const name = trim(b.name, 200) || (contactInfo ? contactInfo.split(/[,;]/)[0].trim() : '') || 'Без имени'
     const title = isChat ? trim(b.task, 300) || 'Заявка из чата' : [trim(b.task, 200), b.scale ? `масштаб: ${trim(b.scale, 100)}` : ''].filter(Boolean).join(', ') || 'Заявка с сайта'
     const note = isChat ? trim(b.detail, 1000) : trim(b.note, 1000)
+    // Полная переписка с «Невой» — отдельной записью во взаимодействия, а не в note
+    // сделки: так карточка сделки остаётся короткой сутью, а весь диалог всё равно
+    // виден на карточке контакта. ПДн тут можно — CRM на РФ-сервере, доступ только у сотрудников.
+    const transcript = isChat ? trim(b.transcript, 4000) : ''
     if (!contactInfo && name === 'Без имени') return reply.code(204).send()
 
     // Проект: явное поле формы → домен сайта → проект по умолчанию.
@@ -625,6 +819,9 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       const cid = db.prepare('INSERT INTO contacts (name, email, messenger, note, source, suspicious, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
         .run(name, email, messenger, '', isChat ? 'site-chat' : 'site-form', suspicious ? 1 : 0, projectId, ts, ts).lastInsertRowid
       db.prepare('INSERT INTO deals (contact_id, title, stage, note, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(cid, title, 'Новый', note, projectId, ts, ts)
+      if (transcript) {
+        db.prepare('INSERT INTO interactions (contact_id, type, note, happened_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(cid, 'сообщение', transcript, ts, ts, ts)
+      }
       return cid
     })()
 
@@ -639,6 +836,66 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       suspicious,
     })
     app.log?.info?.({ contactId, projectId, suspicious }, 'lead accepted')
+    return reply.code(204).send()
+  })
+
+  // ---------- публичный приём запросов по персональным данным ----------
+  // Форма на сайтах: человек может сам потребовать удалить данные, не дожидаясь письма.
+  // Тот же CORS и та же философия, что у лидов: запрос не отвергаем никогда — потерянный
+  // запрос это просроченное обязательство и повод для жалобы в РКН (ADR-011).
+  app.options('/api/pd-requests', async (req, reply) => {
+    if (!leadOriginAllowed(req.headers.origin)) return reply.header('vary', 'Origin').code(403).send()
+    return reply
+      .header('vary', 'Origin')
+      .header('access-control-allow-origin', req.headers.origin)
+      .header('access-control-allow-methods', 'POST, OPTIONS')
+      .header('access-control-allow-headers', 'content-type')
+      .header('access-control-max-age', '86400')
+      .code(204)
+      .send()
+  })
+
+  app.post('/api/pd-requests', async (req, reply) => {
+    applyLeadCors(req, reply)
+    const b = req.body ?? {}
+    const requester = trim(b.contact, 300)
+    if (!requester) return reply.code(400).send({ error: 'contact_required' })
+    const kind = PD_REQUEST_KINDS[b.kind] ? b.kind : 'delete'
+    const suspicious = Boolean(b.website) || leadSuspicious(req.ip)
+
+    const byOrigin = projectByOrigin(req.headers.origin)
+    let projectId = byOrigin ? byOrigin.id : DEFAULT_PROJECT_ID
+    const asked = trim(b.project, 100)
+    if (asked) projectId = resolveProjectId(asked) || projectId
+
+    // Ищем человека в базе сами — по точному совпадению почты или мессенджера.
+    // Не нашли — оставляем contact_id пустым: сотрудник сопоставит вручную, а срок
+    // уже идёт, поэтому запрос всё равно должен быть зарегистрирован.
+    const found = db
+      .prepare('SELECT id FROM contacts WHERE anonymized_at IS NULL AND (lower(email) = lower(?) OR lower(messenger) = lower(?) OR phone = ?) ORDER BY id DESC LIMIT 1')
+      .get(requester, requester, requester)
+
+    const dueDate = addWorkdays(mskToday())
+    const ts = now()
+    const note = [trim(b.note, 800), suspicious ? '⚠️ подозрительная отправка (ловушка или частые обращения с одного адреса)' : '']
+      .filter(Boolean).join('\n')
+    const info = db.prepare(`INSERT INTO pd_requests (contact_id, kind, requester, note, source, project_id, due_date, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(found?.id ?? null, kind, requester, note, 'site-form', projectId, dueDate, ts, ts)
+
+    // Уведомление обезличено для ОБОИХ каналов, в отличие от заявок: здесь ПДн не нужны
+    // по существу — важны вид запроса и срок, а кто именно, видно в CRM по ссылке.
+    const base = String(process.env.CRM_BASE_URL || '').trim().replace(/\/+$/, '')
+    enqueue(db, 'text', {
+      text: [
+        '⚠️ <b>Запрос по персональным данным</b>',
+        `Вид: ${PD_REQUEST_KINDS[kind]}`,
+        `Исполнить до: <b>${dueDate}</b>`,
+        found ? 'Клиент найден в базе автоматически.' : 'Клиента в базе не нашли — сопоставить вручную.',
+        base ? `Открыть: ${base}/crm/privacy` : 'Открыть раздел «Права ПДн» в CRM',
+      ].join('\n'),
+    })
+    app.log?.info?.({ id: info.lastInsertRowid, kind, projectId, matched: Boolean(found), suspicious }, 'pd request accepted')
     return reply.code(204).send()
   })
 

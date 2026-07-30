@@ -110,7 +110,7 @@ export default function Settings({ user }) {
               <span className="crm-cap">Экспорт и импорт данных доступны администратору.</span>
             )}
           </div>
-          <div className="crm-cap">Ночной бэкап на сервере создаётся автоматически и отправляется в Telegram.</div>
+          <div className="crm-cap">Ночной бэкап создаётся на сервере автоматически и отправляется копией в MAX. В Telegram он не уходит: в базе персональные данные клиентов, а Telegram зарубежный.</div>
           <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
             <button className="btn" onClick={demoSeed}>Добавить демо-данные</button>
             <button className="btn" onClick={demoClear}>Очистить демо</button>
@@ -124,7 +124,7 @@ export default function Settings({ user }) {
             <div className="diag">
               <span>Схема БД: <b>v{diag.schemaVersion}</b> · Сервер (МСК): <b>{diag.serverTimeMsk}</b></span>
               <span>Контакты: <b>{diag.counts.contacts}</b> · Сделки: <b>{diag.counts.deals}</b> · Задачи: <b>{diag.counts.tasks}</b> · Действия: <b>{diag.counts.interactions}</b></span>
-              <span>Уведомления в очереди: <b>{diag.outboxPending}</b></span>
+              <span>Уведомления в очереди: Telegram <b>{diag.outboxPending.tg}</b> · MAX <b>{diag.outboxPending.max}</b></span>
             </div>
           )}
           <div className="crm-cap">Рекомендуемый браузер — Chromium (Chrome, Edge, Яндекс). Данные хранятся на сервере.</div>

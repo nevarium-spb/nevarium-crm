@@ -16,6 +16,10 @@
 4. **Telegram-бот**: напишите @BotFather → `/newbot` → получите токен. Добавьте бота
    в рабочую группу. Узнайте chat_id группы: перешлите её сообщение боту @getmyid_bot
    (покажет id вида `-100…`).
+4а. **Бот в MAX (необязательно, второй канал уведомлений параллельно с Telegram)**:
+    заведите бота через MAX для бизнеса (dev.max.ru — нужна верификация организации/ИП),
+    получите токен и chat_id. Если не завести — уведомления просто продолжат идти
+    только в Telegram, ничего не сломается.
 5. **DNS**: у `crm-nevarium.ru` в Ru-Center переключить со статусной страницы на адрес сервера.
 
 ---
@@ -41,6 +45,8 @@
    JWT_SECRET=<сгенерировать: openssl rand -hex 32, или любые 32+ случайных символа>
    TG_BOT_TOKEN=<токен из шага 4>
    TG_CHAT_ID=<chat_id из шага 4>
+   MAX_BOT_TOKEN=<токен бота MAX, если завели — необязательно>
+   MAX_CHAT_ID=<chat_id в MAX, если завели — необязательно>
    CRM_BASE_URL=https://crm-nevarium.ru
    DB_FILE=/data/crm.sqlite
    PORT=3001
@@ -77,7 +83,7 @@ git clone https://github.com/nevarium-spb/nevarium-crm.git && cd nevarium-crm
 
 # 1. Секреты
 cp deploy/.env.example deploy/.env
-nano deploy/.env          # JWT_SECRET (openssl rand -hex 32), TG_BOT_TOKEN, TG_CHAT_ID
+nano deploy/.env          # JWT_SECRET (openssl rand -hex 32), TG_BOT_TOKEN, TG_CHAT_ID, MAX_BOT_TOKEN/MAX_CHAT_ID (необязательно)
 
 # 2. Домен
 nano deploy/Caddyfile     # замените example.ru на ваш домен CRM
