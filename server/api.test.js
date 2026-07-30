@@ -349,6 +349,53 @@ describe('экспорт / импорт / CSV', () => {
     expect(app.db.prepare('SELECT note FROM interactions WHERE id = 1').get().note).toBe('обсудили')
   })
 
+  // На App Platform нет shell — файл базы туда не положить, и «Импорт JSON» остаётся
+  // единственным путём восстановления. Всё, чего нет в дампе, при потере диска
+  // исчезает навсегда, поэтому записи об исполнении запросов ПДн и журнал обязаны
+  // в нём быть: именно ими это исполнение доказывают.
+  it('запросы ПДн и журнал действий переживают экспорт → wipe → импорт', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru' } })
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'm@x.ru', kind: 'delete', note: 'прошу удалить' } })
+    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'done', anonymize: true }, headers: { cookie } })
+
+    const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+    expect(dump.version).toBe(2)
+    expect(dump.pd_requests).toHaveLength(1)
+    expect(dump.audit_log.some((a) => a.action === 'anonymize')).toBe(true)
+
+    app.db.exec('DELETE FROM pd_requests; DELETE FROM audit_log')
+    const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })
+    expect(res.statusCode).toBe(200)
+
+    const restored = app.db.prepare('SELECT * FROM pd_requests WHERE id = 1').get()
+    expect(restored).toMatchObject({ kind: 'delete', status: 'done', requester: 'm@x.ru', contact_id: 1 })
+    expect(app.db.prepare("SELECT COUNT(*) c FROM audit_log WHERE action = 'anonymize'").get().c).toBe(1)
+  })
+
+  it('старый дамп (v1) не стирает сегодняшние записи о ПДн, но рвёт их привязку к контактам', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru' } })
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'm@x.ru' } })
+    expect(app.db.prepare('SELECT contact_id FROM pd_requests WHERE id = 1').get().contact_id).toBe(1)
+
+    // дамп в старом формате: без pd_requests и audit_log
+    const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+    const legacy = { version: 1, contacts: dump.contacts, deals: dump.deals, tasks: dump.tasks, interactions: dump.interactions }
+    const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload: legacy, headers: { cookie } })
+    expect(res.statusCode).toBe(200)
+
+    // запрос жив — это юридический след, стирать его старым файлом нельзя
+    const row = app.db.prepare('SELECT * FROM pd_requests WHERE id = 1').get()
+    expect(row.requester).toBe('m@x.ru')
+    // но привязку разорвали: контакты заменены целиком, id мог достаться другому человеку
+    expect(row.contact_id).toBeNull()
+  })
+
+  it('дамп из будущей версии отклоняется', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload: { version: 99, contacts: [] }, headers: { cookie } })
+    expect(res.statusCode).toBe(400)
+    expect(JSON.parse(res.body).error).toBe('newer_version')
+  })
+
   it('раунд-трип переживает обезличенный контакт и задачу из воронки возврата', async () => {
     await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru' } })
     await app.inject({ method: 'PATCH', url: '/api/crm/deals/1', payload: { stage: 'Проиграно', reason: 'дорого' }, headers: { cookie } })
@@ -795,10 +842,10 @@ describe('бэкап: файл базы уходит в MAX, но никогда
   })
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }))
 
-  it('копия базы создаётся и отправляется документом в MAX', async () => {
+  it('в MAX уходят обе копии: JSON для восстановления и файл базы', async () => {
     await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина Соколова', contact: '+7 921 555-14-88' } })
     const sent = []
-    const file = await runBackup(app.db, {
+    const { file, jsonFile } = await runBackup(app.db, {
       dir,
       env: maxEnv,
       log: silent,
@@ -806,19 +853,37 @@ describe('бэкап: файл базы уходит в MAX, но никогда
       sendStatus: async () => { throw new Error('статус не нужен, когда всё прошло') },
     })
     expect(fs.existsSync(file)).toBe(true)
-    expect(sent).toHaveLength(1)
-    expect(sent[0].f).toBe(file)
-    // в копии действительно лежат ПДн — именно поэтому её нельзя в Telegram
+    expect(fs.existsSync(jsonFile)).toBe(true)
+    // JSON первым: именно им восстанавливаются там, где нет shell
+    expect(sent.map((s) => s.f)).toEqual([jsonFile, file])
+    expect(sent[0].caption).toContain('Импорт JSON')
+
+    // в копиях действительно лежат ПДн — именно поэтому их нельзя в Telegram
     const copy = new Database(file, { readonly: true })
     expect(copy.prepare('SELECT name FROM contacts WHERE id = 1').get().name).toBe('Марина Соколова')
     copy.close()
+    expect(JSON.parse(fs.readFileSync(jsonFile, 'utf8')).contacts[0].name).toBe('Марина Соколова')
   })
 
-  it('если MAX не настроен — копия остаётся на сервере, статус обезличен, файл никуда не уходит', async () => {
+  it('ночной JSON пригоден для восстановления: его принимает «Импорт JSON»', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru' } })
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'm@x.ru', kind: 'delete' } })
+    const { jsonFile } = await runBackup(app.db, { dir, env: {}, log: silent, sendDocument: async () => {}, sendStatus: async () => {} })
+
+    // катастрофа: база опустела
+    app.db.exec('DELETE FROM pd_requests; DELETE FROM interactions; DELETE FROM tasks; DELETE FROM deals; DELETE FROM contacts')
+    const dump = JSON.parse(fs.readFileSync(jsonFile, 'utf8'))
+    const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })
+    expect(res.statusCode).toBe(200)
+    expect(app.db.prepare('SELECT name FROM contacts WHERE id = 1').get().name).toBe('Марина')
+    expect(app.db.prepare('SELECT COUNT(*) c FROM pd_requests').get().c).toBe(1)
+  })
+
+  it('если MAX не настроен — копии остаются на сервере, статус обезличен, файлы никуда не уходят', async () => {
     await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина Соколова', contact: '+7 921 555-14-88' } })
     const docs = []
     const statuses = []
-    const file = await runBackup(app.db, {
+    const { file } = await runBackup(app.db, {
       dir,
       env: {},
       log: silent,
@@ -833,7 +898,7 @@ describe('бэкап: файл базы уходит в MAX, но никогда
 
   it('ошибка отправки не теряет копию и сообщает обезличенным статусом', async () => {
     const statuses = []
-    const file = await runBackup(app.db, {
+    const { file } = await runBackup(app.db, {
       dir,
       env: maxEnv,
       log: silent,
@@ -844,17 +909,17 @@ describe('бэкап: файл базы уходит в MAX, но никогда
     expect(statuses[0]).toContain('не отправился')
   })
 
-  it('ротация оставляет 7 последних копий', async () => {
+  it('ротация оставляет 7 последних дат, обе копии каждой', async () => {
     fs.mkdirSync(dir, { recursive: true })
     for (const d of ['01', '02', '03', '04', '05', '06', '07', '08', '09']) {
       fs.writeFileSync(path.join(dir, `crm-2026-01-${d}.sqlite`), 'старая копия')
+      fs.writeFileSync(path.join(dir, `crm-2026-01-${d}.json`), '{}')
     }
     await runBackup(app.db, { dir, env: {}, log: silent, sendDocument: async () => {}, sendStatus: async () => {} })
-    const left = fs.readdirSync(dir).filter((f) => f.startsWith('crm-'))
-    expect(left).toHaveLength(7)
-    // самые старые удалены, сегодняшняя на месте
-    expect(left).not.toContain('crm-2026-01-01.sqlite')
-    expect(left.some((f) => f.includes(new Date().toISOString().slice(0, 10)))).toBe(true)
+    const stamps = [...new Set(fs.readdirSync(dir).filter((f) => f.startsWith('crm-')).map((f) => f.slice(4, 14)))]
+    expect(stamps).toHaveLength(7)
+    expect(stamps).not.toContain('2026-01-01')
+    expect(stamps).toContain(new Date().toISOString().slice(0, 10))
   })
 })
 

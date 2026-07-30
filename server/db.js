@@ -263,6 +263,38 @@ export const WINBACK_STEPS = [
 /** Проект по умолчанию для строк без явной привязки (совпадает с DEFAULT в схеме). */
 export const DEFAULT_PROJECT_ID = 1
 
+/**
+ * Таблицы, попадающие в JSON-дамп. Порядок важен: при импорте вставляем в этом
+ * порядке (родители раньше детей), удаляем в обратном.
+ *
+ * Почему сюда входят pd_requests и audit_log: на App Platform нет shell-доступа,
+ * поэтому положить обратно файл базы там нечем — единственный реальный путь
+ * восстановления это «Импорт JSON» через браузер. Всё, чего нет в дампе, при
+ * потере диска исчезает навсегда, включая записи об исполнении запросов ПДн
+ * и журнал — то есть ровно то, чем это исполнение доказывают (ADR-013).
+ */
+export const DUMP_TABLES = ['contacts', 'deals', 'tasks', 'interactions', 'pd_requests', 'audit_log']
+
+/** У этих таблиц есть колонка demo — демо-строки в дамп не берём. */
+const DEMO_FILTERED = new Set(['contacts', 'deals', 'tasks', 'interactions'])
+
+/**
+ * Версия формата дампа. v1 — без pd_requests и audit_log (дампы до 2026-07-30).
+ * Импорт обязан принимать и её: старый бэкап должен восстанавливаться.
+ */
+export const DUMP_VERSION = 2
+
+export function buildDump(db) {
+  const data = { version: DUMP_VERSION, exportedAt: now() }
+  for (const t of DUMP_TABLES) {
+    data[t] = db.prepare(`SELECT * FROM ${t}${DEMO_FILTERED.has(t) ? ' WHERE demo = 0' : ''}`).all()
+  }
+  // Пользователи — только для справки «кто был в команде»: импорт их не восстанавливает,
+  // иначе чужие хеши паролей могли бы заменить текущего администратора и запереть вход.
+  data.team = db.prepare('SELECT id, name, email, role FROM users').all()
+  return data
+}
+
 export function openDb(file) {
   const db = new Database(file)
   db.pragma('journal_mode = WAL')

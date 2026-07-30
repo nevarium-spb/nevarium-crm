@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import Fastify from 'fastify'
 import cookie from '@fastify/cookie'
 import staticPlugin from '@fastify/static'
-import { DEFAULT_PROJECT_ID, PD_REQUEST_KINDS, WINBACK_STEPS, addWorkdays, openDb, now, STAGES, TERMINAL_STAGES } from './db.js'
+import { DEFAULT_PROJECT_ID, DUMP_TABLES, DUMP_VERSION, PD_REQUEST_KINDS, WINBACK_STEPS, addWorkdays, buildDump, openDb, now, STAGES, TERMINAL_STAGES } from './db.js'
 import { hashPassword, verifyPassword, signToken, verifyToken, loginThrottle, loginFailed, loginSucceeded, SESSION_TTL_DAYS } from './auth.js'
 import { enqueue } from './telegram.js'
 
@@ -455,17 +455,18 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   // всех клиентских данных и почт команды.
   app.get('/api/crm/export', async (req, reply) => {
     if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
-    const data = { version: 1, exportedAt: now() }
-    for (const n of ENTITY_NAMES) data[n] = db.prepare(`SELECT * FROM ${n} WHERE demo = 0`).all()
-    data.team = db.prepare('SELECT id, name, email, role FROM users').all()
-    return data
+    return buildDump(db)
   })
 
   app.post('/api/crm/import', async (req, reply) => {
     if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
     const data = req.body
     if (!data || typeof data !== 'object' || !Array.isArray(data.contacts)) return reply.code(400).send({ error: 'bad_file' })
-    if (data.version > 1) return reply.code(400).send({ error: 'newer_version' })
+    if (data.version > DUMP_VERSION) return reply.code(400).send({ error: 'newer_version' })
+    // Дамп v1 (до 2026-07-30) не содержал запросов ПДн и журнала. Такой файл
+    // восстанавливать можно, но затирать им сегодняшние записи об исполнении
+    // запросов нельзя — их там просто нет, а не «нет ни одной».
+    const hasCompliance = Array.isArray(data.pd_requests)
     // имена колонок из файла — недоверенный ввод; только известные схеме.
     // ВАЖНО: экспорт отдаёт `SELECT *`, поэтому любая новая колонка обязана попасть
     // сюда, иначе импорт своего же экспорта падает с «bad_file». Добавляя колонку
@@ -476,8 +477,15 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       tasks: ['done', 'done_at', 'winback_sequence_id'],
       interactions: ['happened_at'],
     }
+    // У таблиц вне ENTITIES нет конфига CRUD — перечисляем их колонки явно.
+    const PLAIN_COLS = {
+      pd_requests: ['contact_id', 'kind', 'status', 'requester', 'note', 'source', 'project_id', 'due_date', 'resolved_at', 'resolved_by', 'created_at', 'updated_at'],
+      audit_log: ['user_id', 'user_email', 'action', 'entity', 'entity_id', 'detail', 'created_at'],
+    }
     const allowedCols = (n) =>
-      new Set([...ENTITIES[n].fields, ...(EXTRA_COLS[n] ?? []), 'demo', 'created_at', 'updated_at', 'created_by'])
+      PLAIN_COLS[n]
+        ? new Set(PLAIN_COLS[n])
+        : new Set([...ENTITIES[n].fields, ...(EXTRA_COLS[n] ?? []), 'demo', 'created_at', 'updated_at', 'created_by'])
     const counts = {}
     try {
       db.transaction(() => {
@@ -487,9 +495,12 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
         // одна сделка проигрывалась. Серии восстановлению не подлежат: они выводятся
         // из стадии сделки, а стадия в дампе есть.
         db.prepare('DELETE FROM winback_sequences').run()
+        // Таблицы восстанавливаем те, что есть в дампе: из старого файла (v1)
+        // запросы ПДн и журнал не придут, и стирать существующие мы не станем.
+        const tables = hasCompliance ? DUMP_TABLES : ENTITY_NAMES
         // удаляем детей раньше родителей (FK), вставляем в прямом порядке
-        for (const n of [...ENTITY_NAMES].reverse()) db.prepare(`DELETE FROM ${n}`).run()
-        for (const n of ENTITY_NAMES) {
+        for (const n of [...tables].reverse()) db.prepare(`DELETE FROM ${n}`).run()
+        for (const n of tables) {
           const rows = data[n] || []
           const allowed = allowedCols(n)
           const stmtCache = new Map()
@@ -513,11 +524,13 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
           }
           counts[n] = rows.length
         }
-        // Запросы по ПДн — юридический след, их не удаляем. Но привязку к контакту
-        // рвём: контакты только что заменены целиком, и ссылка могла бы указать на
-        // ДРУГОГО человека с тем же id. Сам запрос остаётся читаемым — в нём есть
-        // адрес заявителя, вид запроса, срок и статус.
-        db.prepare('UPDATE pd_requests SET contact_id = NULL, updated_at = ? WHERE contact_id IS NOT NULL').run(now())
+        // Старый дамп (v1) запросов ПДн не содержит: существующие оставляем как
+        // юридический след, но привязку к контакту рвём — контакты только что
+        // заменены целиком, и ссылка могла бы указать на ДРУГОГО человека с тем же id.
+        // Сам запрос остаётся читаемым: в нём есть адрес заявителя, вид, срок и статус.
+        if (!hasCompliance) {
+          db.prepare('UPDATE pd_requests SET contact_id = NULL, updated_at = ? WHERE contact_id IS NOT NULL').run(now())
+        }
       })()
     } catch (err) {
       return reply.code(400).send({ error: 'bad_file', detail: String(err) })
