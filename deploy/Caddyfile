@@ -1,16 +1,12 @@
 # Замените example.ru на ваш домен — Caddy сам получит HTTPS-сертификат.
+#
+# Caddy здесь — только TLS-терминация и проброс. Раздачу фронта и SPA-роутинг
+# делает сам Node (server/index.js → @fastify/static + фолбэк на index.html,
+# см. ADR-008): один контейнер приложения отдаёт и /api/*, и статику. Раньше
+# здесь был отдельный `handle {}` с `root * /srv/dist` — читал dist/ с хоста,
+# а тот в .gitignore и после перехода на единый контейнер нигде не собирается.
+# После git clone + docker compose up фронт отдавал бы 404 на любой странице.
 example.ru {
 	encode gzip
-
-	# API → Node
-	handle /api/* {
-		reverse_proxy app:3001
-	}
-
-	# SPA: статика + rewrite на index.html для /crm/*, /start и прочих маршрутов
-	handle {
-		root * /srv/dist
-		try_files {path} /index.html
-		file_server
-	}
+	reverse_proxy app:3001
 }
