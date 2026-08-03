@@ -8,6 +8,7 @@ import Deals from './pages/Deals.jsx'
 import Contacts from './pages/Contacts.jsx'
 import ContactCard from './pages/ContactCard.jsx'
 import Tasks from './pages/Tasks.jsx'
+import Privacy from './pages/Privacy.jsx'
 import Settings from './pages/Settings.jsx'
 import { Toasts } from './ui.jsx'
 import './crm.css'
@@ -39,8 +40,9 @@ export default function CrmApp() {
         <Route index element={<Dashboard />} />
         <Route path="deals" element={<Deals />} />
         <Route path="contacts" element={<Contacts />} />
-        <Route path="contacts/:id" element={<ContactCard />} />
+        <Route path="contacts/:id" element={<ContactCard user={me} />} />
         <Route path="tasks" element={<Tasks />} />
+        <Route path="privacy" element={<Privacy user={me} />} />
         <Route path="settings" element={<Settings user={me} />} />
         <Route path="*" element={<Dashboard />} />
       </Route>

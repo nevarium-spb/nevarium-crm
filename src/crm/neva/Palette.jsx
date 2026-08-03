@@ -128,7 +128,15 @@ export default function Palette({ onClose }) {
             placeholder="Поиск или команда: лид…, задача:…, звонок с…"
             aria-label="Команда или поиск"
           />
-          <kbd>Esc</kbd>
+          <kbd
+            role="button"
+            tabIndex={0}
+            onClick={onClose}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClose() } }}
+            style={{ cursor: 'pointer' }}
+          >
+            Esc
+          </kbd>
         </div>
 
         {preview && (

@@ -157,7 +157,98 @@ export const MIGRATIONS = [
   CREATE INDEX idx_winback_deal ON winback_sequences(deal_id, status);
   CREATE INDEX idx_tasks_winback ON tasks(winback_sequence_id);
   `,
+  // v7: уведомления теперь уходят в Telegram и MAX параллельно, независимо друг от
+  // друга — падение одного канала не должно ни блокировать другой, ни требовать
+  // повторной отправки туда, куда уже доставлено. Переименовываем старые
+  // sent_at/attempts/last_error в tg_* (RENAME COLUMN переносит и определение
+  // индекса — проверено) и заводим симметричные max_*.
+  `
+  ALTER TABLE outbox RENAME COLUMN sent_at TO tg_sent_at;
+  ALTER TABLE outbox RENAME COLUMN attempts TO tg_attempts;
+  ALTER TABLE outbox RENAME COLUMN last_error TO tg_last_error;
+  ALTER TABLE outbox ADD COLUMN max_sent_at TEXT;
+  ALTER TABLE outbox ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE outbox ADD COLUMN max_last_error TEXT;
+  CREATE INDEX idx_outbox_pending_max ON outbox(max_sent_at) WHERE max_sent_at IS NULL;
+  `,
+  // v8: исполнение прав субъекта ПДн (152-ФЗ ст. 14, 20, 21) — то, что политика на
+  // сайтах уже публично обещает выполнять «в течение 10 рабочих дней». До этой миграции
+  // обязательство было, а механизма не было. ADR-011.
+  //
+  // pd_requests.contact_id nullable намеренно: запрос с публичной формы приходит от
+  // человека, которого ещё надо найти в базе по почте/телефону (он мог писать с другого
+  // адреса). Несопоставленный запрос всё равно должен быть виден и иметь дедлайн —
+  // иначе он потеряется, а срок идёт. project_id как у остальных: NOT NULL DEFAULT 1
+  // без REFERENCES (см. причины в v3).
+  //
+  // audit_log: раньше audit() писал только в лог процесса, который на App Platform
+  // теряется при передеплое. Для проверки РКН и для вопроса «кто удалил контакт»
+  // нужен след в самой базе. user_email денормализован: пользователя могут удалить,
+  // а запись в журнале обязана остаться читаемой.
+  `
+  CREATE TABLE pd_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    contact_id INTEGER,
+    kind TEXT NOT NULL DEFAULT 'delete',
+    status TEXT NOT NULL DEFAULT 'new',
+    requester TEXT DEFAULT '',
+    note TEXT DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'manual',
+    project_id INTEGER NOT NULL DEFAULT 1,
+    due_date TEXT NOT NULL,
+    resolved_at TEXT,
+    resolved_by INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE TABLE audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    user_email TEXT DEFAULT '',
+    action TEXT NOT NULL,
+    entity TEXT NOT NULL,
+    entity_id INTEGER,
+    detail TEXT DEFAULT '',
+    created_at TEXT NOT NULL
+  );
+  ALTER TABLE contacts ADD COLUMN anonymized_at TEXT;
+  CREATE INDEX idx_pd_open ON pd_requests(status, due_date);
+  CREATE INDEX idx_pd_contact ON pd_requests(contact_id);
+  CREATE INDEX idx_audit_created ON audit_log(created_at);
+  CREATE INDEX idx_audit_entity ON audit_log(entity, entity_id);
+  `,
 ]
+
+/**
+ * Виды запросов субъекта ПДн — ровно то, что перечислено в п.7 политики на сайтах.
+ * Ключи хранятся в pd_requests.kind, подписи показываются в интерфейсе.
+ */
+export const PD_REQUEST_KINDS = {
+  access: 'узнать, какие данные есть',
+  correct: 'исправить неточные данные',
+  delete: 'отозвать согласие и удалить данные',
+  stop: 'прекратить обработку',
+}
+
+/** Срок исполнения по 152-ФЗ и по обещанию в политике — 10 рабочих дней. */
+export const PD_DEADLINE_WORKDAYS = 10
+
+/**
+ * Дедлайн = N рабочих дней от даты (только пн–пт).
+ * Государственные праздники сознательно не учитываем: их даты каждый год переносятся
+ * постановлением, и держать этот календарь в коде — источник тихих ошибок. Без них
+ * дедлайн получается раньше законного, то есть в запас, а не в просрочку.
+ */
+export function addWorkdays(fromIsoDate, days = PD_DEADLINE_WORKDAYS) {
+  const d = new Date(`${fromIsoDate}T00:00:00Z`)
+  let left = days
+  while (left > 0) {
+    d.setUTCDate(d.getUTCDate() + 1)
+    const weekday = d.getUTCDay()
+    if (weekday !== 0 && weekday !== 6) left--
+  }
+  return d.toISOString().slice(0, 10)
+}
 
 /**
  * Расписание воронки возврата: через сколько дней после отказа ставим задачу.
@@ -171,6 +262,38 @@ export const WINBACK_STEPS = [
 
 /** Проект по умолчанию для строк без явной привязки (совпадает с DEFAULT в схеме). */
 export const DEFAULT_PROJECT_ID = 1
+
+/**
+ * Таблицы, попадающие в JSON-дамп. Порядок важен: при импорте вставляем в этом
+ * порядке (родители раньше детей), удаляем в обратном.
+ *
+ * Почему сюда входят pd_requests и audit_log: на App Platform нет shell-доступа,
+ * поэтому положить обратно файл базы там нечем — единственный реальный путь
+ * восстановления это «Импорт JSON» через браузер. Всё, чего нет в дампе, при
+ * потере диска исчезает навсегда, включая записи об исполнении запросов ПДн
+ * и журнал — то есть ровно то, чем это исполнение доказывают (ADR-013).
+ */
+export const DUMP_TABLES = ['contacts', 'deals', 'tasks', 'interactions', 'pd_requests', 'audit_log']
+
+/** У этих таблиц есть колонка demo — демо-строки в дамп не берём. */
+const DEMO_FILTERED = new Set(['contacts', 'deals', 'tasks', 'interactions'])
+
+/**
+ * Версия формата дампа. v1 — без pd_requests и audit_log (дампы до 2026-07-30).
+ * Импорт обязан принимать и её: старый бэкап должен восстанавливаться.
+ */
+export const DUMP_VERSION = 2
+
+export function buildDump(db) {
+  const data = { version: DUMP_VERSION, exportedAt: now() }
+  for (const t of DUMP_TABLES) {
+    data[t] = db.prepare(`SELECT * FROM ${t}${DEMO_FILTERED.has(t) ? ' WHERE demo = 0' : ''}`).all()
+  }
+  // Пользователи — только для справки «кто был в команде»: импорт их не восстанавливает,
+  // иначе чужие хеши паролей могли бы заменить текущего администратора и запереть вход.
+  data.team = db.prepare('SELECT id, name, email, role FROM users').all()
+  return data
+}
 
 export function openDb(file) {
   const db = new Database(file)

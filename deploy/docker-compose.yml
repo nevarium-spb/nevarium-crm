@@ -1,5 +1,7 @@
 # Невариум: сайт + CRM на одном VPS.
-# caddy раздаёт статику (dist) и проксирует /api на app.
+# caddy — только TLS и проброс на app: фронт отдаёт сам Node внутри контейнера
+# приложения (ADR-008), отдельного тома с dist больше нет — раньше он монтировался
+# с хоста, где dist/ (в .gitignore) никогда не собирался после единого контейнера.
 services:
   app:
     build:
@@ -22,7 +24,6 @@ services:
       - '443:443'
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ../dist:/srv/dist:ro
       - caddy-data:/data
       - caddy-config:/config
     depends_on:

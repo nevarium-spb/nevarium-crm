@@ -110,7 +110,7 @@ export default function Settings({ user }) {
               <span className="crm-cap">Экспорт и импорт данных доступны администратору.</span>
             )}
           </div>
-          <div className="crm-cap">Ночной бэкап на сервере создаётся автоматически и отправляется в Telegram.</div>
+          <div className="crm-cap">Ночной бэкап создаётся на сервере автоматически и отправляется копией в MAX. В Telegram он не уходит: в базе персональные данные клиентов, а Telegram зарубежный.</div>
           <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
             <button className="btn" onClick={demoSeed}>Добавить демо-данные</button>
             <button className="btn" onClick={demoClear}>Очистить демо</button>
@@ -124,7 +124,7 @@ export default function Settings({ user }) {
             <div className="diag">
               <span>Схема БД: <b>v{diag.schemaVersion}</b> · Сервер (МСК): <b>{diag.serverTimeMsk}</b></span>
               <span>Контакты: <b>{diag.counts.contacts}</b> · Сделки: <b>{diag.counts.deals}</b> · Задачи: <b>{diag.counts.tasks}</b> · Действия: <b>{diag.counts.interactions}</b></span>
-              <span>Уведомления в очереди: <b>{diag.outboxPending}</b></span>
+              <span>Уведомления в очереди: Telegram <b>{diag.outboxPending.tg}</b> · MAX <b>{diag.outboxPending.max}</b></span>
             </div>
           )}
           <div className="crm-cap">Рекомендуемый браузер — Chromium (Chrome, Edge, Яндекс). Данные хранятся на сервере.</div>
@@ -143,6 +143,14 @@ function UserModal({ existing, onDone, onClose }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
 
+  // Роль ЦЕЛИ: для нового пользователя — что выбрано в форме; при сбросе пароля
+  // существующему — его текущая роль (её здесь не меняют). Должно совпадать
+  // с сервером (server/app.js: POST/PATCH /api/crm/users) — иначе форма молча
+  // пропустит пароль короче 16 символов для админа, а сервер его всё равно
+  // отклонит с непонятной причиной.
+  const targetRole = existing ? existing.role : role
+  const minLen = targetRole === 'admin' ? 16 : 8
+
   const submit = async (e) => {
     e.preventDefault()
     if (busy) return
@@ -156,7 +164,7 @@ function UserModal({ existing, onDone, onClose }) {
       onClose()
     } catch (err) {
       if (err.data?.error === 'email_taken') setError('Такой email уже есть.')
-      else if (err.data?.error === 'bad_input') setError('Проверьте поля: пароль минимум 8 символов.')
+      else if (err.data?.error === 'bad_input') setError(`Проверьте поля: пароль минимум ${minLen} символов.`)
       else { apiErrorToast(err); setError('Не удалось сохранить.') }
     } finally {
       setBusy(false)
@@ -178,7 +186,13 @@ function UserModal({ existing, onDone, onClose }) {
             </label>
           </>
         )}
-        <label>{existing ? 'Новый пароль *' : 'Пароль *'}<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} minLength={8} required autoFocus={Boolean(existing)} /></label>
+        <label>
+          {existing ? 'Новый пароль *' : 'Пароль *'}
+          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} minLength={minLen} required autoFocus={Boolean(existing)} />
+        </label>
+        <div className="crm-cap">
+          Минимум {minLen} символов{targetRole === 'admin' ? ' — у администратора доступ к экспорту базы и обезличиванию, порог выше' : ''}.
+        </div>
         {error && <p className="field-error" role="alert">{error}</p>}
         <div className="crm-form-actions">
           <button type="button" className="btn" onClick={onClose}>Отмена</button>
