@@ -5,8 +5,9 @@ import path from 'node:path'
 import Database from 'better-sqlite3'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { buildApp, mskToday } from './app.js'
-import { hashPassword, resetThrottle, verifyPassword } from './auth.js'
+import { hashPassword, resetThrottle, verifyPassword, volatileSize, reserveVerify, serializeVerify, verifyOrFake, admitLoginRequest, releaseLoginRequest, inFlightLoginCount, MAX_BUCKETS, MAX_QUEUED_PER_KEY, MAX_QUEUED_PER_SOURCE, MAX_INFLIGHT_LOGIN_REQUESTS, THROTTLE_IP_FREE_ATTEMPTS } from './auth.js'
 import { bootstrapAdmin } from './bootstrap.js'
+import { validSeedInput } from './seed-admin.js'
 import { runBackup } from './backup.js'
 import { MIGRATIONS, addWorkdays, now, openDb } from './db.js'
 import { leadMessage, startOutboxWorker } from './telegram.js'
@@ -58,10 +59,341 @@ describe('auth', () => {
     expect(JSON.parse(res.body).error).toBe('invalid_credentials')
   })
 
-  it('троттлинг: после 5 неудач — 429', async () => {
+  it('после 5 неудач попытки выстраиваются в очередь, но остаются 401 — отказа нет', async () => {
+    // Логин не отдаёт 429: отказ до проверки пароля позволял бы любому, кто знает
+    // адрес владельца, запереть его в CRM. Вместо отказа — очередь на проверку.
+    // Первая попытка сверх порога идёт сразу, следующие ждут своего слота (2 с).
     for (let i = 0; i < 5; i++) await login('a@a.ru', 'wrong-password')
-    const res = await login('a@a.ru', 'wrong-password')
-    expect(res.statusCode).toBe(429)
+    const t = Date.now()
+    for (let i = 0; i < 3; i++) {
+      const res = await login('a@a.ru', 'wrong-password')
+      expect(res.statusCode).toBe(401)
+    }
+    // Три попытки сверх порога: первая идёт сразу, следующие ждут слота. Слоты
+    // абсолютные, поэтому ожидание перекрывается с bcrypt — суммарно ~4,2 с.
+    // Без очереди те же три попытки заняли бы ~750 мс, так что порог с запасом.
+    expect(Date.now() - t).toBeGreaterThan(3000)
+  }, 60_000)
+
+  it('верный пароль проходит даже после серии неудач — владельца не запереть', async () => {
+    // Регрессия, которую просил Codex: пять неверных попыток по реальному адресу,
+    // затем верный пароль обязан вернуть 200. Раньше здесь был 429 до проверки.
+    for (let i = 0; i < 5; i++) await login('a@a.ru', 'wrong-password')
+    const res = await login('a@a.ru', 'password123')
+    expect(res.statusCode).toBe(200)
+    // успех чистит корзину — следующая неудача снова «первая», без задержки
+    const t = Date.now()
+    await login('a@a.ru', 'wrong-password')
+    expect(Date.now() - t).toBeLessThan(4000)
+  }, 60_000)
+
+  it('смена X-Forwarded-For не обходит очередь: ключ по email, не по IP', async () => {
+    // Атака из аудита: перебор пароля админа с новым IP на каждый запрос.
+    // Очередь ведётся по email → все попытки в одной корзине, спуфинг бесполезен.
+    const attempt = (i) =>
+      app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        headers: { 'x-forwarded-for': `10.0.${Math.floor(i / 256)}.${i % 256}` },
+        payload: { email: 'a@a.ru', password: `guess${i}` },
+      })
+    for (let i = 0; i < 5; i++) await attempt(i)
+    const t = Date.now()
+    for (let i = 5; i < 8; i++) await attempt(i)
+    // несмотря на новый IP у каждой попытки, очередь по email их растянула:
+    // ~4,2 с против ~750 мс, которые заняли бы три попытки без очереди
+    expect(Date.now() - t).toBeGreaterThan(3000)
+  }, 60_000)
+
+  it('параллельная пачка ограничена по пропускной способности, а не только по задержке', async () => {
+    // Ключевая разница между «поспать N секунд» и очередью. Сон ограничивает
+    // латентность каждого запроса по отдельности: сто параллельных попыток отспят
+    // одни и те же N секунд ОДНОВРЕМЕННО и затем все проверятся — перебор не
+    // замедлится. Резервирование двигает общий счётчик времени синхронно, поэтому
+    // попытки выстраиваются в очередь: одна проверка на интервал.
+    //
+    // Все 40 попыток ВСЕГДА доходят до проверки пароля (отказа по горизонту очереди
+    // больше нет — см. «переполненная очередь не запирает владельца» ниже), поэтому
+    // нижняя граница по времени объясняется не «частью отсеялось», а тем, что после
+    // потолка ожидания (10 с) множество проснувшихся запросов исполняются по одному
+    // через serializeVerify — реальная бы параллельность бы такую нижнюю границу
+    // не дала. Верхняя граница проверяет, что весь serializeVerify-хвост укладывается
+    // в разумное время, а не растягивается на исходные 40 × 2 с = 80 с.
+    const t = Date.now()
+    const results = await Promise.all(
+      Array.from({ length: 40 }, () =>
+        app.inject({ method: 'POST', url: '/api/auth/login', payload: { email: 'a@a.ru', password: 'wrong' } })
+      )
+    )
+    const elapsed = Date.now() - t
+    // Все отвечают одинаково — по коду ответа очередь не видно
+    expect(results.every((r) => r.statusCode === 401)).toBe(true)
+    expect(elapsed).toBeGreaterThan(8000)
+    expect(elapsed).toBeLessThan(30000)
+  }, 120_000)
+
+  it('serializeVerify гарантирует concurrency=1: сколько бы вызовов ни пришло разом, исполняются по одному', async () => {
+    // Это и есть настоящее доказательство фикса — не по времени (замер по wall-clock
+    // на общем CI-раннере flaky сам по себе), а прямым подсчётом одновременных
+    // исполнений. Независимая проверка отдельно указала: HTTP-тест «за 30 секунд»
+    // маскирует именно этот risk — не доказывает границу параллелизма.
+    let inFlight = 0
+    let maxInFlight = 0
+    const work = () => new Promise((resolve) => {
+      inFlight++
+      maxInFlight = Math.max(maxInFlight, inFlight)
+      setTimeout(() => { inFlight--; resolve() }, 5)
+    })
+    await Promise.all(Array.from({ length: 50 }, () => serializeVerify(work)))
+    expect(maxInFlight).toBe(1)
+  })
+
+  it('verifyOrFake ограничивает очередь ОДНОГО ключа: сверх MAX_QUEUED_PER_KEY — мимо serializeVerify', async () => {
+    // Находка Codex (4-й раунд): reserveVerify после своего потолка ожидания даёт
+    // множеству параллельных попыток одно и то же время пробуждения — раньше ВСЕ
+    // они без исключения шли в serializeVerify, и при флуде в тысячи попыток на
+    // известный email владельца очередь растягивалась на ~20 минут. Доказываем не
+    // по времени (замер по wall-clock на общем CI-раннере flaky сам по себе, как уже
+    // отмечал Codex в прошлом раунде), а прямым подсчётом: сколько вызовов реально
+    // дошли до «bcrypt» против того, сколько ушло в дешёвую заглушку. Источники —
+    // все РАЗНЫЕ (потолок по источнику ниже потолка по ключу, разными адресами его
+    // не задеть), чтобы здесь проверялся именно общий потолок по ключу.
+    let realCalls = 0
+    let concurrentReal = 0
+    let maxConcurrentReal = 0
+    const verifier = () => new Promise((resolve) => {
+      realCalls++
+      concurrentReal++
+      maxConcurrentReal = Math.max(maxConcurrentReal, concurrentReal)
+      setTimeout(() => { concurrentReal--; resolve(true) }, 20)
+    })
+    const key = 'email:probe@test.ru'
+    // Все N вызовов стартуют синхронно (Array.from не уступает управление), поэтому
+    // ровно первые MAX_QUEUED_PER_KEY успевают увеличить счётчик занятых слотов до
+    // того, как хоть один из них разрешится — детерминировано, без гонки.
+    await Promise.all(Array.from({ length: 200 }, (_, i) => verifyOrFake(key, `src-${i}`, verifier)))
+    expect(realCalls).toBe(MAX_QUEUED_PER_KEY)
+    expect(maxConcurrentReal).toBe(1) // serializeVerify внутри всё ещё concurrency=1
+  })
+
+  it('verifyOrFake ограничивает очередь ОДНОГО источника: MAX_QUEUED_PER_SOURCE даже при свободных слотах ключа', async () => {
+    // Без этого потолка первая версия admission была гонкой за свободный слот,
+    // которую атакующий с одного адреса выигрывал числом попыток (следующий тест —
+    // прямое доказательство именно этого сценария).
+    let realCalls = 0
+    const verifier = () => new Promise((resolve) => setTimeout(() => resolve(true), 20))
+    const key = 'email:probe-source@test.ru'
+    const source = '10.0.0.1'
+    await Promise.all(Array.from({ length: 50 }, () => verifyOrFake(key, source, () => { realCalls++; return verifier() })))
+    expect(realCalls).toBe(MAX_QUEUED_PER_SOURCE)
+  })
+
+  it('verifyOrFake: непрерывный флуд с ОДНОГО источника не блокирует попытку с ДРУГОГО — находка Codex (5-й раунд)', async () => {
+    // До источникового потолка свободный слот на ключ доставался тому, кто первым
+    // до него дозвонился — при НЕПРЕРЫВНОМ пополнении с одного источника атакующий
+    // выигрывал эту гонку почти всегда просто объёмом попыток, и настоящий пароль
+    // владельца мог не проверяться вообще, сколько бы времени ни прошло (Codex прямо
+    // указал: тест раунда 4 с конечным флудом и ретраями это не ловил). Здесь
+    // атакующий не останавливается, пока владелец не получит ответ — и владелец
+    // обязан получить его от РЕАЛЬНОГО verifier, а не от fakeVerifyDelay.
+    const key = 'email:sustained@test.ru'
+    const attackerSource = '203.0.113.9'
+    const ownerSource = '198.51.100.7'
+    let attackerRunning = true
+    const inFlight = []
+    const pump = (async () => {
+      while (attackerRunning) {
+        inFlight.push(verifyOrFake(key, attackerSource, () => new Promise((r) => setTimeout(() => r(false), 5))))
+        await new Promise((r) => setTimeout(r, 1))
+      }
+    })()
+    await new Promise((r) => setTimeout(r, 30)) // дать атакующему занять свой слот
+    let ownerSawReal = false
+    const ownerResult = await verifyOrFake(key, ownerSource, () => { ownerSawReal = true; return Promise.resolve(true) })
+    attackerRunning = false
+    await pump
+    await Promise.all(inFlight)
+    expect(ownerSawReal).toBe(true)
+    expect(ownerResult).toBe(true)
+  })
+
+  it('admitLoginRequest ограничивает число одновременных /api/auth/login запросов', () => {
+    // Находка Codex (6-й раунд): фаза reserveVerify+sleep не была ограничена по
+    // числу ОДНОВРЕМЕННЫХ ожидающих запросов — потолок на bcrypt-очередь (verifyOrFake)
+    // не спасал от истощения соединений/памяти раньше него. Здесь — счётчик, не
+    // wall-clock: детерминировано.
+    expect(inFlightLoginCount()).toBe(0)
+    for (let i = 0; i < MAX_INFLIGHT_LOGIN_REQUESTS; i++) expect(admitLoginRequest()).toBe(true)
+    expect(admitLoginRequest()).toBe(false) // потолок исчерпан
+    releaseLoginRequest()
+    expect(admitLoginRequest()).toBe(true) // освободившийся слот снова доступен
+    // Счётчик модульный, resetThrottle() его не трогает (это не троттлинг по ключу,
+    // а общий потолок на запрос) — подчищаем сами, чтобы не утекло в другие тесты.
+    for (let i = 0; i < MAX_INFLIGHT_LOGIN_REQUESTS; i++) releaseLoginRequest()
+    expect(inFlightLoginCount()).toBe(0)
+  })
+
+  it('/api/auth/login отвечает 503 при исчерпанном глобальном потолке запросов, а не зависает', async () => {
+    for (let i = 0; i < MAX_INFLIGHT_LOGIN_REQUESTS; i++) admitLoginRequest()
+    try {
+      const res = await login('a@a.ru', 'password123')
+      expect(res.statusCode).toBe(503)
+      expect(JSON.parse(res.body).error).toBe('overloaded')
+    } finally {
+      for (let i = 0; i < MAX_INFLIGHT_LOGIN_REQUESTS; i++) releaseLoginRequest()
+    }
+    const ok = await login('a@a.ru', 'password123')
+    expect(ok.statusCode).toBe(200)
+  })
+
+  it('время ответа не выдаёт, существует ли аккаунт, даже после порога', async () => {
+    // Оракул, который Codex нашёл в прошлой версии: если очередь заводить только для
+    // существующих адресов, то после 5 попыток реальный email начинает отвечать
+    // медленно, а выдуманный — быстро. Очередь ведётся для любого адреса.
+    const probe = async (email) => {
+      for (let i = 0; i < 5; i++) await app.inject({ method: 'POST', url: '/api/auth/login', payload: { email, password: 'x' } })
+      const t = Date.now()
+      await app.inject({ method: 'POST', url: '/api/auth/login', payload: { email, password: 'x' } })
+      return Date.now() - t
+    }
+    const existing = await probe('a@a.ru')
+    const ghost = await probe('ghost@nowhere.ru')
+    // Обе шестые попытки попадают в очередь одинаково: разница не должна быть
+    // такой, чтобы по ней классифицировать аккаунты.
+    expect(Math.abs(existing - ghost)).toBeLessThan(1500)
+  }, 120_000)
+
+  it('спрей не сбрасывает лимит атакуемого аккаунта: корзины аккаунтов не вытесняются', () => {
+    // Находка Codex: вытеснение само становилось примитивом сброса. Атакующий
+    // заливал MAX_BUCKETS мусорных адресов, выбивал корзину владельца и получал
+    // новые бесплатные попытки. Корзины существующих аккаунтов теперь в отдельном
+    // невытесняемом хранилище.
+    resetThrottle()
+    const target = 'email:a@a.ru'
+    // изматываем лимит атакуемого аккаунта
+    for (let i = 0; i < 8; i++) reserveVerify(target, { durable: true })
+    const waitBefore = reserveVerify(target, { durable: true })
+    expect(waitBefore).toBeGreaterThan(0)
+
+    // спрей сверх потолка — он не должен ничего сбросить
+    for (let i = 0; i < MAX_BUCKETS * 2; i++) reserveVerify(`email:spray-${i}@nowhere.ru`)
+
+    const waitAfter = reserveVerify(target, { durable: true })
+    expect(waitAfter).toBeGreaterThan(0)
+    expect(volatileSize()).toBeLessThanOrEqual(MAX_BUCKETS)
+  })
+
+  it('переполненная очередь не запирает владельца: верный пароль проверяется всегда', async () => {
+    // Находка Codex: отказ по горизонту очереди возвращал 401 без проверки пароля,
+    // то есть атакующий, держа очередь полной, не давал владельцу войти вообще.
+    // Теперь ожидание ограничено потолком, но проверка выполняется всегда.
+    await Promise.all(
+      Array.from({ length: 30 }, () =>
+        app.inject({ method: 'POST', url: '/api/auth/login', payload: { email: 'a@a.ru', password: 'wrong' } })
+      )
+    )
+    const res = await login('a@a.ru', 'password123')
+    expect(res.statusCode).toBe(200)
+  }, 120_000)
+
+  it('состояние троттлинга ограничено сверху: спрей уникальных email не растит его без предела', () => {
+    // Корзину заводим для ЛЮБОГО адреса — иначе разница во времени ответа сама
+    // выдаёт, какой аккаунт существует. Значит защита от OOM не в отказе заводить
+    // корзины, а в потолке их числа и вытеснении самых старых.
+    // Проверяем напрямую на reserveVerify: гонять 6000 запросов через HTTP с bcrypt
+    // заняло бы десятки минут, а суть проверки — в самом хранилище.
+    resetThrottle()
+    for (let i = 0; i < MAX_BUCKETS * 2; i++) reserveVerify(`email:spray-${i}@nowhere.ru`)
+    expect(volatileSize()).toBeLessThanOrEqual(MAX_BUCKETS)
+  })
+
+  it('флуд уникальными несуществующими email не жжёт CPU: путь всегда fakeVerifyDelay, не bcrypt', async () => {
+    // Несуществующий email больше не идёт на настоящий bcrypt вообще (ни при каких
+    // условиях) — всегда fakeVerifyDelay, дешёвый по CPU. Контракт: ответ 401,
+    // сервис не блокируется.
+    for (let i = 0; i < THROTTLE_IP_FREE_ATTEMPTS + 5; i++) {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { email: `ghost-${i}-${Date.now()}@nowhere.ru`, password: 'x' },
+      })
+      expect(res.statusCode).toBe(401)
+    }
+  }, 60_000)
+
+  it('флуд не запирает владельца: верный пароль проходит даже после долгой серии неудач', async () => {
+    for (let i = 0; i < THROTTLE_IP_FREE_ATTEMPTS + 5; i++) {
+      await app.inject({ method: 'POST', url: '/api/auth/login', payload: { email: `flood-${i}@nowhere.ru`, password: 'x' } })
+    }
+    const res = await login('a@a.ru', 'password123')
+    expect(res.statusCode).toBe(200)
+  }, 60_000)
+
+  it('владелец логинится за секунды, ПОКА идёт активный флуд поддельных email — независимая проверка нашла: раньше вставал в ту же очередь', async () => {
+    // Тот самый регресс: fakeVerifyDelay раньше шёл через общий serializeVerify —
+    // каждый уникальный несуществующий email резервирует слот мгновенно (emailWait=0,
+    // это его первое обращение), и все они попадали в ОДНУ очередь с настоящим
+    // логином владельца. При потоке в тысячи запросов владелец встал бы в конец
+    // этой очереди и ждал бы весь поток целиком — блокировка не отказом (429),
+    // а фактическим временем ожидания, то есть то же самое, от чего был весь фикс.
+    // Флуд не ждём (не await) — он должен оставаться «в полёте» одновременно
+    // с попыткой владельца, как в реальной атаке.
+    const flood = Array.from({ length: 500 }, (_, i) =>
+      app.inject({ method: 'POST', url: '/api/auth/login', payload: { email: `flood-${i}-${Date.now()}@nowhere.ru`, password: 'x' } })
+    )
+    const t = Date.now()
+    const res = await login('a@a.ru', 'password123')
+    const elapsed = Date.now() - t
+    expect(res.statusCode).toBe(200)
+    // 500 запросов через serializeVerify заняли бы больше минуты; фейковый путь
+    // мимо шлюза — владелец укладывается в пару секунд независимо от флуда.
+    expect(elapsed).toBeLessThan(5000)
+    await Promise.all(flood) // не оставляем висящих промисов после теста
+  }, 60_000)
+
+  it('владелец логинится даже при флуде НА ЕГО ЖЕ email с ЧУЖОГО адреса — тест выше ловит только флуд по чужим адресам', async () => {
+    // Codex прямо указал на пробел: тест на 500 фейковых email не показателен для
+    // ЭТОЙ атаки — разные email и так идут мимо очереди через fakeVerifyDelay.
+    // Настоящая угроза — флуд на email владельца (он опубликован на сайте): все
+    // попытки делят один и тот же ключ в reserveVerify/verifyOrFake. Флуд — с ОДНОГО
+    // чужого IP (реалистичный сценарий: атакующий редко сидит на адресе владельца),
+    // попытка владельца — со своего, дефолтного для инъекций в этом файле. Потолок
+    // по источнику (MAX_QUEUED_PER_SOURCE) гарантирует: атакующий не может занять
+    // больше одного из MAX_QUEUED_PER_KEY слотов, попытке владельца всегда есть куда
+    // встать. Ретраи оставлены как запас на фазу reserveVerify (она по-прежнему
+    // общая на ключ и капается на 10 с независимо от источника, см. auth.js) —
+    // не на гонку за слот bcrypt, та теперь честно разделена по источнику.
+    const flood = Array.from({ length: 60 }, () =>
+      app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        headers: { 'x-forwarded-for': '203.0.113.50' },
+        payload: { email: 'a@a.ru', password: 'wrong-guess' },
+      })
+    )
+    const t = Date.now()
+    let res
+    for (let attempt = 0; attempt < 5; attempt++) {
+      res = await login('a@a.ru', 'password123')
+      if (res.statusCode === 200) break
+    }
+    const elapsed = Date.now() - t
+    expect(res.statusCode).toBe(200)
+    expect(elapsed).toBeLessThan(30000)
+    await Promise.all(flood)
+  }, 60_000)
+
+  it('несуществующий email тоже прогоняет bcrypt — нет тайминговой энумерации', async () => {
+    // До фикса ответ на чужой email был мгновенным (~1 мс), на существующий —
+    // ~230 мс (bcrypt). По разнице во времени атакующий определял валидные учётки.
+    // Порог 40 мс надёжно отделяет «bcrypt выполнился» от «мгновенного ответа»:
+    // bcrypt cost 12 на любом железе дольше 100 мс, а без него путь занимал ~1 мс.
+    const t = Date.now()
+    const res = await app.inject({ method: 'POST', url: '/api/auth/login', payload: { email: 'ghost@nowhere.ru', password: 'x' } })
+    const elapsed = Date.now() - t
+    expect(res.statusCode).toBe(401)
+    expect(JSON.parse(res.body).error).toBe('invalid_credentials')
+    expect(elapsed).toBeGreaterThan(40)
   })
 
   it('без cookie /api/crm/* → 401', async () => {
@@ -70,7 +402,8 @@ describe('auth', () => {
   })
 
   it('смена пароля инвалидирует старую сессию (tokenVersion)', async () => {
-    await app.inject({ method: 'PATCH', url: '/api/crm/users/1', payload: { password: 'newpassword1' }, headers: { cookie } })
+    // Пользователь 1 — admin, порог для него 16 символов (MIN_ADMIN_PASSWORD_LENGTH)
+    await app.inject({ method: 'PATCH', url: '/api/crm/users/1', payload: { password: 'newpassword12345' }, headers: { cookie } })
     const me = await app.inject({ method: 'GET', url: '/api/auth/me', headers: { cookie } })
     expect(me.statusCode).toBe(401)
   })
@@ -93,6 +426,51 @@ describe('auth', () => {
       headers: { cookie, origin: 'https://evil.example', host: 'crm.nevarium.ru' },
     })
     expect(res.statusCode).toBe(403)
+  })
+})
+
+describe('APP_ORIGIN: строгая CSRF-проверка, когда домен CRM настроен явно', () => {
+  // Независимый аудит: сравнение с X-Forwarded-Host — это сравнение с заголовком,
+  // который в общем случае подставляет клиент, а не прокси. Явный APP_ORIGIN
+  // такой лазейки не оставляет — сравниваем строго с настроенным значением.
+  let strictApp, strictCookie
+
+  beforeEach(async () => {
+    strictApp = buildApp({ secure: false, appOrigin: 'https://crm-nevarium.ru' })
+    strictApp.db.prepare('INSERT INTO users (name,email,password_hash,role,created_at) VALUES (?,?,?,?,?)')
+      .run('Админ', 'a@a.ru', await hashPassword('password123'), 'admin', now())
+    await strictApp.ready()
+    strictCookie = (await strictApp.inject({ method: 'POST', url: '/api/auth/login', payload: { email: 'a@a.ru', password: 'password123' } })).headers['set-cookie']
+  })
+  afterEach(() => strictApp.close())
+
+  it('верный Origin проходит', async () => {
+    const res = await strictApp.inject({
+      method: 'POST', url: '/api/crm/contacts', payload: { name: 'X' },
+      headers: { cookie: strictCookie, origin: 'https://crm-nevarium.ru' },
+    })
+    expect(res.statusCode).toBe(200)
+  })
+
+  it('поддельный X-Forwarded-Host больше не помогает — сравнение идёт с APP_ORIGIN, не с заголовком', async () => {
+    const res = await strictApp.inject({
+      method: 'POST', url: '/api/crm/contacts', payload: { name: 'X' },
+      headers: { cookie: strictCookie, origin: 'https://evil.example', 'x-forwarded-host': 'evil.example', host: 'evil.example' },
+    })
+    expect(res.statusCode).toBe(403)
+  })
+
+  it('отсутствие Origin тоже отклоняется — в строгом режиме, в отличие от мягкого', async () => {
+    const res = await strictApp.inject({
+      method: 'POST', url: '/api/crm/contacts', payload: { name: 'X' },
+      headers: { cookie: strictCookie },
+    })
+    expect(res.statusCode).toBe(403)
+  })
+
+  it('GET не требует Origin даже в строгом режиме', async () => {
+    const res = await strictApp.inject({ method: 'GET', url: '/api/crm/contacts', headers: { cookie: strictCookie } })
+    expect(res.statusCode).toBe(200)
   })
 })
 
@@ -766,19 +1144,19 @@ describe('bootstrapAdmin — первый админ без shell-доступа
 
   it('создаёт админа на пустой базе и пароль реально проверяется', async () => {
     app.db.exec('DELETE FROM users') // beforeEach уже создал тестового пользователя
-    const env = { BOOTSTRAP_ADMIN_EMAIL: 'Boss@Example.ru', BOOTSTRAP_ADMIN_PASSWORD: 'supersecret1' }
+    const env = { BOOTSTRAP_ADMIN_EMAIL: 'Boss@Example.ru', BOOTSTRAP_ADMIN_PASSWORD: 'supersecret12345' }
     const created = await bootstrapAdmin(app.db, { log: silent, env })
     expect(created).toBe(true)
     const user = app.db.prepare('SELECT * FROM users WHERE email = ?').get('boss@example.ru')
     expect(user).toMatchObject({ role: 'admin', name: 'Админ' })
-    expect(await verifyPassword('supersecret1', user.password_hash)).toBe(true)
+    expect(await verifyPassword('supersecret12345', user.password_hash)).toBe(true)
   })
 
   it('не трогает базу, если пользователи уже есть', async () => {
     const before = app.db.prepare('SELECT COUNT(*) c FROM users').get().c
     const created = await bootstrapAdmin(app.db, {
       log: silent,
-      env: { BOOTSTRAP_ADMIN_EMAIL: 'x@x.ru', BOOTSTRAP_ADMIN_PASSWORD: 'supersecret1' },
+      env: { BOOTSTRAP_ADMIN_EMAIL: 'x@x.ru', BOOTSTRAP_ADMIN_PASSWORD: 'supersecret12345' },
     })
     expect(created).toBe(false)
     expect(app.db.prepare('SELECT COUNT(*) c FROM users').get().c).toBe(before)
@@ -792,6 +1170,91 @@ describe('bootstrapAdmin — первый админ без shell-доступа
     })
     expect(created).toBe(false)
     expect(app.db.prepare('SELECT COUNT(*) c FROM users').get().c).toBe(0)
+  })
+
+  it('ровно 15 символов — отказ, ровно 16 — создаётся (граница MIN_ADMIN_PASSWORD_LENGTH)', async () => {
+    app.db.exec('DELETE FROM users')
+    const pass15 = 'a'.repeat(15)
+    const pass16 = 'a'.repeat(16)
+    expect(pass15).toHaveLength(15)
+    expect(pass16).toHaveLength(16)
+    const rejected = await bootstrapAdmin(app.db, { log: silent, env: { BOOTSTRAP_ADMIN_EMAIL: 'x@x.ru', BOOTSTRAP_ADMIN_PASSWORD: pass15 } })
+    expect(rejected).toBe(false)
+    const accepted = await bootstrapAdmin(app.db, { log: silent, env: { BOOTSTRAP_ADMIN_EMAIL: 'x@x.ru', BOOTSTRAP_ADMIN_PASSWORD: pass16 } })
+    expect(accepted).toBe(true)
+  })
+})
+
+describe('минимальная длина пароля по роли (MIN_ADMIN_PASSWORD_LENGTH = 16)', () => {
+  // Порог у bootstrap — не единственная дверь для создания админа: /api/crm/users
+  // с role=admin и смена пароля существующему админу обязаны требовать то же самое,
+  // иначе минимум обходится через создание слабого админа в самом интерфейсе.
+  it('создание нового пользователя с role=admin требует 16 символов, participant — только 8', async () => {
+    const weakAdmin = await app.inject({ method: 'POST', url: '/api/crm/users', payload: { name: 'Х', email: 'weak-admin@x.ru', password: 'short123', role: 'admin' }, headers: { cookie } })
+    expect(weakAdmin.statusCode).toBe(400)
+    const okAdmin = await app.inject({ method: 'POST', url: '/api/crm/users', payload: { name: 'Х', email: 'ok-admin@x.ru', password: 'supersecret12345', role: 'admin' }, headers: { cookie } })
+    expect(okAdmin.statusCode).toBe(200)
+    const okMember = await app.inject({ method: 'POST', url: '/api/crm/users', payload: { name: 'Y', email: 'ok-member@x.ru', password: 'short123', role: 'member' }, headers: { cookie } })
+    expect(okMember.statusCode).toBe(200)
+  })
+
+  it('смена пароля существующему админу требует 16 символов — по роли ЦЕЛИ, не инициатора', async () => {
+    // Пользователь 1 (из beforeEach) — admin
+    const weak = await app.inject({ method: 'PATCH', url: '/api/crm/users/1', payload: { password: 'short123' }, headers: { cookie } })
+    expect(weak.statusCode).toBe(400)
+    const strong = await app.inject({ method: 'PATCH', url: '/api/crm/users/1', payload: { password: 'supersecret12345' }, headers: { cookie } })
+    expect(strong.statusCode).toBe(200)
+  })
+
+  it('невалидный пароль в PATCH не должен успевать сохранить имя — раньше запись была частичной', async () => {
+    // Codex поймал: имя писалось в БД ДО проверки длины пароля, поэтому запрос с
+    // новым именем и слабым паролем возвращал 400, но имя всё равно менялось —
+    // ответ «ничего не сохранено» не соответствовал реальности.
+    const before = await app.inject({ method: 'GET', url: '/api/crm/users', headers: { cookie } })
+    const nameBefore = JSON.parse(before.body).items.find((u) => u.id === 1).name
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/api/crm/users/1',
+      payload: { name: 'Новое Имя', password: 'short123' },
+      headers: { cookie },
+    })
+    expect(res.statusCode).toBe(400)
+    const after = await app.inject({ method: 'GET', url: '/api/crm/users', headers: { cookie } })
+    const nameAfter = JSON.parse(after.body).items.find((u) => u.id === 1).name
+    expect(nameAfter).toBe(nameBefore)
+  })
+
+  it('PATCH с нестроковым password не проходит проверку длины молча — тоже не должен писать имя', async () => {
+    // Codex отдельно отметил: password.length у нестроковых значений — undefined,
+    // а undefined < minLen ложно, так что проверка молча пропускала бы такой запрос
+    // без явного typeof-контроля.
+    const before = await app.inject({ method: 'GET', url: '/api/crm/users', headers: { cookie } })
+    const nameBefore = JSON.parse(before.body).items.find((u) => u.id === 1).name
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/api/crm/users/1',
+      payload: { name: 'Другое Имя', password: 12345678901234567 },
+      headers: { cookie },
+    })
+    expect(res.statusCode).toBe(400)
+    const after = await app.inject({ method: 'GET', url: '/api/crm/users', headers: { cookie } })
+    expect(JSON.parse(after.body).items.find((u) => u.id === 1).name).toBe(nameBefore)
+  })
+
+  it('смена пароля участнику по-прежнему принимает 8 символов', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/users', payload: { name: 'Y', email: 'member2@x.ru', password: 'password123', role: 'member' }, headers: { cookie } })
+    const res = await app.inject({ method: 'PATCH', url: '/api/crm/users/2', payload: { password: 'short123' }, headers: { cookie } })
+    expect(res.statusCode).toBe(200)
+  })
+
+  it('seed-admin.js (четвёртый путь создания админа) тоже требует 16 символов', () => {
+    // Независимый аудит поймал: этот путь остался на пороге 8, хотя bootstrap.js,
+    // POST /api/crm/users (role=admin) и PATCH уже требовали 16 — единственный
+    // интерактивный скрипт создания первого админа оставался лазейкой.
+    expect(validSeedInput('Админ', 'a@a.ru', 'a'.repeat(15))).toBe(false)
+    expect(validSeedInput('Админ', 'a@a.ru', 'a'.repeat(16))).toBe(true)
+    expect(validSeedInput('', 'a@a.ru', 'a'.repeat(20))).toBe(false)
+    expect(validSeedInput('Админ', 'не-email', 'a'.repeat(20))).toBe(false)
   })
 })
 

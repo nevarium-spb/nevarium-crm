@@ -143,6 +143,14 @@ function UserModal({ existing, onDone, onClose }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
 
+  // Роль ЦЕЛИ: для нового пользователя — что выбрано в форме; при сбросе пароля
+  // существующему — его текущая роль (её здесь не меняют). Должно совпадать
+  // с сервером (server/app.js: POST/PATCH /api/crm/users) — иначе форма молча
+  // пропустит пароль короче 16 символов для админа, а сервер его всё равно
+  // отклонит с непонятной причиной.
+  const targetRole = existing ? existing.role : role
+  const minLen = targetRole === 'admin' ? 16 : 8
+
   const submit = async (e) => {
     e.preventDefault()
     if (busy) return
@@ -156,7 +164,7 @@ function UserModal({ existing, onDone, onClose }) {
       onClose()
     } catch (err) {
       if (err.data?.error === 'email_taken') setError('Такой email уже есть.')
-      else if (err.data?.error === 'bad_input') setError('Проверьте поля: пароль минимум 8 символов.')
+      else if (err.data?.error === 'bad_input') setError(`Проверьте поля: пароль минимум ${minLen} символов.`)
       else { apiErrorToast(err); setError('Не удалось сохранить.') }
     } finally {
       setBusy(false)
@@ -178,7 +186,13 @@ function UserModal({ existing, onDone, onClose }) {
             </label>
           </>
         )}
-        <label>{existing ? 'Новый пароль *' : 'Пароль *'}<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} minLength={8} required autoFocus={Boolean(existing)} /></label>
+        <label>
+          {existing ? 'Новый пароль *' : 'Пароль *'}
+          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} minLength={minLen} required autoFocus={Boolean(existing)} />
+        </label>
+        <div className="crm-cap">
+          Минимум {minLen} символов{targetRole === 'admin' ? ' — у администратора доступ к экспорту базы и обезличиванию, порог выше' : ''}.
+        </div>
         {error && <p className="field-error" role="alert">{error}</p>}
         <div className="crm-form-actions">
           <button type="button" className="btn" onClick={onClose}>Отмена</button>

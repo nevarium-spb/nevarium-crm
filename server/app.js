@@ -3,7 +3,7 @@ import Fastify from 'fastify'
 import cookie from '@fastify/cookie'
 import staticPlugin from '@fastify/static'
 import { DEFAULT_PROJECT_ID, DUMP_TABLES, DUMP_VERSION, PD_REQUEST_KINDS, WINBACK_STEPS, addWorkdays, buildDump, openDb, now, STAGES, TERMINAL_STAGES } from './db.js'
-import { hashPassword, verifyPassword, signToken, verifyToken, loginThrottle, loginFailed, loginSucceeded, SESSION_TTL_DAYS } from './auth.js'
+import { hashPassword, verifyPassword, fakeVerifyDelay, verifyOrFake, signToken, verifyToken, reserveVerify, loginSucceeded, sleep, admitLoginRequest, releaseLoginRequest, SESSION_TTL_DAYS, MIN_PASSWORD_LENGTH, MIN_ADMIN_PASSWORD_LENGTH } from './auth.js'
 import { enqueue } from './telegram.js'
 
 const COOKIE = 'nv_session'
@@ -20,9 +20,30 @@ export function mskToday(offsetDays = 0, nowMs = Date.now()) {
 
 const trim = (v, max = 500) => String(v ?? '').trim().slice(0, max)
 
-export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = true, logger = false, staticDir = null } = {}) {
+// Доверенных прокси-хопов по умолчанию — один (App Platform). Тесты и dev создают
+// приложение без прокси: с trustProxy=1 и без X-Forwarded-For req.ip = адрес сокета.
+const TRUST_PROXY = Number(process.env.TRUST_PROXY_HOPS) || 1
+
+// Явно настроенный домен CRM для CSRF-проверки Origin на мутациях — например
+// https://crm-nevarium.ru. Не задан по умолчанию: заполняется в деплое (см.
+// deploy/.env.example), а в dev/тестах фронт и бэкенд на разных портах, и
+// единственного правильного значения нет — там остаётся прежний, менее строгий
+// путь сравнения с X-Forwarded-Host.
+const APP_ORIGIN = trim(process.env.APP_ORIGIN, 300) || null
+
+export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = true, logger = false, staticDir = null, trustProxy = TRUST_PROXY, appOrigin = APP_ORIGIN } = {}) {
   const db = openDb(dbFile)
-  const app = Fastify({ logger, trustProxy: true })
+  // trustProxy — число доверенных прокси-хопов, НЕ `true`. С `true` Fastify берёт
+  // самый левый X-Forwarded-For как req.ip, а его подставляет клиент — тогда всё,
+  // что смотрит на req.ip, обманывается сменой заголовка. Безопасность логина от
+  // этого больше не зависит (троттлинг ключуется по email, см. ниже), но req.ip
+  // ещё нужен антиспаму заявок (leadSuspicious) и логам. С числом N доверяем N
+  // хопам с правого края, где реальный прокси проставил IP. На App Platform перед
+  // контейнером один прокси → 1; за ним внешний клиент не может подделать свой IP
+  // (его инъекция остаётся левее доверенного хопа). Если у Timeweb окажется больше
+  // хопов, req.ip выродится в общий IP прокси — антиспам станет глобальнее, не
+  // слабее. Подкручивается переменной TRUST_PROXY_HOPS без правки кода.
+  const app = Fastify({ logger, trustProxy })
   app.register(cookie)
   app.decorate('db', db)
 
@@ -64,11 +85,25 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     const user = getUser(req)
     if (!user) return reply.code(401).send({ error: 'unauthorized' })
     if (req.method !== 'GET') {
-      // за прокси (Caddy/Vite) реальный хост приходит в X-Forwarded-Host
       const origin = req.headers.origin
-      const selfHost = req.headers['x-forwarded-host'] || req.headers.host
-      if (origin && new URL(origin).host !== selfHost) {
-        return reply.code(403).send({ error: 'forbidden' })
+      if (appOrigin) {
+        // Независимая проверка нашла: сравнение с X-Forwarded-Host — это сравнение
+        // с заголовком, который в общем случае подставляет КЛИЕНТ, а не только
+        // прокси (Fastify доверяет ему целиком при любом truthy trustProxy — число
+        // хопов защищает разбор X-Forwarded-For как списка, но X-Forwarded-Host не
+        // список, там нечего разбирать по хопам). Когда домен CRM настроен явно,
+        // сравниваем строго с ним и клиентским заголовкам вообще не доверяем.
+        // Отсутствие Origin здесь ТОЖЕ запрещено (в мягком пути ниже — нет): настоящий
+        // браузер шлёт Origin на мутирующий fetch даже в пределах одного домена,
+        // поэтому легитимный фронт это не заденет, а обходной путь «просто не
+        // прислать заголовок» закрывается.
+        if (origin !== appOrigin) return reply.code(403).send({ error: 'forbidden' })
+      } else if (origin) {
+        // APP_ORIGIN не настроен (dev/тесты, где фронт и бэкенд на разных портах,
+        // единственного верного значения нет) — прежний, более мягкий путь: за
+        // прокси (Caddy/Vite) реальный хост приходит в X-Forwarded-Host.
+        const selfHost = req.headers['x-forwarded-host'] || req.headers.host
+        if (new URL(origin).host !== selfHost) return reply.code(403).send({ error: 'forbidden' })
       }
     }
     req.user = user
@@ -91,20 +126,88 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
 
   // ---------- auth ----------
   app.post('/api/auth/login', async (req, reply) => {
-    const email = trim(req.body?.email, 200).toLowerCase()
-    const password = String(req.body?.password ?? '')
-    const key = `${req.ip}|${email}`
-    const wait = loginThrottle(key)
-    if (wait) return reply.code(429).send({ error: 'throttled', retryAfter: wait })
-    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email)
-    if (!user || !(await verifyPassword(password, user.password_hash))) {
-      loginFailed(key)
-      return reply.code(401).send({ error: 'invalid_credentials' })
+    // Потолок на ЗАПРОС, до всего остального: reserveVerify резервирует слот
+    // синхронно (закрывает гонку «проверил — потом сделал»), но сама фаза ожидания
+    // своего слота ничем не была ограничена по числу одновременных ожидающих —
+    // независимая проверка (Codex, 6-й раунд) нашла, что это истощение ресурсов
+    // само по себе, раньше, чем дело дойдёт до bcrypt-очереди. Потолок общий на все
+    // email — ничего не выдаёт про конкретный аккаунт, троттлинг ключа не трогает.
+    if (!admitLoginRequest()) return reply.code(503).send({ error: 'overloaded' })
+    try {
+      const email = trim(req.body?.email, 200).toLowerCase()
+      const password = String(req.body?.password ?? '')
+      // Логин не отвечает 401-до-проверки по конкретному аккаунту нигде: отказ до
+      // проверки пароля позволял бы любому, кто знает адрес владельца (а он
+      // опубликован на сайте), запереть его в CRM пятью запросами. Вместо отказа —
+      // очередь на проверку (reserveVerify), и верный пароль проходит, как только
+      // слот подошёл. Ответы всегда 401 или 200, поэтому по коду ответа тоже ничего
+      // не утекает (503 выше — про общую перегрузку сервера, не про этот email).
+      const emailKey = `email:${email}`
+      // Слот резервируем СИНХРОННО, до первого await, и для ЛЮБОГО email — существует
+      // аккаунт или нет. Синхронность закрывает гонку «проверил — потом сделал»: иначе
+      // пачка параллельных запросов читает старое значение и проходит лимит целиком.
+      // Одинаковость для существующих и несуществующих закрывает оракул: если ждать
+      // только на реальных адресах, разница во времени ответа сама выдаёт, какой
+      // аккаунт есть.
+      // Пользователя ищем здесь же: поиск синхронный (better-sqlite3), значит остаётся
+      // в том же неразрывном участке. Существующие аккаунты получают корзину в
+      // невытесняемом хранилище — иначе спрей мусорных адресов выбивал бы корзину
+      // владельца и тем самым сбрасывал его лимит.
+      const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email)
+      const emailWait = reserveVerify(emailKey, { durable: Boolean(user) })
+
+      // Ждём свой слот. Отказ ЗДЕСЬ, до какой-либо проверки, был бы плохим: атакующий,
+      // держа очередь резервирования переполненной, не давал бы владельцу дойти даже
+      // до попытки войти. Ниже, после ожидания, ограничение другого рода — не отказ,
+      // а решение «настоящий bcrypt или дешёвая заглушка», см. verifyOrFake.
+      if (emailWait) await sleep(emailWait)
+
+      // Несуществующий email — ВСЕГДА fakeVerifyDelay, и ВСЕГДА мимо очереди bcrypt.
+      // Раньше первые THROTTLE_IP_FREE_ATTEMPTS несуществующих email на IP шли на
+      // настоящий bcrypt (против DUMMY_PASSWORD_HASH) и тоже вставали в общий шлюз —
+      // а для КАЖДОГО нового уникального email слот резервируется мгновенно (это его
+      // первое обращение, emailWait=0). Независимая проверка поймала: поток из тысяч
+      // уникальных несуществующих адресов уходил в ту же очередь, что и настоящий
+      // логин владельца, и вставал впереди него — без потолка на длину очереди
+      // владелец ждал бы весь этот поток целиком. fakeVerifyDelay же не тратит CPU —
+      // это просто setTimeout, параллелить его безопасно и незачем через что-либо
+      // проводить: тайминг совпадает с реальным bcrypt (self-calibrated, см. auth.js).
+      //
+      // Существующий email тоже больше не идёт в очередь безусловно: verifyOrFake
+      // (auth.js) пускает на реальный bcrypt не больше MAX_QUEUED_PER_KEY проверок
+      // ОДНОГО ключа одновременно, а сверх потолка — тот же дешёвый fakeVerifyDelay.
+      // Это закрывает находку Codex: флуд на известный email владельца (он опубликован
+      // на сайте) раньше вставал в serializeVerify БЕЗ ограничения на длину очереди —
+      // при тысячах параллельных попыток владелец мог ждать очередь целиком (~20 минут
+      // при 5000 попытках).
+      //
+      // req.ip — источник для ВТОРОГО потолка (MAX_QUEUED_PER_SOURCE) внутри
+      // verifyOrFake: без него первая версия потолка была гонкой за свободный слот,
+      // которую при НЕПРЕРЫВНОМ флуде с одного адреса атакующий выигрывал числом
+      // попыток. Один слот на источник гарантирует: попытка с ДРУГОГО адреса, чем у
+      // атакующего, всегда находит свободный слот немедленно. req.ip в этом деплое
+      // доверенный (TRUST_PROXY_HOPS, см. выше), не подделывается клиентским
+      // заголовком. Осознанный остаточный риск (Codex, 6-й раунд): если владелец
+      // физически окажется за тем же внешним IP, что и атакующий (CGNAT, офисный
+      // NAT — в РФ не редкость, см. leadSuspicious про ту же тему на приёме заявок),
+      // источниковый потолок не различает их — как и распределённая атака с
+      // MAX_QUEUED_PER_KEY и более разных источников. От такого защищает не этот
+      // файл, а стойкость самого пароля (16 символов для admin, см. auth.js) и
+      // инфраструктурные меры (rate limit на прокси) — сознательно вне этого диффа.
+      const ok = user
+        ? await verifyOrFake(emailKey, req.ip, () => verifyPassword(password, user.password_hash))
+        : await fakeVerifyDelay().then(() => false)
+      if (!user || !ok) {
+        // Счётчик уже увеличен выше, при входе в обработчик — повторно не считаем.
+        return reply.code(401).send({ error: 'invalid_credentials' })
+      }
+      loginSucceeded(emailKey, { durable: true })
+      const token = signToken({ uid: user.id, tokenVersion: user.token_version }, secret)
+      reply.setCookie(COOKIE, token, { httpOnly: true, sameSite: 'lax', secure, path: '/', maxAge: SESSION_TTL_DAYS * 86400 })
+      return { id: user.id, name: user.name, email: user.email, role: user.role }
+    } finally {
+      releaseLoginRequest()
     }
-    loginSucceeded(key)
-    const token = signToken({ uid: user.id, tokenVersion: user.token_version }, secret)
-    reply.setCookie(COOKIE, token, { httpOnly: true, sameSite: 'lax', secure, path: '/', maxAge: SESSION_TTL_DAYS * 86400 })
-    return { id: user.id, name: user.name, email: user.email, role: user.role }
   })
 
   app.post('/api/auth/logout', async (req, reply) => {
@@ -560,9 +663,13 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   app.post('/api/crm/users', async (req, reply) => {
     if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
     const { name, email, password, role } = req.body ?? {}
-    if (!name || !email || !password || password.length < 8) return reply.code(400).send({ error: 'bad_input' })
+    const newRole = role === 'admin' ? 'admin' : 'member'
+    // Админский пароль держит стойкость сам, раз лимитеры логина её не гарантируют
+    // (см. auth.js) — порог выше и для новых админов, не только для bootstrap.
+    const minLen = newRole === 'admin' ? MIN_ADMIN_PASSWORD_LENGTH : MIN_PASSWORD_LENGTH
+    if (!name || !email || !password || password.length < minLen) return reply.code(400).send({ error: 'bad_input' })
     try {
-      const info = db.prepare('INSERT INTO users (name, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)').run(trim(name, 100), trim(email, 200).toLowerCase(), await hashPassword(password), role === 'admin' ? 'admin' : 'member', now())
+      const info = db.prepare('INSERT INTO users (name, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)').run(trim(name, 100), trim(email, 200).toLowerCase(), await hashPassword(password), newRole, now())
       audit(req, 'create', 'users', info.lastInsertRowid)
       return { ok: true, id: info.lastInsertRowid }
     } catch {
@@ -574,9 +681,19 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
     const id = Number(req.params.id)
     const { password, name } = req.body ?? {}
+    if (password) {
+      // Валидация — ДО любой записи. Раньше имя уже уходило в UPDATE, а невалидный
+      // пароль возвращал 400 уже после этого: ответ «ничего не сохранено», а на
+      // самом деле имя изменилось — Codex поймал это как частичную запись.
+      // Порог зависит от РОЛИ ЦЕЛИ, не от того, кто меняет пароль: смена пароля
+      // существующему админу обязана требовать те же 16 символов, что и создание —
+      // иначе минимум обходится через смену пароля после создания слабой учётки.
+      const target = db.prepare('SELECT role FROM users WHERE id = ?').get(id)
+      const minLen = target?.role === 'admin' ? MIN_ADMIN_PASSWORD_LENGTH : MIN_PASSWORD_LENGTH
+      if (typeof password !== 'string' || password.length < minLen) return reply.code(400).send({ error: 'bad_input' })
+    }
     if (name) db.prepare('UPDATE users SET name = ? WHERE id = ?').run(trim(name, 100), id)
     if (password) {
-      if (password.length < 8) return reply.code(400).send({ error: 'bad_input' })
       // смена пароля инвалидирует все сессии пользователя
       db.prepare('UPDATE users SET password_hash = ?, token_version = token_version + 1 WHERE id = ?').run(await hashPassword(password), id)
     }

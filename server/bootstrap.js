@@ -4,7 +4,7 @@
 //
 // Срабатывает только если пользователей ещё нет вообще — не может создать второго
 // админа поверх существующих и не может быть вызван повторно по ошибке.
-import { hashPassword } from './auth.js'
+import { hashPassword, MIN_ADMIN_PASSWORD_LENGTH } from './auth.js'
 import { now } from './db.js'
 
 export async function bootstrapAdmin(db, { log = console, env = process.env } = {}) {
@@ -16,8 +16,8 @@ export async function bootstrapAdmin(db, { log = console, env = process.env } = 
     log.warn?.('BOOTSTRAP_ADMIN_* заданы, но пользователи уже есть — пропускаю (снимите переменные из настроек)')
     return false
   }
-  if (password.length < 8) {
-    log.error?.('BOOTSTRAP_ADMIN_PASSWORD короче 8 символов — администратор не создан')
+  if (password.length < MIN_ADMIN_PASSWORD_LENGTH) {
+    log.error?.(`BOOTSTRAP_ADMIN_PASSWORD короче ${MIN_ADMIN_PASSWORD_LENGTH} символов — администратор не создан`)
     return false
   }
 
