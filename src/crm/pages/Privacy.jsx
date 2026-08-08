@@ -34,11 +34,12 @@ export default function Privacy({ user }) {
     if (!audit) api('/crm/audit').then((r) => setAudit(r.items)).catch(apiErrorToast)
   }
 
+  const OPEN_STATUSES = ['new', 'pending_unverified']
   const open = useMemo(
-    () => (data ?? []).filter((r) => r.status === 'new').sort((a, b) => a.due_date.localeCompare(b.due_date)),
+    () => (data ?? []).filter((r) => OPEN_STATUSES.includes(r.status)).sort((a, b) => a.due_date.localeCompare(b.due_date)),
     [data]
   )
-  const closed = useMemo(() => (data ?? []).filter((r) => r.status !== 'new'), [data])
+  const closed = useMemo(() => (data ?? []).filter((r) => !OPEN_STATUSES.includes(r.status)), [data])
   const overdue = open.filter((r) => today && r.due_date < today).length
 
   const resolve = async (row, { anonymize }) => {
@@ -53,8 +54,22 @@ export default function Privacy({ user }) {
     } catch (err) {
       if (err.data?.error === 'no_contact') toast('Сначала укажите, кто из контактов это', 'error')
       else if (err.data?.error === 'kind_not_erasable') toast('Для такого вида запроса обезличивание не нужно', 'error')
+      else if (err.data?.error === 'not_verified') toast('Сначала подтвердите личность отправителя', 'error')
       else apiErrorToast(err)
     }
+  }
+
+  // Запрос с сайта не подтверждает, что его отправил сам владелец данных — веб-форма
+  // доступна кому угодно, знающему чужой email/телефон. Подтверждение — по каналу,
+  // УЖЕ СОХРАНЁННОМУ в карточке контакта в CRM, а не по тому, что указано в форме
+  // (иначе подтверждение получит тот, кто прислал запрос, будь он вообще посторонним).
+  const verify = async (row) => {
+    if (!window.confirm('Подтвердите: вы связались с человеком по контакту ИЗ КАРТОЧКИ в CRM (не по тому, что указан в форме) и убедились, что запрос от него?')) return
+    try {
+      await api(`/crm/pd-requests/${row.id}`, { method: 'PATCH', body: { status: 'new' } })
+      toast('Личность подтверждена, запрос можно исполнять')
+      load()
+    } catch (err) { apiErrorToast(err) }
   }
 
   const reject = async (row) => {
@@ -101,6 +116,9 @@ export default function Privacy({ user }) {
               <div style={{ minWidth: 0 }}>
                 <div className="row-name">
                   {kinds[row.kind] ?? row.kind}
+                  {row.status === 'pending_unverified' && (
+                    <span className="row-meta" style={{ color: 'var(--danger, #e5484d)' }}> · личность не подтверждена</span>
+                  )}
                   {row.anonymized_at ? <span className="row-meta"> · уже обезличен</span> : null}
                 </div>
                 <div className="row-meta">
@@ -131,14 +149,26 @@ export default function Privacy({ user }) {
                 <span className={`task-due${late ? ' over' : ''}`}>
                   {late ? `просрочено · ${fmtDate(row.due_date)}` : `до ${fmtDate(row.due_date)}`}
                 </span>
-                {isAdmin && ['delete', 'stop'].includes(row.kind) && row.contact_id && !row.anonymized_at && (
-                  <button className="btn danger" style={{ minHeight: 32, fontSize: 12 }} onClick={() => resolve(row, { anonymize: true })}>
-                    Обезличить и закрыть
+                {row.status === 'pending_unverified' ? (
+                  row.contact_id ? (
+                    <button className="btn" style={{ minHeight: 32, fontSize: 12 }} onClick={() => verify(row)}>
+                      Подтвердить личность
+                    </button>
+                  ) : (
+                    <span className="row-meta">сначала сопоставьте контакт</span>
+                  )
+                ) : (
+                  isAdmin && ['delete', 'stop'].includes(row.kind) && row.contact_id && !row.anonymized_at && (
+                    <button className="btn danger" style={{ minHeight: 32, fontSize: 12 }} onClick={() => resolve(row, { anonymize: true })}>
+                      Обезличить и закрыть
+                    </button>
+                  )
+                )}
+                {row.status !== 'pending_unverified' && (
+                  <button className="btn" style={{ minHeight: 32, fontSize: 12 }} onClick={() => resolve(row, { anonymize: false })}>
+                    Исполнено
                   </button>
                 )}
-                <button className="btn" style={{ minHeight: 32, fontSize: 12 }} onClick={() => resolve(row, { anonymize: false })}>
-                  Исполнено
-                </button>
                 <button className="btn" style={{ minHeight: 32, fontSize: 12 }} onClick={() => reject(row)}>Отказ</button>
               </span>
             </div>

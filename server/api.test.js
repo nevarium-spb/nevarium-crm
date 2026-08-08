@@ -9,7 +9,7 @@ import { hashPassword, resetThrottle, verifyPassword, volatileSize, reserveVerif
 import { bootstrapAdmin } from './bootstrap.js'
 import { validSeedInput } from './seed-admin.js'
 import { runBackup } from './backup.js'
-import { MIGRATIONS, addWorkdays, now, openDb } from './db.js'
+import { DUMP_VERSION, MIGRATIONS, addWorkdays, now, openDb } from './db.js'
 import { leadMessage, startOutboxWorker } from './telegram.js'
 
 let app, cookie
@@ -563,10 +563,26 @@ describe('приём лидов', () => {
     expect(app.db.prepare('SELECT COUNT(*) c FROM interactions').get().c).toBe(0)
   })
 
-  it('honeypot принимается, но помечается подозрительным', async () => {
+  it('honeypot: молчаливый дроп — отвечает как успех, но ничего не сохраняет и не уведомляет', async () => {
+    // ТЗ сайта Визор (docs/CRM-REQUIREMENTS.md, §1.3): отвечать нужно как при успехе
+    // (иначе бот подберёт обход по коду ответа), но не сохранять и не уведомлять.
     const res = await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Бот', contact: 'bot@x.ru', website: 'spam.com' } })
     expect(res.statusCode).toBe(204)
-    expect(app.db.prepare('SELECT suspicious FROM contacts WHERE id = 1').get().suspicious).toBe(1)
+    expect(app.db.prepare('SELECT COUNT(*) c FROM contacts').get().c).toBe(0)
+    expect(app.db.prepare('SELECT COUNT(*) c FROM outbox').get().c).toBe(0)
+  })
+
+  it('проект из поля формы не перекрывает уже определённый по Origin', async () => {
+    // ТЗ сайта Визор §2: недоверенный клиент передаёт project сам — если он молча
+    // побеждает доверенный Origin, атакующий может загрязнить инбокс чужого бизнеса.
+    app.db.prepare("UPDATE projects SET origins = 'https://vizor.example.ru' WHERE slug = 'nevarium-vizor'").run()
+    await app.inject({
+      method: 'POST',
+      url: '/api/leads',
+      payload: { name: 'Клиент', contact: 'k@x.ru', project: 'nevarium1' },
+      headers: { origin: 'https://vizor.example.ru' },
+    })
+    expect(app.db.prepare('SELECT project_id FROM contacts WHERE id = 1').get().project_id).toBe(2)
   })
 
   it('rate limit не отбрасывает: 5-й лид с одного IP — подозрительный', async () => {
@@ -575,6 +591,74 @@ describe('приём лидов', () => {
     }
     expect(app.db.prepare('SELECT COUNT(*) c FROM contacts').get().c).toBe(5)
     expect(app.db.prepare('SELECT suspicious FROM contacts WHERE id = 5').get().suspicious).toBe(1)
+  })
+
+  it('жёсткий rate-limit: 429 только после щедрого порога — обычный всплеск его не задевает', async () => {
+    // ТЗ сайта Визор §1.2. Порог намного щедрее примера из ТЗ («5 за 10 минут») —
+    // тот заденет офис на одном IP/CGNAT после пары настоящих заявок подряд, что
+    // противоречит многолетней логике leadSuspicious (см. ADR-006/015).
+    const codes = []
+    for (let i = 0; i < 35; i++) {
+      const res = await app.inject({ method: 'POST', url: '/api/leads', payload: { name: `Г${i}`, contact: `rl${i}@x.ru` }, remoteAddress: '10.2.2.2' })
+      codes.push(res.statusCode)
+    }
+    expect(codes.slice(0, 30)).not.toContain(429)
+    expect(codes.slice(30)).toContain(429)
+  }, 30_000)
+
+  it('жёсткий rate-limit раздельный: флуд по leads не трогает pd-requests с того же IP', async () => {
+    for (let i = 0; i < 35; i++) {
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: `Г${i}`, contact: `sep${i}@x.ru` }, remoteAddress: '10.3.3.3' })
+    }
+    const res = await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'still-ok@x.ru' }, remoteAddress: '10.3.3.3' })
+    expect(res.statusCode).toBe(204)
+  }, 30_000)
+
+  describe('идемпотентность (ТЗ сайта Визор §1.1)', () => {
+    it('Idempotency-Key: повтор с тем же ключом не создаёт вторую заявку и не шлёт повторное уведомление', async () => {
+      const payload = { name: 'Марина', contact: 'm@x.ru' }
+      const headers = { 'idempotency-key': 'req-1' }
+      const first = await app.inject({ method: 'POST', url: '/api/leads', payload, headers })
+      const second = await app.inject({ method: 'POST', url: '/api/leads', payload, headers })
+      expect(first.statusCode).toBe(204)
+      expect(second.statusCode).toBe(204)
+      expect(app.db.prepare('SELECT COUNT(*) c FROM contacts').get().c).toBe(1)
+      // outbox, не только contacts: дедуп по человеку (ADR-014) всё равно enqueue'ит
+      // уведомление о «повторной заявке» на каждый POST — только идемпотентность
+      // по ключу не даёт второму вызову вообще дойти до этой логики.
+      expect(app.db.prepare('SELECT COUNT(*) c FROM outbox').get().c).toBe(1)
+    })
+
+    it('request_id в теле работает так же, как заголовок Idempotency-Key', async () => {
+      const payload = { name: 'Пётр', contact: 'p@x.ru', request_id: 'req-2' }
+      await app.inject({ method: 'POST', url: '/api/leads', payload })
+      await app.inject({ method: 'POST', url: '/api/leads', payload })
+      expect(app.db.prepare('SELECT COUNT(*) c FROM outbox').get().c).toBe(1)
+    })
+
+    it('слишком длинный ключ не обрезается вслепую — два разных длинных ключа не схлопываются в один', async () => {
+      // Codex поймал: обрезка до 200 символов могла бы схлопнуть два РАЗНЫХ ключа,
+      // различающихся только после символа 200, в один и потерять одну из отправок.
+      const prefix = 'x'.repeat(200)
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'A', contact: 'long1@x.ru', request_id: prefix + '-one' } })
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'B', contact: 'long2@x.ru', request_id: prefix + '-two' } })
+      expect(app.db.prepare('SELECT COUNT(*) c FROM contacts').get().c).toBe(2)
+    })
+
+    it('разные ключи — разные вызовы, идемпотентность их не путает', async () => {
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Иван', contact: 'i1@x.ru', request_id: 'k1' } })
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Иван', contact: 'i2@x.ru', request_id: 'k2' } })
+      expect(app.db.prepare('SELECT COUNT(*) c FROM contacts').get().c).toBe(2)
+    })
+
+    it('honeypot тоже идемпотентен: повтор с тем же ключом не пытается сохранить снова', async () => {
+      const payload = { name: 'Бот', contact: 'bot@x.ru', website: 'spam.com', request_id: 'req-hp' }
+      const first = await app.inject({ method: 'POST', url: '/api/leads', payload })
+      const second = await app.inject({ method: 'POST', url: '/api/leads', payload })
+      expect(first.statusCode).toBe(204)
+      expect(second.statusCode).toBe(204)
+      expect(app.db.prepare('SELECT COUNT(*) c FROM contacts').get().c).toBe(0)
+    })
   })
 
   it('пустой лид отбрасывается без записи', async () => {
@@ -703,6 +787,17 @@ describe('приём лидов', () => {
     expect(ours.statusCode).toBe(204)
     expect(ours.headers['access-control-allow-origin']).toBe('https://vizor.example.ru')
   })
+
+  it('CORS preflight разрешает заголовок Idempotency-Key — иначе браузер блокирует реальный запрос сайта', async () => {
+    // Codex поймал: сайт шлёт Idempotency-Key заголовком, но preflight разрешал
+    // только content-type — браузер отбивал бы запрос ДО POST, идемпотентность
+    // для реальных браузерных отправок просто не работала бы.
+    app.db.prepare("UPDATE projects SET origins = 'https://vizor.example.ru' WHERE slug = 'nevarium-vizor'").run()
+    const leads = await app.inject({ method: 'OPTIONS', url: '/api/leads', headers: { origin: 'https://vizor.example.ru' } })
+    expect(leads.headers['access-control-allow-headers']).toContain('idempotency-key')
+    const pd = await app.inject({ method: 'OPTIONS', url: '/api/pd-requests', headers: { origin: 'https://vizor.example.ru' } })
+    expect(pd.headers['access-control-allow-headers']).toContain('idempotency-key')
+  })
 })
 
 describe('outbox: лид не теряется при падении Telegram или MAX', () => {
@@ -795,6 +890,29 @@ describe('outbox: лид не теряется при падении Telegram и
 })
 
 describe('экспорт / импорт / CSV', () => {
+  it('импорт стирает idempotency_keys — иначе повтор после восстановления молча теряет данные', async () => {
+    // Находка Codex: idempotency_keys вне DUMP_TABLES (короткоживущие по смыслу, не
+    // бизнес-данные), но если импорт их не чистит, старый ключ переживает восстановление,
+    // а запись, на которую он ссылался, — нет. Повтор с этим ключом получил бы
+    // закешированный «успех», и сервер НИКОГДА не воссоздал бы пропавшую заявку.
+    const payload = { name: 'Марина', contact: 'm@x.ru', request_id: 'req-restore' }
+    await app.inject({ method: 'POST', url: '/api/leads', payload })
+    expect(app.db.prepare('SELECT COUNT(*) c FROM idempotency_keys').get().c).toBe(1)
+
+    const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+    // катастрофа: контакт возник ПОСЛЕ этого бэкапа, в дампе его нет
+    app.db.exec('DELETE FROM deals; DELETE FROM contacts')
+    const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })
+    expect(res.statusCode).toBe(200)
+    expect(app.db.prepare('SELECT COUNT(*) c FROM idempotency_keys').get().c).toBe(0)
+
+    // повтор с тем же ключом обязан ЗАНОВО создать заявку, а не молча вернуть 204
+    // для записи, которой после восстановления уже нет
+    await app.inject({ method: 'POST', url: '/api/leads', payload })
+    expect(app.db.prepare('SELECT COUNT(*) c FROM contacts').get().c).toBe(1)
+  })
+
+
   // Раунд-трип обязан покрывать ВСЕ четыре сущности: экспорт отдаёт `SELECT *`, а импорт
   // сверяет колонки с белым списком, поэтому забытая в списке колонка ломает импорт
   // своего же экспорта. Так уже случалось дважды — с `winback_sequence_id` (Веха 7)
@@ -823,10 +941,12 @@ describe('экспорт / импорт / CSV', () => {
   it('запросы ПДн и журнал действий переживают экспорт → wipe → импорт', async () => {
     await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru' } })
     await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'm@x.ru', kind: 'delete', note: 'прошу удалить' } })
+    // подтверждение личности — обязательный шаг перед исполнением (pending_unverified)
+    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new' }, headers: { cookie } })
     await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'done', anonymize: true }, headers: { cookie } })
 
     const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
-    expect(dump.version).toBe(2)
+    expect(dump.version).toBe(DUMP_VERSION)
     expect(dump.pd_requests).toHaveLength(1)
     expect(dump.audit_log.some((a) => a.action === 'anonymize')).toBe(true)
 
@@ -855,6 +975,62 @@ describe('экспорт / импорт / CSV', () => {
     expect(row.requester).toBe('m@x.ru')
     // но привязку разорвали: контакты заменены целиком, id мог достаться другому человеку
     expect(row.contact_id).toBeNull()
+  })
+
+  it('дамп с pd_requests, но БЕЗ verified_at (снят до этой сессии): закрытые/ручные верифицируются задним числом, открытый публичный — в pending_unverified', async () => {
+    // Codex поймал ДВЕ ошибки подряд на этом пути: (раунд 9) без бэкфилла вообще
+    // восстановленный открытый запрос оставался бы неисполнимым навсегда; (раунд 15)
+    // мой первый бэкфилл верифицировал ВСЁ подряд, включая открытые публичные запросы,
+    // которые НИКОГДА не проходили верификацию — та же дыра для имперсонации, ради
+    // закрытия которой verified_at появился. Правильно: закрытым (гейт больше ничего
+    // не решает) и ручным (пред-верифицированы по построению) — верифицировать задним
+    // числом можно; открытому публичному — нет, только pending_unverified.
+    await app.inject({ method: 'POST', url: '/api/crm/pd-requests', payload: { requester: 'manual@x.ru', kind: 'delete' }, headers: { cookie } }) // id 1: ручной
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'closed@x.ru', kind: 'delete' } }) // id 2: публичный
+    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/2', payload: { status: 'rejected' }, headers: { cookie } }) // закрыт без верификации — это ОК для rejected
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'open@x.ru', kind: 'delete' } }) // id 3: публичный, открыт
+
+    const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+    // симулируем бэкап ДО этой сессии: у pd_requests не было verified_at вообще
+    dump.pd_requests = dump.pd_requests.map(({ verified_at, ...rest }) => rest)
+
+    const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })
+    expect(res.statusCode).toBe(200)
+
+    const manual = app.db.prepare('SELECT status, verified_at FROM pd_requests WHERE id = 1').get()
+    expect(manual.verified_at).toBeTruthy()
+
+    const closedSite = app.db.prepare('SELECT status, verified_at FROM pd_requests WHERE id = 2').get()
+    expect(closedSite).toMatchObject({ status: 'rejected' })
+    expect(closedSite.verified_at).toBeTruthy()
+
+    const openSite = app.db.prepare('SELECT status, verified_at FROM pd_requests WHERE id = 3').get()
+    expect(openSite.status).toBe('pending_unverified')
+    expect(openSite.verified_at).toBeNull()
+  })
+
+  it('актуальный дамп с ЗАКОННЫМ null у verified_at НЕ бэкфиллится — иначе восстановление обходит верификацию', async () => {
+    // Codex поймал регресс в предыдущем фикс: безусловный бэкфилл по «verified_at IS
+    // NULL» путал «поля не было в старом дампе» с «поле было и было null» — второе
+    // значит по-настоящему неподтверждённый (pending_unverified) запрос из АКТУАЛЬНОГО
+    // дампа. После такого восстановления сотрудник мог бы обезличить контакт без
+    // подтверждения личности — ровно та дыра, ради которой verified_at и появился.
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru' } })
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'm@x.ru', kind: 'delete' } })
+    // НЕ верифицируем — остаётся pending_unverified, verified_at честно null
+    const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+    expect(dump.pd_requests[0]).toHaveProperty('verified_at', null) // ключ ЕСТЬ, значение null
+
+    const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })
+    expect(res.statusCode).toBe(200)
+    const row = app.db.prepare('SELECT status, verified_at FROM pd_requests WHERE id = 1').get()
+    expect(row.status).toBe('pending_unverified')
+    expect(row.verified_at).toBeNull()
+
+    // и попытка обезличить без подтверждения по-прежнему блокируется после восстановления
+    const anonymize = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { anonymize: true }, headers: { cookie } })
+    expect(anonymize.statusCode).toBe(400)
+    expect(JSON.parse(anonymize.body).error).toBe('not_verified')
   })
 
   it('дамп из будущей версии отклоняется', async () => {
@@ -1271,8 +1447,75 @@ describe('права субъекта ПДн (152-ФЗ)', () => {
     const res = await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'marina@x.ru', kind: 'delete' } })
     expect(res.statusCode).toBe(204)
     const row = app.db.prepare('SELECT * FROM pd_requests WHERE id = 1').get()
-    expect(row).toMatchObject({ contact_id: 1, kind: 'delete', status: 'new', source: 'site-form' })
+    // pending_unverified, не new: публичная форма не подтверждает, что запрос
+    // прислал сам владелец данных (ТЗ сайта §1.4, сценарий атаки — чужой email/
+    // телефон + kind=delete). Сотрудник обязан подтвердить личность и перевести
+    // статус дальше, прежде чем запрос можно исполнить.
+    expect(row).toMatchObject({ contact_id: 1, kind: 'delete', status: 'pending_unverified', source: 'site-form' })
     expect(row.due_date).toBe(addWorkdays(mskToday()))
+  })
+
+  it('honeypot на /api/pd-requests НЕ отбрасывает запрос — потерянный запрос по ПДн это просроченный юридический срок', async () => {
+    // Асимметрия с лидами (Codex поймал): у лидов honeypot — молчаливый дроп (ниже
+    // риск, спам засоряет инбокс), но у запроса по ПДн цена ложного срабатывания
+    // категорически выше — просроченное обязательство без единого следа, при этом
+    // отправителю показан «успех». Здесь — как было до этой сессии: помечаем, не теряем.
+    const res = await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'bot@x.ru', kind: 'delete', website: 'spam.com' } })
+    expect(res.statusCode).toBe(204)
+    const row = app.db.prepare('SELECT note FROM pd_requests WHERE id = 1').get()
+    expect(row).toBeTruthy()
+    expect(row.note).toContain('подозрительная отправка')
+    expect(app.db.prepare('SELECT COUNT(*) c FROM outbox').get().c).toBe(1)
+  })
+
+  it('Idempotency-Key на /api/pd-requests: повтор не заводит второй запрос — второй 10-дневный срок не открывается', async () => {
+    const payload = { contact: 'marina@x.ru', kind: 'delete' }
+    const headers = { 'idempotency-key': 'pd-req-1' }
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload, headers })
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload, headers })
+    expect(app.db.prepare('SELECT COUNT(*) c FROM pd_requests').get().c).toBe(1)
+  })
+
+  it('нераспознанный kind сохраняется как прислан, не подменяется другим смыслом', async () => {
+    // Codex дважды поймал одну и ту же ошибку с разных сторон: молчаливый ремап
+    // ЛЮБОГО нераспознанного kind (что на 'delete', что на 'access') подменяет
+    // юридический смысл запроса без следа. Правильно — сохранить сырое значение и
+    // оставить видимым для ручной классификации сотрудником.
+    const res = await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'x@x.ru', kind: 'bogus' } })
+    expect(res.statusCode).toBe(204)
+    expect(app.db.prepare('SELECT kind FROM pd_requests WHERE id = 1').get().kind).toBe('bogus')
+  })
+
+  it('ПОЛНОСТЬЮ опущенный kind по-прежнему «удалить» — обратная совместимость с уже развёрнутым сайтом', async () => {
+    // Codex поймал: если опущенное поле тоже понижать до «access», уже работающий
+    // клиент (сайт), который его не передаёт, тихо получает другой смысл запроса —
+    // «удалить» бесследно становится «узнать». Отличать от явно нераспознанного kind.
+    const res = await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'x2@x.ru' } })
+    expect(res.statusCode).toBe(204)
+    expect(app.db.prepare('SELECT kind FROM pd_requests WHERE id = 1').get().kind).toBe('delete')
+  })
+
+  it('запрос по ПДн не сопоставляется с контактом из ЧУЖОГО проекта по совпавшему email', async () => {
+    // Codex поймал: поиск клиента по email/телефону не учитывал project_id — тот же
+    // адрес в Лаб ИИ и Визоре (разных бизнесах) мог склеить чужого человека, и через
+    // workflow верификации это давало бы «подтверждённое» обезличивание не того контакта.
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Чужой', contact: 'shared@x.ru', project: 'nevarium1' } })
+    const res = await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'shared@x.ru', kind: 'delete', project: 'nevarium-vizor' } })
+    expect(res.statusCode).toBe(204)
+    const row = app.db.prepare('SELECT contact_id, project_id FROM pd_requests WHERE id = 1').get()
+    expect(row.project_id).toBe(2) // nevarium-vizor
+    expect(row.contact_id).toBeNull() // контакт с этим email — в ДРУГОМ проекте, не сопоставлен
+  })
+
+  it('нераспознанный kind экранируется в уведомлении — публичный ввод не ломает HTML-разметку Telegram/MAX', async () => {
+    // Codex поймал: kind теперь сохраняется как прислано (см. тест выше) и попадает
+    // в текст уведомления с format:'html' — без экранирования сломанная разметка
+    // могла бы уронить доставку staff-уведомления навсегда, пока идёт срок по 152-ФЗ.
+    const res = await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'x@x.ru', kind: '<b>evil</b>&broken' } })
+    expect(res.statusCode).toBe(204)
+    const payload = JSON.parse(app.db.prepare("SELECT payload FROM outbox WHERE kind = 'text' ORDER BY id DESC LIMIT 1").get().payload)
+    expect(payload.text).toContain('&lt;b&gt;evil&lt;/b&gt;&amp;broken')
+    expect(payload.text).not.toContain('<b>evil</b>')
   })
 
   it('незнакомый адрес не теряется — запрос заводится без привязки к контакту', async () => {
@@ -1340,9 +1583,171 @@ describe('права субъекта ПДн (152-ФЗ)', () => {
       .toEqual({ name: 'Удалённый контакт #1', anonymized_at: first })
   })
 
-  it('исполнение запроса из списка: статус done + обезличивание одним действием', async () => {
+  it('запрос с сайта нельзя исполнить без подтверждения личности', async () => {
+    // Находка ТЗ сайта (§1.4): атакующий, знающий чужой email/телефон, может сам
+    // отправить kind=delete через форму. pending_unverified блокирует исполнение,
+    // пока сотрудник не подтвердит личность по контакту ИЗ КАРТОЧКИ в CRM.
     await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'marina@x.ru' } })
     await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'marina@x.ru' } })
+    const done = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'done' }, headers: { cookie } })
+    expect(done.statusCode).toBe(400)
+    expect(JSON.parse(done.body).error).toBe('not_verified')
+    const anonymize = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { anonymize: true }, headers: { cookie } })
+    expect(anonymize.statusCode).toBe(400)
+    expect(JSON.parse(anonymize.body).error).toBe('not_verified')
+    expect(app.db.prepare('SELECT anonymized_at FROM contacts WHERE id = 1').get().anonymized_at).toBeNull()
+  })
+
+  it('нельзя подтвердить личность и исполнить одним PATCH — {status:"new", anonymize:true} обязан провалиться', async () => {
+    // Находка Codex: если проверять статус ПОСЛЕ его же обновления в том же запросе,
+    // {status:'new', anonymize:true} одним вызовом «подтверждает» и тут же исполняет —
+    // весь смысл раздельного человеческого шага верификации исчезает.
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'marina@x.ru' } })
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'marina@x.ru', kind: 'delete' } })
+    const res = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new', anonymize: true }, headers: { cookie } })
+    expect(res.statusCode).toBe(400)
+    expect(JSON.parse(res.body).error).toBe('not_verified')
+    expect(app.db.prepare('SELECT anonymized_at FROM contacts WHERE id = 1').get().anonymized_at).toBeNull()
+    // статус тоже не должен был обновиться — весь PATCH проваливается, не только anonymize
+    expect(app.db.prepare('SELECT status FROM pd_requests WHERE id = 1').get().status).toBe('pending_unverified')
+  })
+
+  it('нельзя «подтвердить личность» у запроса без сопоставленного контакта', async () => {
+    // Codex поймал: подтверждать личность полагается по каналу ИЗ КАРТОЧКИ в CRM —
+    // без contact_id такой карточки нет, сотруднику нечем было бы сверяться.
+    const res = await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'неизвестный@нигде.ru', kind: 'delete' } })
+    expect(res.statusCode).toBe(204)
+    expect(app.db.prepare('SELECT contact_id FROM pd_requests WHERE id = 1').get().contact_id).toBeNull()
+    const verify = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new' }, headers: { cookie } })
+    expect(verify.statusCode).toBe(400)
+    expect(JSON.parse(verify.body).error).toBe('no_contact')
+    expect(app.db.prepare('SELECT status FROM pd_requests WHERE id = 1').get().status).toBe('pending_unverified')
+
+    // но привязать контакт и ТУТ ЖЕ подтвердить — можно: contactId в этом же запросе
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Найден', contact: 'позже@нашли.ru' } })
+    const verifyWithLink = await app.inject({
+      method: 'PATCH',
+      url: '/api/crm/pd-requests/1',
+      payload: { contact_id: 1, status: 'new' },
+      headers: { cookie },
+    })
+    expect(verifyWithLink.statusCode).toBe(200)
+    expect(app.db.prepare('SELECT status FROM pd_requests WHERE id = 1').get().status).toBe('new')
+  })
+
+  it('обход через «rejected» закрыт: отказ не подтверждает личность и не открывает anonymize', async () => {
+    // Codex поймал: 'rejected' достижим БЕЗ верификации (это ОК — отказ ничего не
+    // раскрывает), но снимает pending_unverified. Гейт по «status ≠ pending_unverified»
+    // тогда пропускал ВТОРОЙ PATCH: {status:'rejected'} → {anonymize:true}. verified_at
+    // (не текущий status) должен закрыть это независимо от последовательности статусов.
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'marina@x.ru' } })
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'marina@x.ru', kind: 'delete' } })
+    const rejected = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'rejected' }, headers: { cookie } })
+    expect(rejected.statusCode).toBe(200)
+    expect(app.db.prepare('SELECT status, verified_at FROM pd_requests WHERE id = 1').get()).toMatchObject({ status: 'rejected', verified_at: null })
+
+    const anonymize = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { anonymize: true }, headers: { cookie } })
+    expect(anonymize.statusCode).toBe(400)
+    expect(JSON.parse(anonymize.body).error).toBe('not_verified')
+
+    // и попытка «переоткрыть» через new → done тоже не должна проходить без verified_at
+    const reopen = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new' }, headers: { cookie } })
+    expect(reopen.statusCode).toBe(200) // rejected → new сам по себе не запрещён…
+    const done = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'done' }, headers: { cookie } })
+    expect(done.statusCode).toBe(400) // …но done без verified_at всё равно недоступен
+    expect(JSON.parse(done.body).error).toBe('not_verified')
+    expect(app.db.prepare('SELECT anonymized_at FROM contacts WHERE id = 1').get().anonymized_at).toBeNull()
+  })
+
+  it('смена привязки контакта аннулирует прежнюю верификацию — иначе можно обезличить чужого', async () => {
+    // Codex поймал: verified_at подтверждает личность ПРО КОНКРЕТНЫЙ контакт, а не
+    // вообще. Верифицировали для Марины, потом тем же/следующим PATCH подменили
+    // contact_id на Петра — старая верификация не должна распространяться на него.
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'marina@x.ru' } })
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Пётр', contact: 'petr@x.ru' } })
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'marina@x.ru', kind: 'delete' } })
+    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new' }, headers: { cookie } })
+    expect(app.db.prepare('SELECT verified_at FROM pd_requests WHERE id = 1').get().verified_at).toBeTruthy()
+
+    // подмена контакта и обезличивание ОДНИМ запросом
+    const combined = await app.inject({
+      method: 'PATCH',
+      url: '/api/crm/pd-requests/1',
+      payload: { contact_id: 2, anonymize: true },
+      headers: { cookie },
+    })
+    expect(combined.statusCode).toBe(400)
+    expect(JSON.parse(combined.body).error).toBe('not_verified')
+    expect(app.db.prepare('SELECT anonymized_at FROM contacts WHERE id = 2').get().anonymized_at).toBeNull()
+
+    // подмена контакта ОТДЕЛЬНЫМ запросом тоже сбрасывает верификацию и статус
+    const relink = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { contact_id: 2 }, headers: { cookie } })
+    expect(relink.statusCode).toBe(200)
+    expect(app.db.prepare('SELECT status, verified_at FROM pd_requests WHERE id = 1').get())
+      .toMatchObject({ status: 'pending_unverified', verified_at: null })
+    const anonymizeAfter = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { anonymize: true }, headers: { cookie } })
+    expect(anonymizeAfter.statusCode).toBe(400)
+    expect(JSON.parse(anonymizeAfter.body).error).toBe('not_verified')
+  })
+
+  it('релинк + {status:"new"} одним PATCH — легитимная связка «привязали и тут же подтвердили», verified_at выставляется', async () => {
+    // Codex поймал: без пересчёта verifying относительно СБРОШЕННОГО (из-за релинка)
+    // статуса {contact_id: новый, status: 'new'} мог записать status='new', но
+    // verified_at оставить NULL — снаружи «в порядке», а исполнить нельзя никогда.
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'marina@x.ru' } })
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Пётр', contact: 'petr@x.ru' } })
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'marina@x.ru', kind: 'delete' } })
+    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new' }, headers: { cookie } }) // верифицирован на Марине
+
+    const relinkAndVerify = await app.inject({
+      method: 'PATCH',
+      url: '/api/crm/pd-requests/1',
+      payload: { contact_id: 2, status: 'new' },
+      headers: { cookie },
+    })
+    expect(relinkAndVerify.statusCode).toBe(200)
+    const row = app.db.prepare('SELECT contact_id, status, verified_at FROM pd_requests WHERE id = 1').get()
+    expect(row).toMatchObject({ contact_id: 2, status: 'new' })
+    expect(row.verified_at).toBeTruthy() // не «дыра»: verified_at реально выставлен
+
+    // и теперь исполнимо через обычный PATCH — не застряло
+    const done = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'done' }, headers: { cookie } })
+    expect(done.statusCode).toBe(200)
+  })
+
+  it('нельзя привязать запрос к контакту из ЧУЖОГО проекта', async () => {
+    // Codex поймал: PATCH contact_id проверял только «контакт существует», не то,
+    // что он в ТОМ ЖЕ проекте — запрос из Лаб ИИ можно было привязать к клиенту
+    // Визора, «подтвердить» и в итоге обезличить постороннего для этого бизнеса.
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Визор-клиент', contact: 'v@x.ru', project: 'nevarium-vizor' } })
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'someone@else.ru', kind: 'delete', project: 'nevarium1' } })
+    const res = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { contact_id: 1 }, headers: { cookie } })
+    expect(res.statusCode).toBe(400)
+    expect(JSON.parse(res.body).error).toBe('bad_reference')
+    expect(app.db.prepare('SELECT contact_id FROM pd_requests WHERE id = 1').get().contact_id).toBeNull()
+  })
+
+  it('участник (не admin) не может исполнить anonymize через PATCH — обход admin_only закрыт', async () => {
+    // Codex поймал: у прямого POST .../anonymize есть admin_only, а у ЭТОГО пути,
+    // делающего то же самое (после «подтверждения» тем же участником), проверки не было.
+    app.db.prepare('INSERT INTO users (name,email,password_hash,role,created_at) VALUES (?,?,?,?,?)')
+      .run('Участник', 'm@m.ru', app.db.prepare('SELECT password_hash h FROM users WHERE id = 1').get().h, 'member', now())
+    const memberCookie = (await login('m@m.ru', 'password123')).headers['set-cookie']
+
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'marina@x.ru' } })
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'marina@x.ru', kind: 'delete' } })
+    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new' }, headers: { cookie: memberCookie } })
+
+    const res = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { anonymize: true }, headers: { cookie: memberCookie } })
+    expect(res.statusCode).toBe(403)
+    expect(JSON.parse(res.body).error).toBe('admin_only')
+    expect(app.db.prepare('SELECT anonymized_at FROM contacts WHERE id = 1').get().anonymized_at).toBeNull()
+  })
+
+  it('после подтверждения личности: статус done + обезличивание одним действием', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'marina@x.ru' } })
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'marina@x.ru', kind: 'delete' } })
+    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new' }, headers: { cookie } })
     const res = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'done', anonymize: true }, headers: { cookie } })
     expect(res.statusCode).toBe(200)
     expect(JSON.parse(res.body).anonymized.name).toBe('Удалённый контакт #1')
@@ -1351,9 +1756,10 @@ describe('права субъекта ПДн (152-ФЗ)', () => {
     expect(row.resolved_at).toBeTruthy()
   })
 
-  it('на запрос «узнать, какие данные есть» обезличивание не срабатывает', async () => {
+  it('на запрос «узнать, какие данные есть» обезличивание не срабатывает даже после подтверждения', async () => {
     await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'marina@x.ru' } })
     await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'marina@x.ru', kind: 'access' } })
+    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new' }, headers: { cookie } })
     const res = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { anonymize: true }, headers: { cookie } })
     expect(res.statusCode).toBe(400)
     expect(JSON.parse(res.body).error).toBe('kind_not_erasable')
@@ -1496,6 +1902,46 @@ describe('мультипроектность', () => {
       expect(db.prepare('SELECT name, project_id FROM contacts').get()).toEqual({ name: 'Старый лид', project_id: 1 })
       expect(db.prepare('SELECT title, project_id FROM deals').get()).toEqual({ title: 'Старая сделка', project_id: 1 })
       expect(db.prepare('SELECT slug FROM projects ORDER BY id').all().map((p) => p.slug)).toEqual(['nevarium1', 'nevarium-vizor'])
+      db.close()
+    } finally {
+      for (const suffix of ['', '-wal', '-shm']) fs.rmSync(file + suffix, { force: true })
+    }
+  })
+
+  it('миграция v10: ручной ввод и уже закрытые публичные запросы верифицируются задним числом, а ОТКРЫТЫЕ публичные — нет', () => {
+    // Codex поймал мою же более раннюю ошибку: грандфазеринг ВСЕХ старых строк подряд
+    // (включая ещё открытые source='site-form') задним числом «подтверждал» запросы,
+    // которые НИКОГДА не проходили верификацию — ровно та дыра для имперсонации, ради
+    // закрытия которой verified_at появился, причём именно там, где проверка ещё имеет
+    // смысл (закрытым запросам гейт уже ничего не решает — действие уже состоялось).
+    const file = path.join(os.tmpdir(), `nv-migrate-pd-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`)
+    try {
+      const old = new Database(file)
+      old.pragma('foreign_keys = ON')
+      for (let i = 0; i < 9; i++) old.exec(MIGRATIONS[i]) // всё до v10 включительно (индексы 0..8 = v1..v9)
+      old.pragma('user_version = 9')
+      const ts = now()
+      const dueDate = addWorkdays(ts.slice(0, 10))
+      const insert = old.prepare(`INSERT INTO pd_requests (kind, status, requester, source, project_id, due_date, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 1, ?, ?, ?)`)
+      insert.run('delete', 'new', 'manual@x.ru', 'manual', dueDate, ts, ts) // id 1: ручной, открытый
+      insert.run('delete', 'done', 'closed@x.ru', 'site-form', dueDate, ts, ts) // id 2: публичный, уже закрыт
+      insert.run('delete', 'new', 'open@x.ru', 'site-form', dueDate, ts, ts) // id 3: публичный, ЕЩЁ ОТКРЫТ
+      old.close()
+
+      const db = openDb(file)
+      expect(db.pragma('user_version', { simple: true })).toBe(MIGRATIONS.length)
+      const manual = db.prepare('SELECT status, verified_at FROM pd_requests WHERE id = 1').get()
+      expect(manual).toMatchObject({ status: 'new' })
+      expect(manual.verified_at).toBeTruthy()
+
+      const closedSite = db.prepare('SELECT status, verified_at FROM pd_requests WHERE id = 2').get()
+      expect(closedSite).toMatchObject({ status: 'done' })
+      expect(closedSite.verified_at).toBeTruthy()
+
+      const openSite = db.prepare('SELECT status, verified_at FROM pd_requests WHERE id = 3').get()
+      expect(openSite.status).toBe('pending_unverified') // НЕ 'new' — требует настоящей верификации
+      expect(openSite.verified_at).toBeNull()
       db.close()
     } finally {
       for (const suffix of ['', '-wal', '-shm']) fs.rmSync(file + suffix, { force: true })
