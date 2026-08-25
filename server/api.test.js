@@ -614,6 +614,73 @@ describe('приём лидов', () => {
     expect(res.statusCode).toBe(204)
   }, 30_000)
 
+  describe('глобальная квота на уведомления о лидах по проекту (ТЗ сайта Визор §1.2)', () => {
+    // Независимая проверка (раунд 17): первая версия отвечала 429 и НЕ сохраняла
+    // заявку — квота теперь решает только судьбу enqueue(): приём — 204, запись
+    // в БД — всегда безусловно, независимо от бюджета уведомлений.
+    it('61-й лид на проект за час — всё равно 204 и сохранён; уведомления в outbox упираются в потолок 60', async () => {
+      const codes = []
+      for (let i = 0; i < 61; i++) {
+        const res = await app.inject({ method: 'POST', url: '/api/leads', payload: { name: `К${i}`, contact: `q${i}@x.ru` }, remoteAddress: `10.9.0.${i}` })
+        codes.push(res.statusCode)
+      }
+      expect(codes).not.toContain(429)
+      expect(app.db.prepare('SELECT COUNT(*) c FROM contacts').get().c).toBe(61)
+      expect(app.db.prepare("SELECT COUNT(*) c FROM outbox WHERE kind = 'lead'").get().c).toBe(60)
+    }, 45_000)
+
+    it('насыщение бюджета шлёт ОДНО гарантированное предупреждение, не одно на каждую скрытую заявку (раунд 23)', async () => {
+      // Независимая проверка: без явного сигнала исчерпание бюджета неотличимо от
+      // затишья — «нет уведомлений о лидах» выглядит одинаково и когда лидов правда
+      // нет, и когда их слишком много (это и есть «cheap targeted alerting DoS»).
+      for (let i = 0; i < 65; i++) {
+        await app.inject({ method: 'POST', url: '/api/leads', payload: { name: `К${i}`, contact: `w${i}@x.ru` }, remoteAddress: `10.9.5.${i}` })
+      }
+      // ровно одно предупреждение, а не пять (по числу скрытых заявок сверх 60)
+      expect(app.db.prepare("SELECT COUNT(*) c FROM outbox WHERE kind = 'text'").get().c).toBe(1)
+      const payload = JSON.parse(app.db.prepare("SELECT payload FROM outbox WHERE kind = 'text'").get().payload)
+      expect(payload.text).toContain('Много заявок за час')
+    }, 60_000)
+
+    it('квота раздельная по проектам — насыщение одного не трогает соседний', async () => {
+      for (let i = 0; i < 60; i++) {
+        await app.inject({ method: 'POST', url: '/api/leads', payload: { name: `К${i}`, contact: `p1-${i}@x.ru` }, remoteAddress: `10.9.1.${i}` })
+      }
+      // проект 1 (по умолчанию) уже насытил бюджет уведомлений — приём не пострадал
+      const same = await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Ещё', contact: 'over@x.ru' }, remoteAddress: '10.9.1.200' })
+      expect(same.statusCode).toBe(204)
+      expect(app.db.prepare("SELECT COUNT(*) c FROM outbox WHERE kind = 'lead'").get().c).toBe(60)
+      // сосед — другой проект, свой бюджет, уведомление уходит как обычно
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Сосед', contact: 'ok@x.ru', project: 'nevarium-vizor' }, remoteAddress: '10.9.1.201' })
+      expect(app.db.prepare("SELECT COUNT(*) c FROM outbox WHERE kind = 'lead'").get().c).toBe(61)
+    }, 45_000)
+
+    it('запросы по ПДн этой квотой не ограничены вообще (раунд 19): насыщение лидов не трогает pd-requests, и сами pd-requests не имеют потолка', async () => {
+      // Независимая проверка (раунд 19): гейт «только на уведомление», применённый
+      // к pd-requests так же, как к лидам, всё ещё создавал дешёвую DoS — 30 запросов
+      // с одного IP гасят бюджет проекта, и настоящий 31-й запрос сохраняется, но
+      // БЕЗ пинга сотруднику. Правильный фикс — /api/pd-requests не участвует в этом
+      // механизме вообще, ни с одной, ни с другой стороны.
+      for (let i = 0; i < 60; i++) {
+        await app.inject({ method: 'POST', url: '/api/leads', payload: { name: `К${i}`, contact: `s2-${i}@x.ru` }, remoteAddress: `10.9.2.${i}` })
+      }
+      for (let i = 0; i < 35; i++) {
+        const res = await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: `pd${i}@x.ru` }, remoteAddress: `10.9.3.${i}` })
+        expect(res.statusCode).toBe(204)
+      }
+      expect(app.db.prepare('SELECT COUNT(*) c FROM pd_requests').get().c).toBe(35)
+      expect(app.db.prepare('SELECT COUNT(*) c FROM pd_requests WHERE due_date IS NOT NULL').get().c).toBe(35)
+      // 35 > старого потолка 30 — ни один запрос не остался без уведомления
+      expect(app.db.prepare("SELECT COUNT(*) c FROM outbox WHERE kind = 'text'").get().c).toBe(35)
+    }, 60_000)
+  })
+
+  it('неизвестное поле в теле не отбрасывает заявку — только предупреждение в лог (ADR-006: не отвергаем)', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Клиент', contact: 'k@x.ru', totally_unexpected_field: 'x' } })
+    expect(res.statusCode).toBe(204)
+    expect(app.db.prepare('SELECT COUNT(*) c FROM contacts').get().c).toBe(1)
+  })
+
   describe('идемпотентность (ТЗ сайта Визор §1.1)', () => {
     it('Idempotency-Key: повтор с тем же ключом не создаёт вторую заявку и не шлёт повторное уведомление', async () => {
       const payload = { name: 'Марина', contact: 'm@x.ru' }
@@ -775,6 +842,216 @@ describe('приём лидов', () => {
       const text = leadMessage(payload)
       expect(text).toContain('Повторная заявка')
       expect(text).not.toMatch(/Марина|секретная/)
+    })
+  })
+
+  describe('слепок согласия (ТЗ сайта Визор, раздел «Про consent»; 152-ФЗ ст.9 с 2026-09-01)', () => {
+    it('consent сохраняется целиком: версия, текст, момент согласия, и КТО согласился', async () => {
+      const consent = { version: '27 июля 2026 года', text: 'Я даю согласие ИП Макеевой М. А. на обработку…', accepted_at: '2026-08-07T19:16:50.717Z' }
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru', consent } })
+      const row = app.db.prepare('SELECT * FROM consents WHERE contact_id = 1').get()
+      expect(row).toMatchObject({ requester: 'm@x.ru', version: consent.version, text: consent.text, accepted_at: consent.accepted_at, deal_id: 1, project_id: 1 })
+    })
+
+    it('отсутствующий consent не отбрасывает заявку — пишется пустая строка-доказательство', async () => {
+      const res = await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Клиент', contact: 'k@x.ru' } })
+      expect(res.statusCode).toBe(204)
+      const row = app.db.prepare('SELECT * FROM consents WHERE contact_id = 1').get()
+      expect(row).toMatchObject({ version: '', text: '', accepted_at: null })
+    })
+
+    it('повторное обращение того же человека получает СВОЮ строку согласия, а не перезаписывает первую', async () => {
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru', consent: { version: 'v1', text: 'старая редакция', accepted_at: '2026-01-01T00:00:00Z' } } })
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru', consent: { version: 'v2', text: 'новая редакция', accepted_at: '2026-08-01T00:00:00Z' } } })
+      const rows = app.db.prepare('SELECT version FROM consents WHERE contact_id = 1 ORDER BY id').all()
+      expect(rows.map((r) => r.version)).toEqual(['v1', 'v2'])
+    })
+
+    it('честный контракт: доступно для выгрузки как доказательство через существующий экспорт', async () => {
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru', consent: { version: 'v1', text: 'текст согласия', accepted_at: '2026-08-01T00:00:00Z' } } })
+      const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+      expect(dump.consents).toHaveLength(1)
+      expect(dump.consents[0]).toMatchObject({ version: 'v1', text: 'текст согласия' })
+    })
+
+    it('раунд-трип: экспорт → wipe → импорт сохраняет согласие целиком', async () => {
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru', consent: { version: 'v1', text: 'текст', accepted_at: '2026-08-01T00:00:00Z' } } })
+      const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+      expect(dump.version).toBe(DUMP_VERSION)
+      const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })
+      expect(res.statusCode).toBe(200)
+      const row = app.db.prepare('SELECT * FROM consents WHERE id = 1').get()
+      expect(row).toMatchObject({ contact_id: 1, deal_id: 1, requester: 'm@x.ru', version: 'v1', text: 'текст' })
+    })
+
+    it('дамп с pd_requests, но БЕЗ ключа consents (снят между появлением ПДн-раздела и появлением согласия): существующее согласие не стирается, но привязка рвётся', async () => {
+      // hasCompliance (наличие pd_requests) слишком грубый флаг для consents — эта
+      // таблица младше. Дамп такого «промежуточного» формата не должен ни стереть
+      // сегодняшние согласия (их там просто нет физически), ни оставить их указывающими
+      // на contact_id, который импорт вот-вот переиспользует для ДРУГОГО человека.
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru', consent: { version: 'v1', text: 'текст', accepted_at: '2026-08-01T00:00:00Z' } } })
+      const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+      delete dump.consents // симулируем дамп до появления этой таблицы
+
+      const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })
+      expect(res.statusCode).toBe(200)
+      // строка жива — само согласие как факт не потеряно
+      const row = app.db.prepare('SELECT * FROM consents WHERE id = 1').get()
+      expect(row).toMatchObject({ version: 'v1', text: 'текст' })
+      // привязка к контакту разорвана — тот только что пересоздан с тем же id
+      expect(row.contact_id).toBeNull()
+      expect(row.deal_id).toBeNull()
+      // НО requester (независимая проверка, раунд 17) — переживает разрыв: без него
+      // строка осталась бы «кто-то когда-то на что-то согласился» — недоказательной
+      expect(row.requester).toBe('m@x.ru')
+    })
+
+    it('осиротевшее legacy-восстановлением согласие всё равно затирается при обезличивании ТОГО ЖЕ человека (раунд 21)', async () => {
+      // Независимая проверка нашла: consents.requester переживает разрыв (раунд 17),
+      // но anonymizeContact() матчит только по contact_id (раунд 20) — осиротевшая
+      // (contact_id=NULL) строка недостижима ЭТИМ путём и переживала бы обезличивание
+      // навсегда. Сценарий: заявка → «промежуточный» дамп без consents → импорт рвёт
+      // привязку → тот же человек (контакт восстановлен из дампа под тем же id и
+      // email) требует обезличивания — раньше requester остался бы 'm@x.ru' навсегда.
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru', consent: { version: 'v1', text: 'текст', accepted_at: '2026-08-01T00:00:00Z' } } })
+      const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+      delete dump.consents
+      await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })
+      expect(app.db.prepare('SELECT contact_id, requester FROM consents WHERE id = 1').get()).toMatchObject({ contact_id: null, requester: 'm@x.ru' })
+
+      const res = await app.inject({ method: 'POST', url: '/api/crm/contacts/1/anonymize', headers: { cookie } })
+      expect(res.statusCode).toBe(200)
+      // requester И содержимое затёрты (раунд 23: version/text — attacker-controlled
+      // свободный текст с публичного эндпоинта, то же обоснование, что и у requester)
+      const row = app.db.prepare('SELECT requester, version, text, text_truncated, accepted_at FROM consents WHERE id = 1').get()
+      expect(row).toMatchObject({ requester: '', version: '', text: '', text_truncated: 0, accepted_at: null })
+      // сама строка жива — факт «согласие когда-то было» не потерян
+      expect(app.db.prepare('SELECT COUNT(*) c FROM consents').get().c).toBe(1)
+    })
+
+    it('осиротевшее согласие с ДРУГИМ форматом телефона тоже находится и затирается (раунд 25)', async () => {
+      // Независимая проверка: старое сравнение requester точной строкой пропускало
+      // совпадение, когда один и тот же номер записан по-разному ("+7 921 555-14-88"
+      // vs "89215551488") — ровно тот случай, который дедуп при приёме (findExistingContact)
+      // уже умеет распознавать через phoneKey. Два обращения одного человека в
+      // разных форматах → два consents на один contact_id → оба осиротевшие после
+      // «промежуточного» дампа обязаны найтись при обезличивании.
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: '+7 921 555-14-88', consent: { version: 'v1', text: 'формат А' } } })
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: '89215551488', consent: { version: 'v1', text: 'формат Б' } } })
+      expect(app.db.prepare('SELECT COUNT(*) c FROM contacts').get().c).toBe(1) // дедуп сработал
+      expect(app.db.prepare('SELECT COUNT(*) c FROM consents WHERE contact_id = 1').get().c).toBe(2)
+
+      const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+      delete dump.consents
+      await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })
+      expect(app.db.prepare('SELECT COUNT(*) c FROM consents WHERE contact_id IS NULL').get().c).toBe(2)
+
+      await app.inject({ method: 'POST', url: '/api/crm/contacts/1/anonymize', headers: { cookie } })
+      const rows = app.db.prepare('SELECT requester FROM consents').all()
+      expect(rows.every((r) => r.requester === '')).toBe(true)
+    })
+
+    it('email с цифрами не путается с чужим телефоном при поиске осиротевших согласий (раунд 26)', async () => {
+      // Независимая проверка: phoneKey раньше вызывался для ЛЮБОГО идентификатора,
+      // включая email. Если в адресе случайно нашлась 10-значная цепочка цифр
+      // ("buyer1234567890@example.ru" → "1234567890"), она совпадала бы с ключом
+      // РЕАЛЬНОГО телефона ("+7 123 456-78-90" → тот же "1234567890") — и удаление/
+      // обезличивание контакта с таким email стирало бы согласие СОВСЕМ ДРУГОГО
+      // человека, случайно набравшего тот же 10-значный хвост.
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Покупатель', contact: 'buyer1234567890@example.ru', consent: { version: 'v1', text: 'согласие покупателя' } } })
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Другой', contact: '+7 123 456-78-90', consent: { version: 'v1', text: 'согласие другого' } } })
+      expect(app.db.prepare('SELECT COUNT(*) c FROM contacts').get().c).toBe(2) // разные люди, дедуп не сработал
+
+      const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+      delete dump.consents
+      await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })
+      expect(app.db.prepare('SELECT COUNT(*) c FROM consents WHERE contact_id IS NULL').get().c).toBe(2)
+
+      // обезличиваем контакт с email — согласие ЧУЖОГО телефона не должно пострадать
+      await app.inject({ method: 'POST', url: '/api/crm/contacts/1/anonymize', headers: { cookie } })
+      const untouched = app.db.prepare("SELECT requester, text FROM consents WHERE text = 'согласие другого'").get()
+      expect(untouched).toMatchObject({ requester: '+7 123 456-78-90', text: 'согласие другого' })
+    })
+
+    it('обычное удаление контакта (не анонимизация) тоже чистит его согласие (раунд 22)', async () => {
+      // Независимая проверка нашла: DELETE /api/crm/contacts/:id — отдельный от
+      // anonymizeContact путь («эту карточку не стоило заводить», спам/ошибка, не
+      // исполнение права на забвение) — каскадно удаляет tasks/interactions, но не
+      // трогал consents. Контакт исчезает, а requester (сырой email/телефон) остаётся
+      // в базе и в экспорте без единой связанной карточки — то, ради чего сотрудник
+      // мог бы удалить спам-контакт, теряет смысл.
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Спам', contact: 'spam@x.ru', consent: { version: 'v1', text: 'текст' } } })
+      expect(app.db.prepare('SELECT COUNT(*) c FROM consents WHERE contact_id = 1').get().c).toBe(1)
+      await app.inject({ method: 'DELETE', url: '/api/crm/deals/1', headers: { cookie } })
+      const res = await app.inject({ method: 'DELETE', url: '/api/crm/contacts/1', headers: { cookie } })
+      expect(res.statusCode).toBe(200)
+      expect(app.db.prepare('SELECT COUNT(*) c FROM consents WHERE contact_id = 1').get().c).toBe(0)
+    })
+
+    it('удаление контакта чистит и осиротевшие legacy-восстановлением согласия того же человека (раунд 23)', async () => {
+      // Тот же класс пропуска, что раунд 21 нашёл в anonymizeContact — только для
+      // отдельного пути DELETE /api/crm/contacts/:id: contact_id = ? не достаёт
+      // строку с contact_id = NULL, даже если она про того же человека.
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru', consent: { version: 'v1', text: 'текст' } } })
+      const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+      delete dump.consents
+      await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })
+      expect(app.db.prepare('SELECT contact_id, requester FROM consents WHERE id = 1').get()).toMatchObject({ contact_id: null, requester: 'm@x.ru' })
+
+      await app.inject({ method: 'DELETE', url: '/api/crm/deals/1', headers: { cookie } })
+      const res = await app.inject({ method: 'DELETE', url: '/api/crm/contacts/1', headers: { cookie } })
+      expect(res.statusCode).toBe(200)
+      expect(app.db.prepare('SELECT COUNT(*) c FROM consents').get().c).toBe(0)
+    })
+
+    it('удаление сделки рвёт deal_id у согласия, но саму строку и контакт не трогает', async () => {
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Клиент', contact: 'k@x.ru', consent: { version: 'v1', text: 'текст' } } })
+      await app.inject({ method: 'DELETE', url: '/api/crm/deals/1', headers: { cookie } })
+      const row = app.db.prepare('SELECT contact_id, deal_id, requester FROM consents WHERE id = 1').get()
+      expect(row).toMatchObject({ contact_id: 1, deal_id: null, requester: 'k@x.ru' })
+    })
+
+    it('текст согласия НЕ обрезается в пределах разумного — сохраняется целиком (раунд 22)', async () => {
+      // Настоящая политика на несколько тысяч слов легко превышает старый потолок
+      // 5000 — обрезка тихо противоречила бы claim'у «хранится целиком». Текущий
+      // потолок CONSENT_TEXT_MAX = 20000 (раунд 25) с огромным запасом — этот тест
+      // держится далеко внутри него.
+      const longText = 'А'.repeat(6000)
+      await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Клиент', contact: 'l@x.ru', consent: { version: 'v1', text: longText } } })
+      const row = app.db.prepare('SELECT text, text_truncated FROM consents WHERE contact_id = 1').get()
+      expect(row.text).toHaveLength(6000)
+      expect(row.text).toBe(longText)
+      expect(row.text_truncated).toBe(0)
+    })
+
+    it('текст согласия ограничен потолком CONSENT_TEXT_MAX = 20000, но обрезка ВИДНА через text_truncated (раунд 25 + раунд 27)', async () => {
+      // Раунд 25: без потолка — счётчик места на диске при распределённом флуде.
+      // Раунд 27: тихая обрезка противоречила бы «хранится целиком» из раунда 22 —
+      // разрешено флагом: текст обрезан, но это явно видно в самой записи.
+      const res = await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Клиент', contact: 'over-text@x.ru', consent: { version: 'v1', text: 'Б'.repeat(25000) } } })
+      expect(res.statusCode).toBe(204)
+      const row = app.db.prepare('SELECT text, text_truncated FROM consents WHERE contact_id = 1').get()
+      expect(row.text).toHaveLength(20000)
+      expect(row.text_truncated).toBe(1)
+    })
+
+    it('нестроковые version/text не стрингифицируются вслепую — приравниваются к отсутствующим (раунд 24)', async () => {
+      // Независимая проверка: раньше String(consentIn.text ?? '') молча превращал
+      // ЛЮБОЙ тип (число, вложенный объект) в текст вроде «[object Object]» —
+      // не инъекция (параметризованный INSERT), но бессмысленные данные под видом
+      // «сохранено как прислано». Неверный тип теперь = отсутствию поля, как уже
+      // было у accepted_at.
+      const res = await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Клиент', contact: 'z@x.ru', consent: { version: 12345, text: { evil: 'object' }, accepted_at: '2026-08-01T00:00:00Z' } } })
+      expect(res.statusCode).toBe(204)
+      const row = app.db.prepare('SELECT version, text, accepted_at FROM consents WHERE contact_id = 1').get()
+      expect(row).toMatchObject({ version: '', text: '', accepted_at: '2026-08-01T00:00:00Z' })
+    })
+
+    it('опечатка в ключе внутри consent (acceptedAt вместо accepted_at) не роняет заявку — поле просто отсутствует (раунд 24)', async () => {
+      const res = await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Клиент', contact: 'y@x.ru', consent: { version: 'v1', text: 'текст', acceptedAt: '2026-08-01T00:00:00Z' } } })
+      expect(res.statusCode).toBe(204)
+      const row = app.db.prepare('SELECT version, text, accepted_at FROM consents WHERE contact_id = 1').get()
+      expect(row).toMatchObject({ version: 'v1', text: 'текст', accepted_at: null })
     })
   })
 
@@ -1540,7 +1817,7 @@ describe('права субъекта ПДн (152-ФЗ)', () => {
     await app.inject({
       method: 'POST',
       url: '/api/leads',
-      payload: { name: 'Марина Соколова', contact: '+7 921 555-14-88', task: 'внедрение ИИ', note: 'звонить после 18', transcript: 'Клиент: меня зовут Марина, телефон 555-14-88', source: 'chat' },
+      payload: { name: 'Марина Соколова', contact: '+7 921 555-14-88', task: 'внедрение ИИ', note: 'звонить после 18', transcript: 'Клиент: меня зовут Марина, телефон 555-14-88', source: 'chat', consent: { version: 'v1', text: 'текст политики', accepted_at: '2026-08-01T00:00:00Z' } },
     })
     app.db.prepare("INSERT INTO tasks (title, contact_id, created_at, updated_at) VALUES ('Позвонить Марине', 1, ?, ?)").run(now(), now())
     const res = await app.inject({ method: 'POST', url: '/api/crm/contacts/1/anonymize', headers: { cookie } })
@@ -1560,6 +1837,11 @@ describe('права субъекта ПДн (152-ФЗ)', () => {
     expect(inter.note).toBe('')
     // задачи удалены: обработку требовали прекратить
     expect(app.db.prepare('SELECT COUNT(*) c FROM tasks WHERE contact_id = 1').get().c).toBe(0)
+    // слепок согласия: requester, version, text, accepted_at — всё затёрто (раунд 20
+    // затирал только requester; раунд 23 указал, что version/text — тоже свободный
+    // текст с публичного эндпоинта, недоказуемо свободный от ПДн). Строка жива.
+    const consent = app.db.prepare('SELECT * FROM consents WHERE contact_id = 1').get()
+    expect(consent).toMatchObject({ requester: '', version: '', text: '', text_truncated: 0, accepted_at: null })
     // и всё это попало в журнал
     expect(app.db.prepare("SELECT COUNT(*) c FROM audit_log WHERE action = 'anonymize'").get().c).toBe(1)
   })

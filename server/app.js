@@ -100,6 +100,107 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     return false
   }
 
+  // Глобальная квота на проект — ТОЛЬКО для /api/leads (ТЗ сайта Визор, §1.2:
+  // «глобальная квота на проект, чтобы всплеск не выел лимиты уведомлений» +
+  // «защита downstream: если новая заявка триггерит письмо/телеграм, лимитировать
+  // и это»). hardRateLimited выше лимитирует ОДИН IP — распределённый всплеск
+  // (много разных адресов, вирусный пост, скоординированная атака) им не ловится:
+  // суммарный поток на один проект ничем не ограничен.
+  //
+  // Гейт ТОЛЬКО на enqueue(), никогда на приём (независимая проверка, раунд 17):
+  // первая версия отвечала 429 и НЕ сохраняла заявку — для /api/pd-requests это была
+  // дешёвая неаутентифицированная DoS на срок по 152-ФЗ. Заявка/запрос сохраняется
+  // всегда, как и остальной приём в этом файле (ADR-006); квота решает только судьбу
+  // уведомления.
+  //
+  // /api/pd-requests этим механизмом ВООБЩЕ НЕ пользуется (независимая проверка,
+  // раунд 19): даже гейт «только на уведомление» здесь не годится — пропущенный ПИНГ
+  // о запросе на удаление/доступ ПДн означает, что сотрудник узнает о нём, только
+  // если сам откроет /crm/privacy, а полагаться на это при легальном 10-дневном
+  // сроке — тот же класс риска, что и блокировка приёма из раунда 17, просто мягче
+  // на один шаг. Дёшево устроить: 30 запросов с ОДНОГО IP (per-IP лимит это
+  // разрешает) гасят бюджет проекта на час. У лидов цена пропуска — коммерческое
+  // неудобство (инбокс всё равно показывает всё), у ПДн-запроса — кандидат на жалобу
+  // в РКН. /api/pd-requests уведомляет БЕЗУСЛОВНО на каждый принятый запрос; outbox
+  // асинхронный, с ретраями (server/telegram.js) — всплеск встанет в очередь и
+  // рассосётся, не уронит ничего.
+  // Осознанный остаточный риск для leads: без гейта на приём распределённый флуд
+  // (много IP, каждый под hardRateLimited) может неограниченно растить contacts/
+  // deals. Принято намеренно — рост БД от спама чинится вручную (bulk-delete из
+  // CRM), а пропущенный ПДн-дедлайн не чинится ничем; hardRateLimited остаётся
+  // первой линией защиты от ОДНОГО источника, что и раньше.
+  //
+  // Ключевое пространство — число проектов (сейчас 2, см. таблицу projects), расти
+  // неоткуда: в отличие от hardHits/leadHits (ключ — IP, потенциально безграничный),
+  // вытеснение здесь не нужно.
+  //
+  // Состояние — Map в памяти процесса, обнуляется рестартом/передеплоем (независимая
+  // проверка, раунд 20). Тот же характер, что у ВСЕХ остальных счётчиков в этом файле
+  // и в auth.js (hardHits, leadHits, accounts/volatile_) — не новое ограничение этой
+  // квоты, а уже принятое во всём проекте следствие однопроцессного деплоя (ADR-003/
+  // 008, App Platform без внешнего кэша). Раньше это было безопасно принять, потому
+  // что цена промаха — задержка входа/лишняя пометка suspicious. Здесь цена ещё ниже,
+  // чем везде: после раундов 17 и 19 эта квота НИКОГДА не блокирует приём — только
+  // решает, слать ли ещё уведомление. Рестарт посреди насыщенного часа в худшем
+  // случае даёт ещё до 60 уведомлений о лидах сверху — не потерю данных и не
+  // пропущенный дедлайн (для ПДн-запросов квоты вообще нет, см. выше). Строить под
+  // это отдельное durable-хранилище значило бы решать проблему, которую не решает
+  // ни один другой лимитер в проекте — непропорционально цене промаха.
+  const LEAD_PROJECT_QUOTA_WINDOW_MS = 60 * 60_000
+  const LEAD_PROJECT_QUOTA_MAX = 60
+  const leadProjectHits = new Map()
+  // Когда проект в последний раз уведомляли о насыщении бюджета (независимая
+  // проверка, раунд 23): без явного сигнала насыщение неотличимо от затишья —
+  // «нет уведомлений о лидах» выглядит одинаково и когда лидов правда нет, и когда
+  // их слишком много. Один сигнал на окно на проект, не на каждую заблокированную
+  // заявку — иначе сам сигнал стал бы тем потоком, который призван предотвращать.
+  const leadQuotaWarnedAt = new Map()
+  /** true — бюджет уведомлений о лидах на проект ещё не исчерпан (можно enqueue). */
+  function leadNotifyBudgetOk(projectId) {
+    const nowMs = Date.now()
+    const list = (leadProjectHits.get(projectId) || []).filter((t) => nowMs - t < LEAD_PROJECT_QUOTA_WINDOW_MS)
+    if (list.length >= LEAD_PROJECT_QUOTA_MAX) {
+      leadProjectHits.set(projectId, list)
+      const warnedAt = leadQuotaWarnedAt.get(projectId) || 0
+      if (nowMs - warnedAt >= LEAD_PROJECT_QUOTA_WINDOW_MS) {
+        leadQuotaWarnedAt.set(projectId, nowMs)
+        const project = db.prepare('SELECT display_name FROM projects WHERE id = ?').get(projectId)
+        enqueue(db, 'text', {
+          text: [
+            '⚠️ <b>Много заявок за час</b>',
+            `Проект: ${project?.display_name || projectId}`,
+            `Уведомления о новых лидах временно скрыты (лимит ${LEAD_PROJECT_QUOTA_MAX}/час) — все заявки уже в инбоксе CRM.`,
+          ].join('\n'),
+        })
+      }
+      return false
+    }
+    list.push(nowMs)
+    leadProjectHits.set(projectId, list)
+    return true
+  }
+
+  // Гигиена API (ТЗ сайта Визор, §1.5: «отклонять неизвестные поля»). Здесь — НЕ
+  // жёсткий отказ: 400 на любое незнакомое поле нарушил бы центральный принцип
+  // проекта «заявку не отвергаем никогда» (ADR-006/011) — рассинхрон версий клиента
+  // и сервера (сайт добавил поле раньше, чем CRM научилась его понимать) тихо ронял
+  // бы ВСЕ заявки разом, а не только вредные. Вместо отказа — предупреждение в лог:
+  // видимость есть, приём не рвётся. Значения полей не логируем (свободный текст,
+  // потенциально ПДн) — только имена ключей.
+  const LEAD_FIELDS = new Set(['name', 'contact', 'task', 'note', 'source', 'website', 'consent', 'project', 'request_id', 'scale', 'detail', 'transcript'])
+  const PD_REQUEST_FIELDS = new Set(['contact', 'kind', 'note', 'website', 'project', 'request_id'])
+  const CONSENT_FIELDS = new Set(['version', 'text', 'accepted_at'])
+  // Ограничения на сам лог (независимая проверка, раунд 27): ключи JSON-объекта —
+  // такой же недоверенный, произвольной длины ввод, как и значения — bodyLimit
+  // (65536) не мешает ОДНОМУ ключу занять почти всё тело. Без потолка здесь лог-
+  // строка от одного запроса могла бы разрастись почти до размера всего bodyLimit —
+  // тот самый «объём в логи» риск, которого вызов и должен избегать. Обрезаем
+  // каждое имя и их количество — независимо от вызывающего кода.
+  function warnUnknownFields(scope, body, allowed) {
+    const unknown = Object.keys(body).filter((k) => !allowed.has(k)).slice(0, 20).map((k) => k.slice(0, 100))
+    if (unknown.length) app.log?.warn?.({ scope, unknown }, 'публичный приём: неизвестные поля в теле запроса')
+  }
+
   // Срок хранения idempotency_keys — сильно больше любого разумного окна ретраев
   // (сайт ждёт таймаут 10 с и предлагает повтор человеку, не часами) но не вечно:
   // независимая проверка указала, что публичный неаутентифицированный эндпоинт без
@@ -551,17 +652,52 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       if (name === 'contacts') {
         const deals = db.prepare('SELECT COUNT(*) c FROM deals WHERE contact_id = ?').get(id).c
         if (deals > 0) return reply.code(409).send({ error: 'has_deals', hint: 'архивируйте контакт' })
-        db.prepare('DELETE FROM tasks WHERE contact_id = ?').run(id)
-        db.prepare('DELETE FROM interactions WHERE contact_id = ?').run(id)
       }
-      if (name === 'deals') {
-        // Серии возврата ссылаются на сделку внешним ключом — без этой уборки
-        // удаление сделки упало бы на FOREIGN KEY.
-        db.prepare('DELETE FROM tasks WHERE winback_sequence_id IN (SELECT id FROM winback_sequences WHERE deal_id = ?)').run(id)
-        db.prepare('DELETE FROM winback_sequences WHERE deal_id = ?').run(id)
-        db.prepare('UPDATE tasks SET deal_id = NULL WHERE deal_id = ?').run(id)
-      }
-      db.prepare(`DELETE FROM ${name} WHERE id = ?`).run(id)
+      // Вся цепочка удаления — ОДНОЙ транзакцией (независимая проверка, раунд 26):
+      // раньше это были отдельные db.prepare().run() подряд — сбой посреди (диск,
+      // прерывание процесса) мог оставить контакт удалённым, а его consents — нет
+      // (или наоборот), то есть ровно ту частичную запись, от которой транзакции
+      // в этом файле обычно и защищают.
+      db.transaction(() => {
+        if (name === 'contacts') {
+          // phone/email/messenger читаем ДО удаления строки — нужны ниже, чтобы найти
+          // осиротевшие legacy-восстановлением слепки согласия того же человека.
+          const c = db.prepare('SELECT phone, email, messenger, project_id FROM contacts WHERE id = ?').get(id)
+          db.prepare('DELETE FROM tasks WHERE contact_id = ?').run(id)
+          db.prepare('DELETE FROM interactions WHERE contact_id = ?').run(id)
+          // Слепки согласия (независимая проверка, раунд 22): в отличие от анонимизации
+          // (anonymizeContact сохраняет обезличенный след), обычное удаление контакта —
+          // это «эту карточку не стоило заводить» (спам, ошибка), а не исполнение права
+          // на забвение. Оставлять requester (сырой email/телефон) после того, как сам
+          // контакт исчез, значило бы держать ПДн без контакта, который они описывают —
+          // и как раз тот путь, которым сотрудник мог бы попытаться почистить массовый
+          // спам, тихо не подчищая ПДн из consents. Удаляем целиком, тем же приёмом,
+          // что tasks/interactions строкой выше.
+          db.prepare('DELETE FROM consents WHERE contact_id = ?').run(id)
+          // Осиротевшие legacy-восстановлением строки того же человека (contact_id уже
+          // NULL — независимая проверка, раунд 23: тот же класс пропуска, что нашли в
+          // anonymizeContact раундом 21, но в этом отдельном пути удаления). orphanedConsentIds
+          // (определена ниже по файлу у phoneKey, но доступна здесь — function-декларация
+          // поднимается в область видимости buildApp) — С НОРМАЛИЗАЦИЕЙ ТЕЛЕФОНА, не точным
+          // совпадением строк (раунд 25: «+7 921…» и «89215551488» иначе не совпали бы).
+          const orphanIds = c ? orphanedConsentIds(c.project_id, [c.phone, c.email, c.messenger]) : []
+          if (orphanIds.length) {
+            const marks = orphanIds.map(() => '?').join(',')
+            db.prepare(`DELETE FROM consents WHERE id IN (${marks})`).run(...orphanIds)
+          }
+        }
+        if (name === 'deals') {
+          // Серии возврата ссылаются на сделку внешним ключом — без этой уборки
+          // удаление сделки упало бы на FOREIGN KEY.
+          db.prepare('DELETE FROM tasks WHERE winback_sequence_id IN (SELECT id FROM winback_sequences WHERE deal_id = ?)').run(id)
+          db.prepare('DELETE FROM winback_sequences WHERE deal_id = ?').run(id)
+          db.prepare('UPDATE tasks SET deal_id = NULL WHERE deal_id = ?').run(id)
+          // Согласие живёт независимо от сделки (contact_id — основная связь) — только
+          // рвём ставшую невалидной ссылку, тем же приёмом, что и у tasks.deal_id выше.
+          db.prepare('UPDATE consents SET deal_id = NULL WHERE deal_id = ?').run(id)
+        }
+        db.prepare(`DELETE FROM ${name} WHERE id = ?`).run(id)
+      })()
       audit(req, 'delete', name, id)
       return { ok: true }
     })
@@ -708,6 +844,7 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     const PLAIN_COLS = {
       pd_requests: ['contact_id', 'kind', 'status', 'requester', 'note', 'source', 'project_id', 'due_date', 'resolved_at', 'resolved_by', 'verified_at', 'created_at', 'updated_at'],
       audit_log: ['user_id', 'user_email', 'action', 'entity', 'entity_id', 'detail', 'created_at'],
+      consents: ['contact_id', 'deal_id', 'project_id', 'requester', 'version', 'text', 'text_truncated', 'accepted_at', 'created_at'],
     }
     const allowedCols = (n) =>
       PLAIN_COLS[n]
@@ -732,7 +869,13 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
         db.prepare('DELETE FROM idempotency_keys').run()
         // Таблицы восстанавливаем те, что есть в дампе: из старого файла (v1)
         // запросы ПДн и журнал не придут, и стирать существующие мы не станем.
-        const tables = hasCompliance ? DUMP_TABLES : ENTITY_NAMES
+        // consents младше даже pd_requests: дамп может иметь pd_requests (hasCompliance),
+        // но не иметь consents (снят до этой сессии, между появлением ПДн-раздела и
+        // появлением согласия) — hasCompliance слишком грубый для этого различия,
+        // проверяем наличие СВОЕГО ключа отдельно, тем же принципом, что verified_at
+        // ниже: по факту присутствия в JSON, а не по общей версии формата.
+        const hasConsents = Array.isArray(data.consents)
+        const tables = (hasCompliance ? DUMP_TABLES : ENTITY_NAMES).filter((n) => n !== 'consents' || hasConsents)
         // удаляем детей раньше родителей (FK), вставляем в прямом порядке
         for (const n of [...tables].reverse()) db.prepare(`DELETE FROM ${n}`).run()
         for (const n of tables) {
@@ -763,6 +906,16 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
         // юридический след, но привязку к контакту рвём — контакты только что
         // заменены целиком, и ссылка могла бы указать на ДРУГОГО человека с тем же id.
         // Сам запрос остаётся читаемым: в нём есть адрес заявителя, вид, срок и статус.
+        // Та же логика для consents, отдельно от ветки hasCompliance ниже: contacts/
+        // deals в любом случае только что заменены целиком (они всегда в tables), а
+        // если сам дамп consents не нёс (!hasConsents — v1 ИЛИ дамп между появлением
+        // pd_requests и появлением consents), таблица выше НЕ вошла в wipe-цикл —
+        // существующие строки живы, но их contact_id/deal_id могли достаться СОВСЕМ
+        // другому человеку/сделке с тем же id. Согласие как факт остаётся читаемым
+        // (version/text/accepted_at никуда не делись) — рвём только привязку.
+        if (!hasConsents) {
+          db.prepare('UPDATE consents SET contact_id = NULL, deal_id = NULL WHERE contact_id IS NOT NULL OR deal_id IS NOT NULL').run()
+        }
         if (!hasCompliance) {
           db.prepare('UPDATE pd_requests SET contact_id = NULL, updated_at = ? WHERE contact_id IS NOT NULL').run(now())
         } else if (!(data.pd_requests ?? []).some((r) => Object.prototype.hasOwnProperty.call(r, 'verified_at'))) {
@@ -918,7 +1071,9 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   const PD_STATUSES = ['pending_unverified', 'new', 'done', 'rejected']
 
   function anonymizeContact(contactId, req) {
-    const contact = db.prepare('SELECT id, anonymized_at FROM contacts WHERE id = ?').get(contactId)
+    // phone/email/messenger читаем ЗАРАНЕЕ, до их обнуления шагом 1 — нужны шагу 5b
+    // ниже, чтобы найти осиротевшие слепки согласия ДО того, как значения исчезнут.
+    const contact = db.prepare('SELECT id, phone, email, messenger, project_id, anonymized_at FROM contacts WHERE id = ?').get(contactId)
     if (!contact) return null
     if (contact.anonymized_at) return contact // повторный вызов безвреден
 
@@ -939,6 +1094,32 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       db.prepare('DELETE FROM tasks WHERE contact_id = ?').run(contactId)
       db.prepare("UPDATE winback_sequences SET status = 'cancelled', finished_at = ? WHERE contact_id = ? AND status = 'active'")
         .run(ts, contactId)
+      // 5. Слепки согласия: затираем ВСЁ содержимое — requester, version, text,
+      //    accepted_at. Раньше (раунд 20) version/text/accepted_at не трогались —
+      //    рассуждение было «это не про человека, а про то, какой текст политики
+      //    показывали». Независимая проверка (раунд 23) указала: это НЕПРОВЕРЯЕМОЕ
+      //    допущение о содержимом — text/version приходят с публичного эндпоинта КАК
+      //    ПРИСЛАНО, без проверки, что это действительно текст политики, а не что
+      //    угодно ещё (имя, номер, кусок переписки) — как и у остальных свободных
+      //    полей этого приёма (note/task/transcript), которые как раз затираются
+      //    анонимизацией. Оставляем только сам факт «согласие когда-то было» —
+      //    contact_id/deal_id/project_id/created_at (ссылка на уже анонимизированный
+      //    контакт ничего не раскрывает, дата фиксирует момент события).
+      db.prepare("UPDATE consents SET requester = '', version = '', text = '', text_truncated = 0, accepted_at = NULL WHERE contact_id = ?").run(contactId)
+      // 5b. Осиротевшие legacy-восстановлением строки (contact_id обнулён импортом
+      //     дампа без consents — ADR-015, раунд 17/18 — requester НАМЕРЕННО уцелел
+      //     как единственная зацепка). Независимая проверка (раунд 21) поймала: такая
+      //     строка недостижима шагом 5 — у неё contact_id уже NULL, а не contactId —
+      //     и переживала бы анонимизацию НАВСЕГДА, продолжая раскрывать email/телефон
+      //     в базе и в экспорте. orphanedConsentIds (см. выше, у phoneKey) ищет по
+      //     значению идентификатора С НОРМАЛИЗАЦИЕЙ ТЕЛЕФОНА (раунд 25: точное
+      //     сравнение строк пропускало бы совпадение при разных форматах одного
+      //     номера) — значения читаны ДО шага 1, пока не затёрты.
+      const orphanIds = orphanedConsentIds(contact.project_id, [contact.phone, contact.email, contact.messenger])
+      if (orphanIds.length) {
+        const marks = orphanIds.map(() => '?').join(',')
+        db.prepare(`UPDATE consents SET requester = '', version = '', text = '', text_truncated = 0, accepted_at = NULL WHERE id IN (${marks})`).run(...orphanIds)
+      }
     })()
     audit(req, 'anonymize', 'contacts', contactId, 'исполнение запроса субъекта ПДн')
     return db.prepare('SELECT id, name, anonymized_at FROM contacts WHERE id = ?').get(contactId)
@@ -1149,6 +1330,43 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   }
 
   /**
+   * id осиротевших legacy-восстановлением строк consents (contact_id уже NULL —
+   * ADR-015, раунд 17/18), принадлежащих человеку с любым из переданных
+   * идентификаторов. ТЕМ ЖЕ способом сравнения, что и дедуп при приёме
+   * (findExistingContact выше) — независимая проверка (раунд 25) поймала, что
+   * anonymizeContact/DELETE-контакта раньше сравнивали requester ТОЧНОЙ строкой
+   * (lower(requester) = lower(?)), а дедуп нормализует телефон через phoneKey —
+   * «+7 921…» и «89215551488» для дедупа один номер, а для точного сравнения
+   * строк — разные. Расхождение в форматах между тем, как телефон попал в
+   * requester при первой отправке, и тем, как он лежит в восстановленном
+   * контакте, позволяло осиротевшей строке пережить и анонимизацию, и удаление.
+   * Перебор в JS — SQL не выражает нормализацию телефона без лишней колонки
+   * (тот же приём и та же причина, что в findExistingContact).
+   */
+  // phoneKey — только для значений, которые в принципе МОГУТ быть телефоном: '@'
+  // однозначно исключает и email, и мессенджер-хендл вида «@username». Независимая
+  // проверка (раунд 26) поймала: без этой отсечки phoneKey(email) тоже возвращает
+  // truthy-ключ, если в адресе случайно нашлась 10-значная цифровая
+  // последовательность (например, «buyer1234567890@example.ru»), и совпадение по
+  // этому ключу с ЧУЖИМ телефоном («+7 123 456-78-90» → тот же ключ) стирало бы
+  // согласие СОВЕРШЕННО ДРУГОГО человека. Гвард нужен на ОБЕИХ сторонах сравнения —
+  // и на переданном идентификаторе, и на requester кандидата.
+  const phoneKeyIfPlausible = (s) => (s && !String(s).includes('@') ? phoneKey(s) : '')
+
+  function orphanedConsentIds(projectId, identifiers) {
+    const candidates = db.prepare('SELECT id, requester FROM consents WHERE contact_id IS NULL AND project_id = ?').all(projectId)
+    const ids = new Set()
+    for (const v of identifiers.filter(Boolean)) {
+      const key = phoneKeyIfPlausible(v)
+      for (const row of candidates) {
+        const match = key ? phoneKeyIfPlausible(row.requester) === key : String(row.requester || '').toLowerCase() === String(v).toLowerCase()
+        if (match) ids.add(row.id)
+      }
+    }
+    return [...ids]
+  }
+
+  /**
    * Тот же человек уже писал? Ищем строго по точному совпадению контакта —
    * почта, телефон или ник. По имени НЕ ищем: «Иван» без фамилии есть у каждого,
    * и склеить двух разных клиентов хуже, чем завести им две карточки.
@@ -1184,6 +1402,10 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     const replay = idempotencyReplay('leads', requestId)
     if (replay !== null) return reply.code(replay).send()
     if (hardRateLimited('leads', req.ip)) return reply.code(429).send()
+    // ПОСЛЕ hardRateLimited (независимая проверка, раунд 27): уже заблокированный по
+    // IP запрос не должен провоцировать даже эту (ограниченную по размеру) запись в
+    // лог — лимитер обязан быть первым, что видит недоверенный запрос, не последним.
+    warnUnknownFields('leads', b, LEAD_FIELDS)
 
     // honeypot: скрытое поле website видят только боты — молчаливый дроп. Отвечаем
     // КАК ПРИ УСПЕХЕ (иначе бот подберёт обход по коду ответа), но не сохраняем и
@@ -1204,6 +1426,49 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     // сделки: так карточка сделки остаётся короткой сутью, а весь диалог всё равно
     // виден на карточке контакта. ПДн тут можно — CRM на РФ-сервере, доступ только у сотрудников.
     const transcript = isChat ? trim(b.transcript, 4000) : ''
+    // Слепок согласия (ТЗ сайта Визор, раздел «Про consent»; 152-ФЗ ст.9 в редакции
+    // с 2026-09-01 требует, чтобы оператор МОГ ДОКАЗАТЬ согласие). Сайт шлёт
+    // {version, text, accepted_at} в каждой заявке — сохраняем как прислано, без
+    // требования непустоты: отсутствие/пустой consent — тоже значимый факт (старая
+    // версия клиента сайта, ручной тест), и это не повод ронять приём заявки.
+    const consentIn = b.consent && typeof b.consent === 'object' ? b.consent : {}
+    // Нераспознанные ключи ВНУТРИ consent — предупреждение, тем же приёмом, что и
+    // у полей верхнего уровня (независимая проверка, раунд 24): без этого опечатка
+    // клиента (например, camelCase acceptedAt вместо контрактного accepted_at) молча
+    // теряла бы поле целиком — accepted_at ушёл бы в NULL без единого следа в логах.
+    warnUnknownFields('leads.consent', consentIn, CONSENT_FIELDS)
+    // version/text — СТРОГО typeof === 'string', тем же правилом, что уже было у
+    // accepted_at (независимая проверка, раунд 24): раньше text через String(v ?? '')
+    // молча стрингифицировал ЛЮБОЙ тип («[object Object]» для вложенного объекта и
+    // т.п.) — не риск инъекции (параметризованный INSERT), но бессмысленные данные
+    // под видом «сохранено как прислано». Неверный тип теперь приравнивается к
+    // отсутствию поля — так же, как уже было у accepted_at.
+    // CONSENT_TEXT_MAX — компромисс между раундом 22 (5000 было тихо мало для
+    // настоящей политики на несколько тысяч слов — обрубало заявленное «хранится
+    // целиком») и раундом 25 (совсем без потолка одна заявка легально уносит до
+    // ~64 КБ — bodyLimit — в consents.text; распределённый флуд по многим IP,
+    // каждый под hardRateLimited, а не под квотой на приём (см. leadNotifyBudgetOk
+    // выше, раунды 17/19: квота НИКОГДА не блокирует приём) — превращает это в
+    // счётчик места на диске, а не просто мусорные карточки). 20 000 символов с
+    // огромным запасом покрывает любую настоящую политику (несколько тысяч слов),
+    // но остаётся конечным, предсказуемым потолком на строку, а не «весь bodyLimit».
+    // Полностью проблему распределённого флуда это НЕ решает — тот же остаточный
+    // риск, что уже принят в раундах 17/19 для роста contacts/deals, просто с
+    // ощутимо более низким потолком на одну запись, чем без этой правки.
+    //
+    // Обрезка ТЕПЕРЬ ВИДНА, а не тиха (независимая проверка, раунд 27): раунд 22
+    // прямо требовал «нельзя тихо обрезать — это же и есть доказательство», а
+    // раунд 25 требовал потолок. textTruncated (миграция v11 → consents.text_truncated)
+    // разрешает оба разом — потолок остаётся (защищает диск), но факт обрезки
+    // записывается рядом с самим текстом, а не теряется молча.
+    const CONSENT_TEXT_MAX = 20000
+    const rawConsentText = typeof consentIn.text === 'string' ? consentIn.text.trim() : ''
+    const consent = {
+      version: typeof consentIn.version === 'string' ? trim(consentIn.version, 200) : '',
+      text: rawConsentText.slice(0, CONSENT_TEXT_MAX),
+      textTruncated: rawConsentText.length > CONSENT_TEXT_MAX,
+      acceptedAt: typeof consentIn.accepted_at === 'string' ? trim(consentIn.accepted_at, 64) : '',
+    }
     if (!contactInfo && name === 'Без имени') {
       idempotencyRecord('leads', requestId, 204)
       return reply.code(204).send()
@@ -1226,7 +1491,6 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
         else app.log?.warn?.({ asked, origin: req.headers.origin }, 'lead: неизвестный проект, беру запасной')
       }
     }
-
     // Дубли: тот же человек мог заполнить форму, а потом написать в чат. Две карточки
     // на одного клиента рвут историю пополам, поэтому вторую не заводим — привязываем
     // заявку к существующей (ADR-014). Ошибочную склейку видно сразу и она поправима:
@@ -1246,11 +1510,12 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
         const messenger = isEmail ? '' : contactInfo
         const cid = db.prepare('INSERT INTO contacts (name, email, messenger, note, source, suspicious, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
           .run(name, email, messenger, '', isChat ? 'site-chat' : 'site-form', suspicious ? 1 : 0, projectId, ts, ts).lastInsertRowid
-        db.prepare('INSERT INTO deals (contact_id, title, stage, note, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(cid, title, 'Новый', note, projectId, ts, ts)
+        const did = db.prepare('INSERT INTO deals (contact_id, title, stage, note, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+          .run(cid, title, 'Новый', note, projectId, ts, ts).lastInsertRowid
         if (transcript) {
           db.prepare('INSERT INTO interactions (contact_id, type, note, happened_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(cid, 'сообщение', transcript, ts, ts, ts)
         }
-        return { contactId: cid, repeat: false }
+        return { contactId: cid, dealId: did, repeat: false }
       }
 
       const cid = existing.id
@@ -1297,22 +1562,44 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
         db.prepare('DELETE FROM tasks WHERE winback_sequence_id = ? AND done = 0').run(seq.id)
         db.prepare("UPDATE winback_sequences SET status = 'cancelled', finished_at = ? WHERE id = ?").run(ts, seq.id)
       }
-        return { contactId: cid, repeat: true, returned: seqs.length > 0 }
+        return { contactId: cid, dealId, repeat: true, returned: seqs.length > 0 }
       })()
+
+      // Слепок согласия — одна строка на КАЖДУЮ отправку (не только на новый контакт):
+      // повторное обращение того же человека может нести другую версию политики или
+      // другой момент согласия, а дедуп (ADR-014) намеренно переиспользует контакт/
+      // сделку — терять из-за этого согласие нельзя, поэтому запись безусловная.
+      // requester = contactInfo как прислано в форме — независимое от contact_id
+      // доказательство личности, переживающее любой импорт (см. миграцию v11).
+      db.prepare('INSERT INTO consents (contact_id, deal_id, project_id, requester, version, text, text_truncated, accepted_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(inner.contactId, inner.dealId ?? null, projectId, contactInfo, consent.version, consent.text, consent.textTruncated ? 1 : 0, consent.acceptedAt || null, ts)
 
       // В уведомление кладём только обезличенное: проект, источник, ссылку на карточку.
       // Имя, контакт и текст заявки остаются в CRM на российском сервере — Telegram
       // зарубежный, и отправка туда ПДн была бы трансграничной передачей (152-ФЗ).
-      const project = db.prepare('SELECT display_name FROM projects WHERE id = ?').get(projectId)
-      enqueue(db, 'lead', {
-        projectName: project?.display_name || '',
-        source: isChat ? 'чат' : 'форма',
-        contactId: inner.contactId,
-        suspicious,
-        // repeat/returned — не ПДн: это про историю обращения, а не про человека
-        repeat: Boolean(inner.repeat),
-        returned: Boolean(inner.returned),
-      })
+      // leadNotifyBudgetOk вызывается ЗДЕСЬ, а не до транзакции (независимая проверка,
+      // раунд 24): та версия «тратила» слот бюджета из in-memory Map ДО того, как
+      // транзакция гарантированно прошла — сбой чуть позже (например, INSERT
+      // idempotency_keys ниже, единственное, что может бросить не-UNIQUE ошибку
+      // ПОСЛЕ этой точки) откатил бы SQL, но не откатил бы уже потраченный слот
+      // Map — несостоявшаяся заявка тихо съедала бы бюджет уведомлений впустую. Здесь
+      // это тот же риск, но окно короче на порядок: до этой строки в транзакции
+      // только INSERT/UPDATE контакта/сделки/consents, которые бросают либо сразу
+      // (в самом начале), либо не бросают вовсе. ЕДИНСТВЕННОЕ, что квота на проект
+      // решает — заявка выше уже сохранена безусловно, здесь только вопрос, ставить
+      // ли ещё одно уведомление в очередь при исчерпанном бюджете проекта.
+      if (leadNotifyBudgetOk(projectId)) {
+        const project = db.prepare('SELECT display_name FROM projects WHERE id = ?').get(projectId)
+        enqueue(db, 'lead', {
+          projectName: project?.display_name || '',
+          source: isChat ? 'чат' : 'форма',
+          contactId: inner.contactId,
+          suspicious,
+          // repeat/returned — не ПДн: это про историю обращения, а не про человека
+          repeat: Boolean(inner.repeat),
+          returned: Boolean(inner.returned),
+        })
+      }
       if (requestId) {
         try {
           db.prepare('INSERT INTO idempotency_keys (scope, request_id, status_code, created_at) VALUES (?, ?, ?, ?)').run('leads', requestId, 204, ts)
@@ -1354,6 +1641,8 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     const replay = idempotencyReplay('pd_requests', requestId)
     if (replay !== null) return reply.code(replay).send()
     if (hardRateLimited('pd_requests', req.ip)) return reply.code(429).send()
+    // ПОСЛЕ hardRateLimited — та же причина, что у /api/leads (раунд 27).
+    warnUnknownFields('pd_requests', b, PD_REQUEST_FIELDS)
 
     // honeypot — НЕ молчаливый дроп, в отличие от лидов. Независимая проверка указала
     // на асимметрию: скрытое поле обычно не подделывает ничего, кроме ботов, но
@@ -1394,6 +1683,9 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       const asked = trim(b.project, 100)
       if (asked) projectId = resolveProjectId(asked) || projectId
     }
+    // Запрос по ПДн — БЕЗ квоты на проект вообще, ни на приём, ни на уведомление
+    // (см. развёрнутый разбор у leadNotifyBudgetOk выше, раунды 17 и 19): сохраняется,
+    // получает due_date и уведомляет сотрудника всегда, каждый раз.
 
     // Ищем человека в базе сами — по точному совпадению почты или мессенджера, ВНУТРИ
     // проекта (независимая проверка нашла: без project_id тот же email/телефон в
@@ -1427,6 +1719,8 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
 
       // Уведомление обезличено для ОБОИХ каналов, в отличие от заявок: здесь ПДн не
       // нужны по существу — важны вид запроса и срок, кто именно — видно в CRM по ссылке.
+      // БЕЗ квоты на уведомление (раунд 19, см. комментарий выше) — ПДн-запрос
+      // уведомляет ВСЕГДА, каждый раз, без исключений.
       enqueue(db, 'text', {
         text: [
           '⚠️ <b>Запрос по персональным данным</b>',
