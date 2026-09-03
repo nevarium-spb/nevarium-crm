@@ -437,6 +437,18 @@ describe('auth', () => {
     })
     expect(res.statusCode).toBe(403)
   })
+
+  it('битый Origin — 403, а не 500', async () => {
+    // new URL('not a url') бросает исключение, а необработанное внутри preHandler оно
+    // отдавало 500 ERR_INVALID_URL. Не разобрали Origin — значит не браузер, значит отказ.
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/crm/contacts',
+      payload: { name: 'X' },
+      headers: { cookie, origin: 'not a url', host: 'localhost:3001' },
+    })
+    expect(res.statusCode).toBe(403)
+  })
 })
 
 describe('APP_ORIGIN: строгая CSRF-проверка, когда домен CRM настроен явно', () => {
@@ -494,6 +506,24 @@ describe('CRUD + конфликты', () => {
     expect(JSON.parse(paid.body).item.closed_at).toBeTruthy()
     const back = await app.inject({ method: 'PATCH', url: '/api/crm/deals/1', payload: { stage: 'Переговоры' }, headers: { cookie } })
     expect(JSON.parse(back.body).item.closed_at).toBeNull()
+  })
+
+  it('PATCH той же стадией не затирает closed_at', async () => {
+    // Форма редактирования сделки всегда шлёт текущую стадию, поэтому правка одной лишь
+    // заметки у закрытой сделки перевыставляла closed_at на сегодня и теряла настоящую
+    // дату закрытия — а по ней считается воронка за прошлые периоды.
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'Пилот' }, headers: { cookie } })
+    const paid = await app.inject({ method: 'PATCH', url: '/api/crm/deals/1', payload: { stage: 'Оплачено' }, headers: { cookie } })
+    const closedAt = JSON.parse(paid.body).item.closed_at
+    expect(closedAt).toBeTruthy()
+    const edited = await app.inject({
+      method: 'PATCH',
+      url: '/api/crm/deals/1',
+      payload: { stage: 'Оплачено', note: 'уточнение по договору' },
+      headers: { cookie },
+    })
+    expect(JSON.parse(edited.body).item.closed_at).toBe(closedAt)
   })
 
   it('устаревший expectedUpdatedAt → 409 с актуальной записью', async () => {
@@ -1576,6 +1606,17 @@ describe('пользователи', () => {
   it('нельзя удалить себя', async () => {
     const res = await app.inject({ method: 'DELETE', url: '/api/crm/users/1', headers: { cookie } })
     expect(res.statusCode).toBe(400)
+  })
+
+  it('PATCH и DELETE несуществующего пользователя — 404, а не молчаливый ok', async () => {
+    // Без проверки существования оба отвечали {ok:true} и писали в журнал, не изменив
+    // ничего: 0 задетых строк неотличимы от успеха, а админ считал доступ отозванным.
+    // Проверка в асинхронном коде обязана быть под await — на промисе if (!x) не сработает
+    // никогда, и этот тест — единственное, что поймает такую регрессию при слиянии.
+    const patch = await app.inject({ method: 'PATCH', url: '/api/crm/users/999', payload: { name: 'Никто' }, headers: { cookie } })
+    expect(patch.statusCode).toBe(404)
+    const del = await app.inject({ method: 'DELETE', url: '/api/crm/users/999', headers: { cookie } })
+    expect(del.statusCode).toBe(404)
   })
 })
 

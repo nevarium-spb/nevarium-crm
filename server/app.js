@@ -364,7 +364,16 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         // единственного верного значения нет) — прежний, более мягкий путь: за
         // прокси (Caddy/Vite) реальный хост приходит в X-Forwarded-Host.
         const selfHost = req.headers['x-forwarded-host'] || req.headers.host
-        if (new URL(origin).host !== selfHost) return reply.code(403).send({ error: 'forbidden' })
+        // Origin — заголовок клиента, не гарантированно валидный URL: битый Origin
+        // роняет new URL() в исключение, а необработанное исключение внутри preHandler
+        // отдавало бы 500 вместо честного отказа. Не разобрался — не браузер, отказ.
+        let originHost
+        try {
+          originHost = new URL(origin).host
+        } catch {
+          return reply.code(403).send({ error: 'forbidden' })
+        }
+        if (originHost !== selfHost) return reply.code(403).send({ error: 'forbidden' })
       }
     }
     req.user = user
@@ -664,7 +673,10 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       const data = pick(req.body ?? {}, spec)
       if (name === 'deals' && data.stage) {
         if (!STAGES.includes(data.stage)) return reply.code(400).send({ error: 'bad_stage' })
-        data.closed_at = TERMINAL_STAGES.includes(data.stage) ? now() : null
+        // Только при РЕАЛЬНОЙ смене стадии — иначе повторный PATCH тем же значением
+        // (форма редактирования всегда шлёт текущую стадию, даже правя только заметку)
+        // переставлял бы дату закрытия на сейчас, стирая настоящую дату.
+        if (data.stage !== existing.stage) data.closed_at = TERMINAL_STAGES.includes(data.stage) ? now() : null
       }
       if (PROJECT_SCOPED.has(name) && data.project_id !== undefined) {
         const pid = await resolveProjectId(data.project_id)
@@ -1108,6 +1120,12 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   app.patch('/api/crm/users/:id', async (req, reply) => {
     if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
     const id = Number(req.params.id)
+    if (!Number.isInteger(id)) return reply.code(400).send({ error: 'bad_id' })
+    // Существование проверяем ДО записи — иначе несуществующий/битый id молча
+    // отдаёт {ok:true} (0 задетых строк ничем не отличается от успеха), а админ
+    // решает, что пароль сброшен или имя сменилось, хотя на деле ничего не произошло.
+    const existing = await db.prepare('SELECT id, role FROM users WHERE id = ?').get(id)
+    if (!existing) return reply.code(404).send({ error: 'not_found' })
     const { password, name } = req.body ?? {}
     if (password) {
       // Валидация — ДО любой записи. Раньше имя уже уходило в UPDATE, а невалидный
@@ -1116,8 +1134,10 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       // Порог зависит от РОЛИ ЦЕЛИ, не от того, кто меняет пароль: смена пароля
       // существующему админу обязана требовать те же 16 символов, что и создание —
       // иначе минимум обходится через смену пароля после создания слабой учётки.
-      const target = await db.prepare('SELECT role FROM users WHERE id = ?').get(id)
-      const minLen = target?.role === 'admin' ? MIN_ADMIN_PASSWORD_LENGTH : MIN_PASSWORD_LENGTH
+      // Роль берём из уже прочитанной строки existing — отдельный SELECT ровно за тем
+      // же самым был лишним обращением к базе (при SQLite оно стоило почти ничего,
+      // с Postgres это сетевой round-trip на каждую смену пароля).
+      const minLen = existing.role === 'admin' ? MIN_ADMIN_PASSWORD_LENGTH : MIN_PASSWORD_LENGTH
       if (typeof password !== 'string' || password.length < minLen) return reply.code(400).send({ error: 'bad_input' })
     }
     if (name) await db.prepare('UPDATE users SET name = ? WHERE id = ?').run(trim(name, 100), id)
@@ -1132,7 +1152,11 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   app.delete('/api/crm/users/:id', async (req, reply) => {
     if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
     const id = Number(req.params.id)
+    if (!Number.isInteger(id)) return reply.code(400).send({ error: 'bad_id' })
     if (id === req.user.id) return reply.code(400).send({ error: 'cannot_delete_self' })
+    // Как и в PATCH выше: без этой проверки удаление несуществующего id отвечает
+    // {ok:true}, ничего не удалив, — админ считает, что доступ отозван.
+    if (!(await db.prepare('SELECT 1 FROM users WHERE id = ?').get(id))) return reply.code(404).send({ error: 'not_found' })
     await db.prepare('UPDATE users SET token_version = token_version + 1 WHERE id = ?').run(id)
     await db.prepare('DELETE FROM users WHERE id = ?').run(id)
     await audit(req, 'delete', 'users', id)
