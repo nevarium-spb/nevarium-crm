@@ -6,27 +6,32 @@
 
 ## Стек
 
-- **Бэкенд:** Node.js + Fastify + better-sqlite3 (SQLite), авторизация bcrypt + cookie-сессия
+- **Бэкенд:** Node.js + Fastify + `pg` (PostgreSQL), авторизация bcrypt + cookie-сессия
 - **Фронтенд:** React 18 + react-router (Vite), без Tailwind — обычный CSS + токены
-- **Хранение:** SQLite-файл (`data/dev.sqlite`) — на российском VPS законно по 152-ФЗ и просто в бэкапе
+- **Хранение:** управляемый PostgreSQL у российского провайдера (Timeweb) — 152-ФЗ требует
+  хранить ПДн в РФ. Схема — одним файлом `server/schema.sql`, применяется на старте
+  идемпотентно. Раньше был файл SQLite; перевод — ADR-003 «заменено», план в
+  `nevarium-spb/nevarium-lab#3`.
 
 ## Запуск локально
 
 ```bash
 npm install
-node server/dev.js        # бэкенд на :3001 (dev-дефолты: JWT_SECRET, DB_FILE=./data/dev.sqlite)
+# DATABASE_URL обязателен: нужен работающий Postgres, файла-базы «из коробки» больше нет
+DATABASE_URL=postgresql://user:pass@localhost:5432/nevarium_crm node server/dev.js
 npm run dev               # фронтенд на :5173 (проксирует /api на :3001)
 npm run seed-admin        # создать первого администратора (интерактивно)
-npm test                  # 49 тестов (парсер + API)
+npm test                  # 190 тестов: 188 зелёных + 2 намеренно it.skip (см. CLAUDE.md)
 ```
 
 Открыть `http://localhost:5173/` → перекинет на `/crm`.
 
+Тесты Postgres не требуют: они поднимают `pg-mem` (эмулятор в памяти) на каждый тест.
+
 ## Прод
 
-Бэкенд (`server/index.js`) требует `JWT_SECRET` (≥16 симв.) и `DB_FILE`. Готовый деплой —
-в `deploy/` (Dockerfile + docker-compose + Caddyfile, SPA-fallback и HTTPS). Подробности —
-`deploy/README.md`.
+Бэкенд (`server/index.js`) требует `JWT_SECRET` (≥16 симв.) и `DATABASE_URL`. Готовый деплой —
+в `deploy/` (Dockerfile, SPA-fallback и HTTPS). Подробности — `deploy/README.md`.
 
 ## Документы
 

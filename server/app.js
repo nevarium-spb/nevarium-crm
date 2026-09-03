@@ -3,6 +3,7 @@ import Fastify from 'fastify'
 import cookie from '@fastify/cookie'
 import staticPlugin from '@fastify/static'
 import { DEFAULT_PROJECT_ID, DUMP_TABLES, DUMP_VERSION, PD_REQUEST_KINDS, WINBACK_STEPS, addWorkdays, buildDump, openDb, now, STAGES, TERMINAL_STAGES } from './db.js'
+import { withTransaction, resyncIdentitySequence, tryClaimIdempotencyKey } from './db-adapter.js'
 import { hashPassword, verifyPassword, fakeVerifyDelay, verifyOrFake, signToken, verifyToken, reserveVerify, loginSucceeded, sleep, admitLoginRequest, releaseLoginRequest, SESSION_TTL_DAYS, MIN_PASSWORD_LENGTH, MIN_ADMIN_PASSWORD_LENGTH } from './auth.js'
 import { enqueue } from './telegram.js'
 
@@ -37,8 +38,11 @@ const TRUST_PROXY = Number(process.env.TRUST_PROXY_HOPS) || 1
 // путь сравнения с X-Forwarded-Host.
 const APP_ORIGIN = trim(process.env.APP_ORIGIN, 300) || null
 
-export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = true, logger = false, staticDir = null, trustProxy = TRUST_PROXY, appOrigin = APP_ORIGIN } = {}) {
-  const db = openDb(dbFile)
+// dbConfig (было dbFile — SQLite-путь; перевод на Postgres, план в nevarium-lab#3):
+// строка подключения (DATABASE_URL, прод) ИЛИ уже готовый Pool-совместимый объект
+// (тесты — pg-mem). Без аргумента openDb() сама берёт process.env.DATABASE_URL.
+export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true, logger = false, staticDir = null, trustProxy = TRUST_PROXY, appOrigin = APP_ORIGIN } = {}) {
+  const db = await openDb(dbConfig)
   // trustProxy — число доверенных прокси-хопов, НЕ `true`. С `true` Fastify берёт
   // самый левый X-Forwarded-For как req.ip, а его подставляет клиент — тогда всё,
   // что смотрит на req.ip, обманывается сменой заголовка. Безопасность логина от
@@ -156,7 +160,7 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   // заявку — иначе сам сигнал стал бы тем потоком, который призван предотвращать.
   const leadQuotaWarnedAt = new Map()
   /** true — бюджет уведомлений о лидах на проект ещё не исчерпан (можно enqueue). */
-  function leadNotifyBudgetOk(projectId) {
+  async function leadNotifyBudgetOk(projectId) {
     const nowMs = Date.now()
     const list = (leadProjectHits.get(projectId) || []).filter((t) => nowMs - t < LEAD_PROJECT_QUOTA_WINDOW_MS)
     if (list.length >= LEAD_PROJECT_QUOTA_MAX) {
@@ -164,8 +168,8 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       const warnedAt = leadQuotaWarnedAt.get(projectId) || 0
       if (nowMs - warnedAt >= LEAD_PROJECT_QUOTA_WINDOW_MS) {
         leadQuotaWarnedAt.set(projectId, nowMs)
-        const project = db.prepare('SELECT display_name FROM projects WHERE id = ?').get(projectId)
-        enqueue(db, 'text', {
+        const project = await db.prepare('SELECT display_name FROM projects WHERE id = ?').get(projectId)
+        await enqueue(db, 'text', {
           text: [
             '⚠️ <b>Много заявок за час</b>',
             `Проект: ${project?.display_name || projectId}`,
@@ -219,12 +223,14 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
         if (!list.length || nowMs - list[list.length - 1] > HARD_LIMIT_WINDOW_MS) store.delete(ip)
       }
     }
-    try {
-      db.prepare('DELETE FROM idempotency_keys WHERE created_at < ?').run(new Date(nowMs - IDEMPOTENCY_RETENTION_MS).toISOString())
-    } catch {
-      // База может быть уже закрыта при выключении (onClose гонится с последним
-      // тиком интервала) — не роняем процесс из-за фонового обслуживания.
-    }
+    // .run() теперь асинхронный (сетевой запрос к Postgres) — колбэк setInterval
+    // синхронный, дождаться его тут нечем, поэтому .catch() вместо try/catch:
+    // фоновая уборка не обязана блокировать тик, а её ошибку (например, база уже
+    // закрыта при выключении — onClose гонится с последним тиком интервала) нельзя
+    // ронять процессом из-за фонового обслуживания.
+    db.prepare('DELETE FROM idempotency_keys WHERE created_at < ?')
+      .run(new Date(nowMs - IDEMPOTENCY_RETENTION_MS).toISOString())
+      .catch(() => {})
   }, 5 * 60_000)
   leadSweep.unref?.()
   app.addHook('onClose', (_i, done) => {
@@ -238,17 +244,13 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   // обязан вернуть тот же код ответа, а не создать вторую заявку/запрос — для
   // запроса по ПДн дубль это ещё и второй 10-дневный срок по 152-ФЗ.
   //
-  // Осознанно НЕ защищено от гонки между ДВУМЯ ПРОЦЕССАМИ, читающими один и тот же
-  // ключ одновременно (независимая проверка подняла это как отдельный риск): при
-  // истинной многопроцессности оба могли бы пройти idempotencyReplay ДО того, как
-  // любой из них закоммитит, и оба выполнили бы бизнес-запись. В деплое этого
-  // проекта это недостижимо — один контейнер, один процесс Node, better-sqlite3
-  // синхронный (ADR-003: SQLite — однопроцессный писатель по конструкции), и внутри
-  // ОДНОГО процесса JS однопоточный: между idempotencyReplay и записью ключа внутри
-  // db.transaction() нет ни одного await, событийному циклу неоткуда вклиниться со
-  // вторым запросом на той же самой проверке. Добавлять кросс-процессную блокировку
-  // здесь значило бы решать проблему архитектуры, которой в проекте нет и не
-  // планируется (App Platform, 1 контейнер).
+  // Гонка «двое читают один ключ одновременно» БОЛЬШЕ НЕ полагается на однопроцессность
+  // и синхронность: прежний аргумент («better-sqlite3 синхронный, между проверкой и
+  // записью нет ни одного await») перестал быть верным с асинхронным pg, и именно
+  // поэтому механизм переписан на claim-first — ключ застолбляется UNIQUE-индексом в
+  // СУБД ДО бизнес-логики, а не проверяется заранее (см. idempotencyClaim ниже и
+  // tryClaimIdempotencyKey в server/db-adapter.js). Атомарность теперь даёт сама база,
+  // так что защита не зависит ни от числа процессов, ни от порядка выполнения JS.
   // Не обрезаем длинный ключ до 200 символов — два РАЗНЫХ ключа, различающихся только
   // после символа 200, иначе схлопнулись бы в один и потеряли бы одну из отправок.
   // Контракт сайта — UUID (36 символов), 200 уже щедрый запас; ключ длиннее просто
@@ -272,42 +274,76 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   // соразмерно риску, который сам контракт объявляет невозможным. Если это когда-нибудь
   // изменится (сайт начнёт легитимно переиспользовать ключи для разного контента) —
   // это отдельная, согласованная с сайтом смена контракта, не тихий фикс здесь.
-  function idempotencyReplay(scope, requestId) {
-    if (!requestId) return null
-    const row = db.prepare('SELECT status_code FROM idempotency_keys WHERE scope = ? AND request_id = ?').get(scope, requestId)
-    return row ? row.status_code : null
-  }
-  // Пишем только терминальные исходы (200/204/400) — НЕ 429: тот обязан оставаться
-  // повторяемым, застолбить ключ на первом же отказе по лимиту значило бы, что
-  // повтор с тем же ключом навсегда получает 429, даже когда лимит уже снят.
-  function idempotencyRecord(scope, requestId, statusCode) {
-    if (!requestId) return
-    try {
-      db.prepare('INSERT INTO idempotency_keys (scope, request_id, status_code, created_at) VALUES (?, ?, ?, ?)').run(scope, requestId, statusCode, now())
-    } catch (err) {
-      // Ловим ТОЛЬКО ожидаемый UNIQUE-конфликт (параллельный повтор той же логической
-      // отправки уже записал этот ключ первым — наш ответ клиенту всё равно верный).
-      // Любую другую ошибку (диск, повреждение БД) пробрасываем дальше — независимая
-      // проверка нашла: широкий catch{} проглотил бы её молча, и для путей БЕЗ общей
-      // транзакции (honeypot/пустой лид — этот вызов сам по себе, не внутри чужого
-      // db.transaction()) это означало бы «мы решили, что записали ключ, а на самом
-      // деле нет» без единого следа.
-      if (err.code !== 'SQLITE_CONSTRAINT_UNIQUE') throw err
+  //
+  // ПЕРЕВОД НА POSTGRES (план в nevarium-lab#3, раздел «Идемпотентность полагается
+  // на синхронность SQLite»): прежняя пара idempotencyReplay/idempotencyRecord
+  // (check-then-act) была безопасна ТОЛЬКО потому, что между проверкой «ключа ещё
+  // нет» и записью бизнес-данных внутри db.transaction() не было ни одного await —
+  // синхронный однопоточный better-sqlite3 не оставлял событийному циклу шанса
+  // вклиниться вторым запросом на тот же ключ. С асинхронным pg каждый шаг — сетевой
+  // round-trip, окно между «проверил» и «записал» открыто, и два параллельных
+  // запроса с одним Idempotency-Key могли бы оба пройти проверку. Ниже — claim-first:
+  // ключ застолбляется (status_code=NULL) UNIQUE-индексом в БД ДО бизнес-логики,
+  // атомарность даёт сама СУБД, не порядок JS (см. tryClaimIdempotencyKey,
+  // server/db-adapter.js).
+  /**
+   * Застолбить ключ идемпотентности ИЛИ получить ответ на то, что с ним уже
+   * происходит. requestId пустой (заголовок/поле не прислали) — идемпотентность
+   * не участвует вовсе, как и раньше: {claimed:true, id:null}.
+   *
+   * {claimed:true, id} — ключ наш; вызывающий код ОБЯЗАН в конце (успех или явный
+   * терминальный отказ) вызвать idempotencyFinish(id, statusCode), а при настоящей
+   * ошибке (не штатный ранний выход) — idempotencyAbandon(id), иначе ключ навечно
+   * останется занят NULL'ом и будущие повторы с ним будут молотить впустую.
+   *
+   * {claimed:false, statusCode} — ключ уже занят: statusCode не null, если ЧЬЯ-ТО
+   * попытка (эта же логическая отправка, повтор) уже завершилась терминальным
+   * кодом — тот же самый код и надо вернуть. statusCode===null после нескольких
+   * попыток дождаться — конкурентная обработка идёт непривычно долго; 429 — тот же
+   * код, которым сайт уже понимает «не доставлено, повторите с тем же ключом»
+   * (см. hardRateLimited выше), не нужно объяснять новый контракт.
+   */
+  async function idempotencyClaim(scope, requestId) {
+    if (!requestId) return { claimed: true, id: null }
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const claimedId = await tryClaimIdempotencyKey(db, scope, requestId, now())
+      if (claimedId !== null) return { claimed: true, id: claimedId }
+      const row = await db.prepare('SELECT status_code FROM idempotency_keys WHERE scope = ? AND request_id = ?').get(scope, requestId)
+      if (row && row.status_code !== null) return { claimed: false, statusCode: row.status_code }
+      // Ключ занят, но status_code ещё NULL — чужая обработка не успела закончиться.
+      // Короткая пауза и повтор: это простые INSERT/UPDATE, не bcrypt, обычно
+      // укладывается в первую же паузу.
+      await sleep(150)
     }
+    return { claimed: false, statusCode: 429 }
+  }
+  /** Записать финальный код ответа по застолблённому ключу. id===null — идемпотентность
+   * не участвовала (ключ не был прислан) — тихо ничего не делаем. */
+  async function idempotencyFinish(id, statusCode) {
+    if (id == null) return
+    await db.prepare('UPDATE idempotency_keys SET status_code = ? WHERE id = ?').run(statusCode, id)
+  }
+  /** Снять застолбление при настоящей ошибке (не штатный ранний выход) — иначе
+   * ключ висит с status_code=NULL навсегда, и повтор с ним бьётся в 429 без конца. */
+  async function idempotencyAbandon(id) {
+    if (id == null) return
+    await db.prepare('DELETE FROM idempotency_keys WHERE id = ?').run(id).catch(() => {})
   }
 
-  const getUser = (req) => {
+  const getUser = async (req) => {
     const data = verifyToken(req.cookies?.[COOKIE], secret)
     if (!data) return null
-    const user = db.prepare('SELECT id, name, email, role, token_version FROM users WHERE id = ?').get(data.uid)
+    const user = await db.prepare('SELECT id, name, email, role, token_version FROM users WHERE id = ?').get(data.uid)
     if (!user || user.token_version !== data.tv) return null
     return user
   }
 
-  // Auth + Origin-проверка на мутациях для всего /api/crm/*
-  app.addHook('preHandler', (req, reply, done) => {
-    if (!req.url.startsWith('/api/crm/')) return done()
-    const user = getUser(req)
+  // Auth + Origin-проверка на мутациях для всего /api/crm/*. Async-хук вместо
+  // (req, reply, done): getUser теперь сам асинхронный (await до БД) — Fastify
+  // поддерживает async preHandler нативно, встроенный done() здесь просто не нужен.
+  app.addHook('preHandler', async (req, reply) => {
+    if (!req.url.startsWith('/api/crm/')) return
+    const user = await getUser(req)
     if (!user) return reply.code(401).send({ error: 'unauthorized' })
     if (req.method !== 'GET') {
       const origin = req.headers.origin
@@ -332,15 +368,20 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       }
     }
     req.user = user
-    done()
   })
 
   // Пишем и в лог процесса (удобно смотреть вживую), и в таблицу — логи контейнера
   // на App Platform теряются при передеплое, а след нужен для проверки РКН (ADR-011).
-  const audit = (req, action, entity, id, detail = '') => {
+  // runner — по умолчанию пул (db), но принимает tx: вызов ИЗНУТРИ чужой транзакции
+  // (PATCH /api/crm/pd-requests, anonymizeContact) обязан писать НА ТОМ ЖЕ соединении,
+  // что и остальные шаги — иначе (пул выдал бы отдельное соединение под каждый
+  // запрос) запись аудита закоммитилась бы независимо от исхода транзакции, которую
+  // она описывает: полдела отката, полдела нет. У better-sqlite3 (одно соединение
+  // на процесс) это было бесплатной гарантией, у pg — нет, нужно явно.
+  const audit = async (req, action, entity, id, detail = '', runner = db) => {
     app.log?.info?.({ user: req.user?.email, action, entity, id, detail }, 'mutation')
     try {
-      db.prepare('INSERT INTO audit_log (user_id, user_email, action, entity, entity_id, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      await runner.prepare('INSERT INTO audit_log (user_id, user_email, action, entity, entity_id, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
         .run(req.user?.id ?? null, req.user?.email ?? '', action, entity, id ?? null, trim(detail, 500), now())
     } catch (err) {
       // Журнал не должен ломать сам запрос: потерянная строка аудита хуже, чем
@@ -374,11 +415,16 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       // Одинаковость для существующих и несуществующих закрывает оракул: если ждать
       // только на реальных адресах, разница во времени ответа сама выдаёт, какой
       // аккаунт есть.
-      // Пользователя ищем здесь же: поиск синхронный (better-sqlite3), значит остаётся
-      // в том же неразрывном участке. Существующие аккаунты получают корзину в
-      // невытесняемом хранилище — иначе спрей мусорных адресов выбивал бы корзину
-      // владельца и тем самым сбрасывал его лимит.
-      const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email)
+      // Пользователя ищем здесь же — с pg поиск асинхронный (сетевой round-trip),
+      // не синхронный, как было с better-sqlite3, поэтому await ЕСТЬ, до
+      // reserveVerify. Это не открывает ту гонку, от которой была вся эта
+      // синхронность: reserveVerify (auth.js) сам по себе не содержит ни одного
+      // await — его чтение-и-запись счётчика остаётся одним неразрывным тактом
+      // JS, кто бы его ни вызвал и сколько бы запросов ни ждало на await выше.
+      // Существующие аккаунты получают корзину в невытесняемом хранилище — иначе
+      // спрей мусорных адресов выбивал бы корзину владельца и тем самым сбрасывал
+      // его лимит.
+      const user = await db.prepare('SELECT * FROM users WHERE email = ?').get(email)
       const emailWait = reserveVerify(emailKey, { durable: Boolean(user) })
 
       // Ждём свой слот. Отказ ЗДЕСЬ, до какой-либо проверки, был бы плохим: атакующий,
@@ -441,7 +487,7 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   })
 
   app.get('/api/auth/me', async (req, reply) => {
-    const user = getUser(req)
+    const user = await getUser(req)
     if (!user) return reply.code(401).send({ error: 'unauthorized' })
     return { id: user.id, name: user.name, email: user.email, role: user.role }
   })
@@ -469,49 +515,51 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
    * клиентах просто забывают.
    * Повторно серию не создаём: если активная уже есть, значит сделку уже отказывали.
    */
-  function startWinback(dealId, userId, reason = '') {
-    const deal = db.prepare('SELECT contact_id FROM deals WHERE id = ?').get(dealId)
+  async function startWinback(dealId, userId, reason = '') {
+    const deal = await db.prepare('SELECT contact_id FROM deals WHERE id = ?').get(dealId)
     if (!deal) return null
-    const active = db.prepare("SELECT id FROM winback_sequences WHERE deal_id = ? AND status = 'active'").get(dealId)
+    const active = await db.prepare("SELECT id FROM winback_sequences WHERE deal_id = ? AND status = 'active'").get(dealId)
     if (active) return active.id
 
     const ts = now()
-    return db.transaction(() => {
-      const seqId = db
-        .prepare('INSERT INTO winback_sequences (deal_id, contact_id, reason, started_at, created_by) VALUES (?, ?, ?, ?, ?)')
-        .run(dealId, deal.contact_id, trim(reason, 500), ts, userId ?? null).lastInsertRowid
-      const insert = db.prepare(
+    return withTransaction(db.pool, async (tx) => {
+      const seqRes = await tx
+        .prepare('INSERT INTO winback_sequences (deal_id, contact_id, reason, started_at, created_by) VALUES (?, ?, ?, ?, ?) RETURNING id')
+        .run(dealId, deal.contact_id, trim(reason, 500), ts, userId ?? null)
+      const seqId = seqRes.lastInsertRowid
+      const insert = tx.prepare(
         'INSERT INTO tasks (title, contact_id, deal_id, due_date, winback_sequence_id, created_at, updated_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
       )
       for (const step of WINBACK_STEPS) {
-        insert.run(step.title, deal.contact_id, dealId, mskToday(step.days), seqId, ts, ts, userId ?? null)
+        await insert.run(step.title, deal.contact_id, dealId, mskToday(step.days), seqId, ts, ts, userId ?? null)
       }
       return seqId
-    })()
+    })
   }
 
   /**
    * Сделку вернули из «Проиграно» в работу — незакрытые напоминания больше не нужны.
    * Выполненные задачи не трогаем: это уже история работы с клиентом.
    */
-  function cancelWinback(dealId) {
-    const active = db.prepare("SELECT id FROM winback_sequences WHERE deal_id = ? AND status = 'active'").all(dealId)
+  async function cancelWinback(dealId) {
+    const active = await db.prepare("SELECT id FROM winback_sequences WHERE deal_id = ? AND status = 'active'").all(dealId)
     if (!active.length) return 0
-    return db.transaction(() => {
+    return withTransaction(db.pool, async (tx) => {
       let removed = 0
       for (const seq of active) {
-        removed += db.prepare('DELETE FROM tasks WHERE winback_sequence_id = ? AND done = 0').run(seq.id).changes
-        db.prepare("UPDATE winback_sequences SET status = 'cancelled', finished_at = ? WHERE id = ?").run(now(), seq.id)
+        const del = await tx.prepare('DELETE FROM tasks WHERE winback_sequence_id = ? AND done = 0').run(seq.id)
+        removed += del.changes
+        await tx.prepare("UPDATE winback_sequences SET status = 'cancelled', finished_at = ? WHERE id = ?").run(now(), seq.id)
       }
       return removed
-    })()
+    })
   }
 
   /** Проект по origin сайта (см. колонку projects.origins). null — не наш домен. */
-  function projectByOrigin(origin) {
+  async function projectByOrigin(origin) {
     const o = trim(origin, 200).toLowerCase().replace(/\/+$/, '')
     if (!o) return null
-    const rows = db.prepare("SELECT id, slug, display_name, origins FROM projects WHERE archived = 0 AND origins != ''").all()
+    const rows = await db.prepare("SELECT id, slug, display_name, origins FROM projects WHERE archived = 0 AND origins != ''").all()
     return (
       rows.find((p) =>
         p.origins
@@ -528,14 +576,14 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
    * Проект по slug («nevarium1») или числовому id.
    * null — фильтр не запрошен; undefined — запрошен несуществующий проект (→ 400).
    */
-  function resolveProjectId(value) {
+  async function resolveProjectId(value) {
     const raw = trim(value, 100)
     if (!raw || raw === 'all') return null
     const asId = Number(raw)
     const row =
       Number.isInteger(asId) && asId > 0
-        ? db.prepare('SELECT id FROM projects WHERE id = ?').get(asId)
-        : db.prepare('SELECT id FROM projects WHERE slug = ?').get(raw)
+        ? await db.prepare('SELECT id FROM projects WHERE id = ?').get(asId)
+        : await db.prepare('SELECT id FROM projects WHERE slug = ?').get(raw)
     return row ? row.id : undefined
   }
 
@@ -551,10 +599,10 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   for (const [name, spec] of Object.entries(ENTITIES)) {
     app.get(`/api/crm/${name}`, async (req, reply) => {
       const q = trim(req.query?.q, 100).toLowerCase()
-      const projectId = resolveProjectId(req.query?.project)
+      const projectId = await resolveProjectId(req.query?.project)
       if (projectId === undefined) return reply.code(400).send({ error: 'unknown_project' })
       const scoped = projectId !== null && PROJECT_SCOPED.has(name)
-      let rows = db
+      let rows = await db
         .prepare(
           `SELECT * FROM ${name} ${scoped ? 'WHERE project_id = ?' : ''} ORDER BY updated_at DESC LIMIT ${LIST_SCAN_LIMIT}`
         )
@@ -570,12 +618,12 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       if (name === 'deals' && data.stage && !STAGES.includes(data.stage)) return reply.code(400).send({ error: 'bad_stage' })
       if (PROJECT_SCOPED.has(name)) {
         if (data.project_id !== undefined) {
-          const pid = resolveProjectId(data.project_id)
+          const pid = await resolveProjectId(data.project_id)
           if (!pid) return reply.code(400).send({ error: 'bad_project' })
           data.project_id = pid
         } else if (name === 'deals') {
           // сделка наследует проект своего контакта — чтобы они не разъехались
-          const owner = db.prepare('SELECT project_id FROM contacts WHERE id = ?').get(data.contact_id)
+          const owner = await db.prepare('SELECT project_id FROM contacts WHERE id = ?').get(data.contact_id)
           if (owner) data.project_id = owner.project_id
         }
       }
@@ -584,31 +632,31 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       // предупреждение о дубликате контакта по телефону/email
       let duplicateOf = null
       if (name === 'contacts' && (data.phone || data.email)) {
-        const dup = db
+        const dup = await db
           .prepare("SELECT id, name FROM contacts WHERE archived = 0 AND ((phone != '' AND phone = ?) OR (email != '' AND email = ?)) LIMIT 1")
           .get(data.phone ?? '', data.email ?? '')
         if (dup) duplicateOf = dup
       }
       const cols = Object.keys(data)
       const stmt = db.prepare(
-        `INSERT INTO ${name} (${cols.join(',')}, created_at, updated_at, created_by) VALUES (${cols.map(() => '?').join(',')}, ?, ?, ?)`
+        `INSERT INTO ${name} (${cols.join(',')}, created_at, updated_at, created_by) VALUES (${cols.map(() => '?').join(',')}, ?, ?, ?) RETURNING id`
       )
       let info
       try {
-        info = stmt.run(...cols.map((c) => data[c]), ts, ts, req.user.id)
+        info = await stmt.run(...cols.map((c) => data[c]), ts, ts, req.user.id)
       } catch (err) {
-        if (String(err).includes('FOREIGN KEY')) return reply.code(400).send({ error: 'bad_reference' })
+        if (String(err).includes('foreign key') || err.code === '23503') return reply.code(400).send({ error: 'bad_reference' })
         throw err
       }
-      audit(req, 'create', name, info.lastInsertRowid)
-      const row = db.prepare(`SELECT * FROM ${name} WHERE id = ?`).get(info.lastInsertRowid)
+      await audit(req, 'create', name, info.lastInsertRowid)
+      const row = await db.prepare(`SELECT * FROM ${name} WHERE id = ?`).get(info.lastInsertRowid)
       return { item: row, duplicateOf }
     })
 
     app.patch(`/api/crm/${name}/:id`, async (req, reply) => {
       const id = Number(req.params.id)
       if (!Number.isInteger(id)) return reply.code(400).send({ error: 'bad_id' })
-      const existing = db.prepare(`SELECT * FROM ${name} WHERE id = ?`).get(id)
+      const existing = await db.prepare(`SELECT * FROM ${name} WHERE id = ?`).get(id)
       if (!existing) return reply.code(404).send({ error: 'not_found' })
       const expected = req.body?.expectedUpdatedAt
       if (expected && expected !== existing.updated_at)
@@ -619,38 +667,38 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
         data.closed_at = TERMINAL_STAGES.includes(data.stage) ? now() : null
       }
       if (PROJECT_SCOPED.has(name) && data.project_id !== undefined) {
-        const pid = resolveProjectId(data.project_id)
+        const pid = await resolveProjectId(data.project_id)
         if (!pid) return reply.code(400).send({ error: 'bad_project' })
         data.project_id = pid
       }
       if (name === 'tasks' && data.done !== undefined) data.done_at = data.done ? now() : null
       const cols = Object.keys(data)
       if (!cols.length) return { item: existing }
-      db.prepare(
+      await db.prepare(
         `UPDATE ${name} SET ${cols.map((c) => `${c} = @${c}`).join(', ')}, updated_at = @updated_at WHERE id = @id`
       ).run({ ...data, updated_at: now(), id })
-      audit(req, 'update', name, id)
+      await audit(req, 'update', name, id)
 
       // Воронка возврата — только на смене стадии сделки, и только когда стадия
       // действительно поменялась (повторный PATCH тем же значением ничего не заводит).
       let winback = null
       if (name === 'deals' && data.stage && data.stage !== existing.stage) {
         if (data.stage === LOST_STAGE) {
-          const seqId = startWinback(id, req.user.id, req.body?.lostReason)
+          const seqId = await startWinback(id, req.user.id, req.body?.lostReason)
           if (seqId) winback = { started: true, tasks: WINBACK_STEPS.length }
         } else if (existing.stage === LOST_STAGE) {
-          const removed = cancelWinback(id)
+          const removed = await cancelWinback(id)
           if (removed) winback = { cancelled: true, tasks: removed }
         }
       }
-      return { item: db.prepare(`SELECT * FROM ${name} WHERE id = ?`).get(id), winback }
+      return { item: await db.prepare(`SELECT * FROM ${name} WHERE id = ?`).get(id), winback }
     })
 
     app.delete(`/api/crm/${name}/:id`, async (req, reply) => {
       const id = Number(req.params.id)
       if (!Number.isInteger(id)) return reply.code(400).send({ error: 'bad_id' })
       if (name === 'contacts') {
-        const deals = db.prepare('SELECT COUNT(*) c FROM deals WHERE contact_id = ?').get(id).c
+        const deals = (await db.prepare('SELECT COUNT(*) c FROM deals WHERE contact_id = ?').get(id)).c
         if (deals > 0) return reply.code(409).send({ error: 'has_deals', hint: 'архивируйте контакт' })
       }
       // Вся цепочка удаления — ОДНОЙ транзакцией (независимая проверка, раунд 26):
@@ -658,13 +706,13 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       // прерывание процесса) мог оставить контакт удалённым, а его consents — нет
       // (или наоборот), то есть ровно ту частичную запись, от которой транзакции
       // в этом файле обычно и защищают.
-      db.transaction(() => {
+      await withTransaction(db.pool, async (tx) => {
         if (name === 'contacts') {
           // phone/email/messenger читаем ДО удаления строки — нужны ниже, чтобы найти
           // осиротевшие legacy-восстановлением слепки согласия того же человека.
-          const c = db.prepare('SELECT phone, email, messenger, project_id FROM contacts WHERE id = ?').get(id)
-          db.prepare('DELETE FROM tasks WHERE contact_id = ?').run(id)
-          db.prepare('DELETE FROM interactions WHERE contact_id = ?').run(id)
+          const c = await tx.prepare('SELECT phone, email, messenger, project_id FROM contacts WHERE id = ?').get(id)
+          await tx.prepare('DELETE FROM tasks WHERE contact_id = ?').run(id)
+          await tx.prepare('DELETE FROM interactions WHERE contact_id = ?').run(id)
           // Слепки согласия (независимая проверка, раунд 22): в отличие от анонимизации
           // (anonymizeContact сохраняет обезличенный след), обычное удаление контакта —
           // это «эту карточку не стоило заводить» (спам, ошибка), а не исполнение права
@@ -673,32 +721,34 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
           // и как раз тот путь, которым сотрудник мог бы попытаться почистить массовый
           // спам, тихо не подчищая ПДн из consents. Удаляем целиком, тем же приёмом,
           // что tasks/interactions строкой выше.
-          db.prepare('DELETE FROM consents WHERE contact_id = ?').run(id)
+          await tx.prepare('DELETE FROM consents WHERE contact_id = ?').run(id)
           // Осиротевшие legacy-восстановлением строки того же человека (contact_id уже
           // NULL — независимая проверка, раунд 23: тот же класс пропуска, что нашли в
           // anonymizeContact раундом 21, но в этом отдельном пути удаления). orphanedConsentIds
           // (определена ниже по файлу у phoneKey, но доступна здесь — function-декларация
           // поднимается в область видимости buildApp) — С НОРМАЛИЗАЦИЕЙ ТЕЛЕФОНА, не точным
           // совпадением строк (раунд 25: «+7 921…» и «89215551488» иначе не совпали бы).
-          const orphanIds = c ? orphanedConsentIds(c.project_id, [c.phone, c.email, c.messenger]) : []
+          // ВНУТРИ транзакции: orphanedConsentIds принимает queryable (tx), чтобы искать
+          // и удалять кандидатов на ТОМ ЖЕ соединении, что и остальная транзакция.
+          const orphanIds = c ? await orphanedConsentIds(tx, c.project_id, [c.phone, c.email, c.messenger]) : []
           if (orphanIds.length) {
             const marks = orphanIds.map(() => '?').join(',')
-            db.prepare(`DELETE FROM consents WHERE id IN (${marks})`).run(...orphanIds)
+            await tx.prepare(`DELETE FROM consents WHERE id IN (${marks})`).run(...orphanIds)
           }
         }
         if (name === 'deals') {
           // Серии возврата ссылаются на сделку внешним ключом — без этой уборки
           // удаление сделки упало бы на FOREIGN KEY.
-          db.prepare('DELETE FROM tasks WHERE winback_sequence_id IN (SELECT id FROM winback_sequences WHERE deal_id = ?)').run(id)
-          db.prepare('DELETE FROM winback_sequences WHERE deal_id = ?').run(id)
-          db.prepare('UPDATE tasks SET deal_id = NULL WHERE deal_id = ?').run(id)
+          await tx.prepare('DELETE FROM tasks WHERE winback_sequence_id IN (SELECT id FROM winback_sequences WHERE deal_id = ?)').run(id)
+          await tx.prepare('DELETE FROM winback_sequences WHERE deal_id = ?').run(id)
+          await tx.prepare('UPDATE tasks SET deal_id = NULL WHERE deal_id = ?').run(id)
           // Согласие живёт независимо от сделки (contact_id — основная связь) — только
           // рвём ставшую невалидной ссылку, тем же приёмом, что и у tasks.deal_id выше.
-          db.prepare('UPDATE consents SET deal_id = NULL WHERE deal_id = ?').run(id)
+          await tx.prepare('UPDATE consents SET deal_id = NULL WHERE deal_id = ?').run(id)
         }
-        db.prepare(`DELETE FROM ${name} WHERE id = ?`).run(id)
-      })()
-      audit(req, 'delete', name, id)
+        await tx.prepare(`DELETE FROM ${name} WHERE id = ?`).run(id)
+      })
+      await audit(req, 'delete', name, id)
       return { ok: true }
     })
   }
@@ -706,21 +756,25 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   app.get('/api/crm/contacts/:id', async (req, reply) => {
     const id = Number(req.params.id)
     if (!Number.isInteger(id)) return reply.code(400).send({ error: 'bad_id' })
-    const contact = db.prepare('SELECT * FROM contacts WHERE id = ?').get(id)
+    const contact = await db.prepare('SELECT * FROM contacts WHERE id = ?').get(id)
     if (!contact) return reply.code(404).send({ error: 'not_found' })
-    return {
-      contact,
-      deals: db.prepare('SELECT * FROM deals WHERE contact_id = ? ORDER BY updated_at DESC').all(id),
-      tasks: db.prepare('SELECT * FROM tasks WHERE contact_id = ? ORDER BY done, due_date').all(id),
-      interactions: db.prepare('SELECT * FROM interactions WHERE contact_id = ? ORDER BY happened_at DESC LIMIT 200').all(id),
-    }
+    // Три запроса независимы — Promise.all, а не последовательные await: с pg
+    // каждый await это сетевой round-trip (у better-sqlite3 они были бесплатны),
+    // и подряд они складывались бы в тройную задержку открытия карточки. Тот же
+    // приём, что уже применён к дашборду ниже.
+    const [deals, tasks, interactions] = await Promise.all([
+      db.prepare('SELECT * FROM deals WHERE contact_id = ? ORDER BY updated_at DESC').all(id),
+      db.prepare('SELECT * FROM tasks WHERE contact_id = ? ORDER BY done, due_date').all(id),
+      db.prepare('SELECT * FROM interactions WHERE contact_id = ? ORDER BY happened_at DESC LIMIT 200').all(id),
+    ])
+    return { contact, deals, tasks, interactions }
   })
 
   // ---------- проекты ----------
   // Только чтение: проекты заводятся миграцией. Удаление через API не даём —
   // осиротевшие контакты выпали бы из отфильтрованного инбокса.
   app.get('/api/crm/projects', async () => ({
-    items: db.prepare('SELECT id, slug, display_name, archived FROM projects WHERE archived = 0 ORDER BY id').all(),
+    items: await db.prepare('SELECT id, slug, display_name, archived FROM projects WHERE archived = 0 ORDER BY id').all(),
   }))
 
   // ---------- dashboard (агрегаты, время МСК) ----------
@@ -738,7 +792,7 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     // _now: только для тестов границы суток МСК; в проде игнорируется
     const nowMs = Number(req.query?._now) || Date.now()
     const today = mskToday(0, nowMs)
-    const pid = resolveProjectId(req.query?.project)
+    const pid = await resolveProjectId(req.query?.project)
     if (pid === undefined) return reply.code(400).send({ error: 'unknown_project' })
     const pf = (sql) => (pid ? sql : '') // фрагмент включается только при фильтре
     const arg = pid ? [pid] : []
@@ -746,21 +800,38 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     const coolingBefore = new Date(nowMs - COOLING_DAYS * 864e5).toISOString()
 
     const termMarks = TERMINAL_STAGES.map(() => '?').join(',')
-    const open = db
-      .prepare(`SELECT stage, COUNT(*) n, SUM(COALESCE(amount,0)) sum, SUM(amount IS NULL) noAmount FROM deals WHERE stage NOT IN (${termMarks}) ${pf('AND project_id = ?')} GROUP BY stage`)
-      .all(...TERMINAL_STAGES, ...arg)
-    const closed = db
-      .prepare(`SELECT stage, COUNT(*) n, SUM(COALESCE(amount,0)) sum FROM deals WHERE stage IN (${termMarks}) ${pf('AND project_id = ?')} GROUP BY stage`)
-      .all(...TERMINAL_STAGES, ...arg)
-
-    return {
-      today,
-      projectId: pid,
-      inbox: db
+    // Независимые запросы — параллельно (Promise.all), не последовательно: ни один
+    // не зависит от результата другого, а сетевой round-trip к pg не бесплатен —
+    // 10 запросов подряд ждать было бы вдесятеро дольше, чем дождаться их разом.
+    const [open, closed, inbox, tasksToday, cooling, activity, contactsCount, dealsCount, overdueCount, byProject, bySource] = await Promise.all([
+      db
+        // SUM(amount IS NULL) полагался на неявное bool→int SQLite — Postgres так не
+        // умеет (SUM принимает только числовые типы, boolean не приводится сама).
+        // Явный ::int делает то же самое портируемо.
+        // NOT (stage IN (...)), не `stage NOT IN (...)`: семантически то же самое, но
+        // обходит баг pg-mem (используется в тестах) — `NOT IN` на ИНДЕКСИРОВАННОЙ
+        // текстовой колонке (idx_deals_stage, schema.sql) падает у него с внутренней
+        // ошибкой в BIndex.nin (не баг реального Postgres, там оба варианта identичны).
+        // Алиас noAmount В КАВЫЧКАХ — не косметика: Postgres складывает неквотированные
+        // идентификаторы в нижний регистр, и строка возвращалась с ключом `noamount`,
+        // тогда как фронт читает `f.noAmount` (src/crm/pages/Dashboard.jsx) — приписка
+        // «(+N без суммы)» в воронке молча исчезала. SQLite регистр алиаса сохранял,
+        // поэтому до перевода это работало. Единственный camelCase-алиас в файле.
+        .prepare(`SELECT stage, COUNT(*) n, SUM(COALESCE(amount,0)) sum, SUM((amount IS NULL)::int) "noAmount" FROM deals WHERE NOT (stage IN (${termMarks})) ${pf('AND project_id = ?')} GROUP BY stage`)
+        .all(...TERMINAL_STAGES, ...arg),
+      db
+        .prepare(`SELECT stage, COUNT(*) n, SUM(COALESCE(amount,0)) sum FROM deals WHERE stage IN (${termMarks}) ${pf('AND project_id = ?')} GROUP BY stage`)
+        .all(...TERMINAL_STAGES, ...arg),
+      db
         .prepare(`SELECT c.*, d.title deal_title, d.id deal_id FROM contacts c LEFT JOIN deals d ON d.contact_id = c.id AND d.stage = 'Новый' WHERE c.source IN ('site-form','site-chat') AND c.archived = 0 ${pf('AND c.project_id = ?')} ORDER BY c.created_at DESC LIMIT 8`)
         .all(...arg),
-      tasksToday: db
-        .prepare(`SELECT t.*, c.name contact_name FROM tasks t LEFT JOIN contacts c ON c.id = t.contact_id WHERE t.done = 0 AND t.due_date IS NOT NULL AND t.due_date <= ? ${pf('AND (t.contact_id IS NULL OR c.project_id = ?)')} ORDER BY t.due_date LIMIT 20`)
+      db
+        // Без явного IS NOT NULL: `due_date <= ?` для NULL уже даёт NULL (не TRUE),
+        // WHERE такую строку и так исключает — условие было избыточным. Заодно
+        // обходит баг pg-mem (тесты): `IS NOT NULL AND <=` на индексированной
+        // колонке (idx_tasks_due) вместе давали пустой результат при непустых данных —
+        // подтверждено изолированной репродукцией, реальный Postgres так не делает.
+        .prepare(`SELECT t.*, c.name contact_name FROM tasks t LEFT JOIN contacts c ON c.id = t.contact_id WHERE t.done = 0 AND t.due_date <= ? ${pf('AND (t.contact_id IS NULL OR c.project_id = ?)')} ORDER BY t.due_date LIMIT 20`)
         .all(today, ...arg),
       // «Остывают»: живые сделки, по которым давно ничего не происходило. Точка отсчёта —
       // последнее взаимодействие, а если их не было ни одного, то создание сделки.
@@ -768,45 +839,75 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       // договорились — иначе блок быстро превратился бы в шум, который перестают читать.
       // Обезличенные контакты исключены: человек потребовал прекратить обработку,
       // напоминать о нём нельзя (ADR-011).
-      cooling: db
+      // Переписано под перевод на Postgres — исходный вариант (JOIN interactions +
+      // GROUP BY + HAVING на агрегате) синтаксически корректен и для Postgres, но
+      // тестовый движок pg-mem не тянет эту связку сразу по трём независимым
+      // причинам (подтверждено изолированной репродукцией на каждой): агрегат в
+      // HAVING через алиас не резолвится (Postgres, в отличие от SQLite, вообще не
+      // резолвит алиасы SELECT-списка в HAVING — это была бы правка в любом случае);
+      // HAVING с COALESCE(MAX(...), ...) целиком не поддержан («AST parts have not
+      // been read»); коррелированный NOT EXISTS/скалярный подзапрос вместе с GROUP BY
+      // по колонке из JOIN даёт ложное «column "c.id" does not exist». Ниже —
+      // агрегация вынесена в НЕКОРРЕЛИРОВАННУЮ производную таблицу (li), внешний
+      // запрос — обычный JOIN без GROUP BY/HAVING вообще: обходит все три места разом
+      // и остаётся стандартным, портируемым SQL.
+      db
         .prepare(`SELECT d.id, d.title, d.stage, d.amount, d.created_at, d.project_id, c.id contact_id, c.name contact_name, c.source,
-            COALESCE(MAX(i.happened_at), d.created_at) last_touch,
-            MAX(i.happened_at) IS NULL no_touch
+            COALESCE(li.last_happened, d.created_at) last_touch,
+            (li.last_happened IS NULL)::int no_touch
           FROM deals d
           JOIN contacts c ON c.id = d.contact_id
-          LEFT JOIN interactions i ON i.contact_id = c.id
-          WHERE d.stage NOT IN (${termMarks})
+          LEFT JOIN (SELECT contact_id, MAX(happened_at) last_happened FROM interactions GROUP BY contact_id) li ON li.contact_id = c.id
+          LEFT JOIN tasks ot ON ot.contact_id = c.id AND ot.done = 0
+          WHERE NOT (d.stage IN (${termMarks}))
             AND c.archived = 0
             AND c.anonymized_at IS NULL
-            AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.contact_id = c.id AND t.done = 0)
+            AND ot.id IS NULL
+            AND COALESCE(li.last_happened, d.created_at) < ?
             ${pf('AND d.project_id = ?')}
-          GROUP BY d.id
-          HAVING last_touch < ?
           ORDER BY last_touch
           LIMIT 8`)
-        .all(...TERMINAL_STAGES, ...arg, coolingBefore),
+        .all(...TERMINAL_STAGES, coolingBefore, ...arg),
+      db
+        .prepare(`SELECT i.*, c.name contact_name, u.name user_name FROM interactions i LEFT JOIN contacts c ON c.id = i.contact_id LEFT JOIN users u ON u.id = i.created_by ${pf('WHERE c.project_id = ?')} ORDER BY i.happened_at DESC LIMIT 10`)
+        .all(...arg),
+      db.prepare(`SELECT COUNT(*) c FROM contacts WHERE archived = 0 ${pf('AND project_id = ?')}`).get(...arg),
+      db.prepare(`SELECT COUNT(*) c FROM deals ${pid ? 'WHERE project_id = ?' : ''}`).get(...arg),
+      db
+        .prepare(`SELECT COUNT(*) c FROM tasks t LEFT JOIN contacts c2 ON c2.id = t.contact_id WHERE t.done = 0 AND t.due_date < ? ${pf('AND (t.contact_id IS NULL OR c2.project_id = ?)')}`)
+        .get(today, ...arg),
+      // Аналитика: сколько заявок пришло за период и откуда.
+      db
+        // GROUP BY p.id, p.display_name — не только p.id: реальный Postgres разрешил бы
+        // и одно p.id (functional dependency на PK), но pg-mem (тесты) эту оптимизацию
+        // не реализует и молча отдаёт NULL вместо display_name — подтверждено
+        // изолированной репродукцией. Явное перечисление — валидный SQL в обоих случаях.
+        .prepare(`SELECT p.id, p.display_name name, COUNT(*) n FROM contacts c JOIN projects p ON p.id = c.project_id WHERE c.created_at >= ? AND c.archived = 0 ${pf('AND c.project_id = ?')} GROUP BY p.id, p.display_name ORDER BY n DESC`)
+        .all(since, ...arg),
+      db
+        .prepare(`SELECT source, COUNT(*) n FROM contacts WHERE created_at >= ? AND archived = 0 ${pf('AND project_id = ?')} GROUP BY source ORDER BY n DESC`)
+        .all(since, ...arg),
+    ])
+
+    return {
+      today,
+      projectId: pid,
+      inbox,
+      tasksToday,
+      cooling,
       coolingDays: COOLING_DAYS,
       funnel: STAGES.filter((s) => !TERMINAL_STAGES.includes(s)).map((s) => open.find((r) => r.stage === s) || { stage: s, n: 0, sum: 0, noAmount: 0 }),
       terminal: TERMINAL_STAGES.map((s) => closed.find((r) => r.stage === s) || { stage: s, n: 0, sum: 0 }),
-      activity: db
-        .prepare(`SELECT i.*, c.name contact_name, u.name user_name FROM interactions i LEFT JOIN contacts c ON c.id = i.contact_id LEFT JOIN users u ON u.id = i.created_by ${pf('WHERE c.project_id = ?')} ORDER BY i.happened_at DESC LIMIT 10`)
-        .all(...arg),
+      activity,
       counts: {
-        contacts: db.prepare(`SELECT COUNT(*) c FROM contacts WHERE archived = 0 ${pf('AND project_id = ?')}`).get(...arg).c,
-        deals: db.prepare(`SELECT COUNT(*) c FROM deals ${pid ? 'WHERE project_id = ?' : ''}`).get(...arg).c,
-        overdue: db
-          .prepare(`SELECT COUNT(*) c FROM tasks t LEFT JOIN contacts c2 ON c2.id = t.contact_id WHERE t.done = 0 AND t.due_date < ? ${pf('AND (t.contact_id IS NULL OR c2.project_id = ?)')}`)
-          .get(today, ...arg).c,
+        contacts: contactsCount.c,
+        deals: dealsCount.c,
+        overdue: overdueCount.c,
       },
-      // Аналитика: сколько заявок пришло за период и откуда.
       stats: {
         days: STATS_DAYS,
-        byProject: db
-          .prepare(`SELECT p.id, p.display_name name, COUNT(*) n FROM contacts c JOIN projects p ON p.id = c.project_id WHERE c.created_at >= ? AND c.archived = 0 ${pf('AND c.project_id = ?')} GROUP BY p.id ORDER BY n DESC`)
-          .all(since, ...arg),
-        bySource: db
-          .prepare(`SELECT source, COUNT(*) n FROM contacts WHERE created_at >= ? AND archived = 0 ${pf('AND project_id = ?')} GROUP BY source ORDER BY n DESC`)
-          .all(since, ...arg),
+        byProject,
+        bySource,
       },
     }
   })
@@ -818,7 +919,7 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   // всех клиентских данных и почт команды.
   app.get('/api/crm/export', async (req, reply) => {
     if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
-    return buildDump(db)
+    return await buildDump(db)
   })
 
   app.post('/api/crm/import', async (req, reply) => {
@@ -852,13 +953,17 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
         : new Set([...ENTITIES[n].fields, ...(EXTRA_COLS[n] ?? []), 'demo', 'created_at', 'updated_at', 'created_by'])
     const counts = {}
     try {
-      db.transaction(() => {
-        // winback_sequences ссылается на deals и contacts НАСТОЯЩИМ внешним ключом и в
-        // дамп не входит — без этой очистки его строки блокируют `DELETE FROM deals`
-        // и импорт падает с «FOREIGN KEY constraint failed» на любой базе, где хоть
-        // одна сделка проигрывалась. Серии восстановлению не подлежат: они выводятся
-        // из стадии сделки, а стадия в дампе есть.
-        db.prepare('DELETE FROM winback_sequences').run()
+      await withTransaction(db.pool, async (tx) => {
+        // winback_sequences в дамп не входит и восстановлению не подлежит (серии
+        // выводятся из стадии сделки, а стадия в дампе есть) — очищаем безусловно,
+        // но НЕ прямо здесь: у неё теперь ДВЕ настоящих FK-связи в обе стороны
+        // (перевод на Postgres, schema.sql — в SQLite обеих не было, только
+        // ограничение платформы, не решение). tasks.winback_sequence_id ссылается
+        // НА winback_sequences (значит удалять её раньше tasks нельзя — навесить
+        // «DELETE раньше» здесь уронило бы импорт на FK), а winback_sequences.deal_id/
+        // contact_id ссылаются на deals/contacts (значит удалять её позже них тоже
+        // нельзя). Единственное окно — СТРОГО между удалением tasks и удалением
+        // deals/contacts, поэтому команда вклинена в сам цикл ниже, а не стоит особняком.
         // idempotency_keys тоже вне дампа и тоже чистится безусловно (независимая
         // проверка поймала риск: ОСТАВШИЙСЯ старый ключ после импорта более раннего
         // бэкапа ссылался бы на заявку/запрос, которых после restore уже нет — повтор
@@ -866,7 +971,7 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
         // воссоздал бы пропавшую запись — тихая потеря данных именно в момент
         // восстановления, худшее время для этого). Ключи короткоживущие по смыслу
         // (окно ретраев формы — секунды-минуты), восстанавливать их из бэкапа не нужно.
-        db.prepare('DELETE FROM idempotency_keys').run()
+        await tx.prepare('DELETE FROM idempotency_keys').run()
         // Таблицы восстанавливаем те, что есть в дампе: из старого файла (v1)
         // запросы ПДн и журнал не придут, и стирать существующие мы не станем.
         // consents младше даже pd_requests: дамп может иметь pd_requests (hasCompliance),
@@ -877,7 +982,13 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
         const hasConsents = Array.isArray(data.consents)
         const tables = (hasCompliance ? DUMP_TABLES : ENTITY_NAMES).filter((n) => n !== 'consents' || hasConsents)
         // удаляем детей раньше родителей (FK), вставляем в прямом порядке
-        for (const n of [...tables].reverse()) db.prepare(`DELETE FROM ${n}`).run()
+        for (const n of [...tables].reverse()) {
+          await tx.prepare(`DELETE FROM ${n}`).run()
+          // См. комментарий у DELETE FROM winback_sequences выше — единственное
+          // окно, где обе её FK-связи довольны: tasks уже пусты, deals/contacts
+          // ещё нет.
+          if (n === 'tasks') await tx.prepare('DELETE FROM winback_sequences').run()
+        }
         for (const n of tables) {
           const rows = data[n] || []
           const allowed = allowedCols(n)
@@ -895,12 +1006,19 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
             const sig = cols.join(',')
             let stmt = stmtCache.get(sig)
             if (!stmt) {
-              stmt = db.prepare(`INSERT INTO ${n} (id, ${sig}) VALUES (@id, ${cols.map((c) => '@' + c).join(',')})`)
+              stmt = tx.prepare(`INSERT INTO ${n} (id, ${sig}) VALUES (@id, ${cols.map((c) => '@' + c).join(',')})`)
               stmtCache.set(sig, stmt)
             }
-            stmt.run(row)
+            await stmt.run(row)
           }
           counts[n] = rows.length
+          // Явная вставка id НЕ продвигает identity-последовательность сама (см.
+          // schema.sql, преамбула, и resyncIdentitySequence в db-adapter.js) — без
+          // этого следующий органический INSERT в эту таблицу рано или поздно
+          // столкнётся с уже занятым восстановленным id. Только для таблиц, где
+          // явный id вообще был вставлен (пустой rows — нечего резинхронизировать,
+          // и нет риска гонки с уже идущей вставкой без явного id).
+          if (rows.length) await resyncIdentitySequence(tx, n)
         }
         // Старый дамп (v1) запросов ПДн не содержит: существующие оставляем как
         // юридический след, но привязку к контакту рвём — контакты только что
@@ -914,10 +1032,10 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
         // другому человеку/сделке с тем же id. Согласие как факт остаётся читаемым
         // (version/text/accepted_at никуда не делись) — рвём только привязку.
         if (!hasConsents) {
-          db.prepare('UPDATE consents SET contact_id = NULL, deal_id = NULL WHERE contact_id IS NOT NULL OR deal_id IS NOT NULL').run()
+          await tx.prepare('UPDATE consents SET contact_id = NULL, deal_id = NULL WHERE contact_id IS NOT NULL OR deal_id IS NOT NULL').run()
         }
         if (!hasCompliance) {
-          db.prepare('UPDATE pd_requests SET contact_id = NULL, updated_at = ? WHERE contact_id IS NOT NULL').run(now())
+          await tx.prepare('UPDATE pd_requests SET contact_id = NULL, updated_at = ? WHERE contact_id IS NOT NULL').run(now())
         } else if (!(data.pd_requests ?? []).some((r) => Object.prototype.hasOwnProperty.call(r, 'verified_at'))) {
           // Бэкфилл — ТОЛЬКО если verified_at ОТСУТСТВУЕТ как ключ у ВСЕХ строк дампа
           // (значит дамп снят до появления этой колонки). hasOwnProperty проверяет
@@ -937,22 +1055,24 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
           // существовать) дамп мог быть текущего формата с уже вырезанным ключом
           // verified_at (см. тест) — тогда status='pending_unverified' у публичного
           // запроса уже стоит, и «!= 'new'» ошибочно засчитал бы его закрытым.
-          db.prepare(`UPDATE pd_requests SET verified_at = COALESCE(resolved_at, created_at)
+          await tx.prepare(`UPDATE pd_requests SET verified_at = COALESCE(resolved_at, created_at)
             WHERE verified_at IS NULL AND (source = 'manual' OR status IN ('done', 'rejected'))`).run()
-          db.prepare(`UPDATE pd_requests SET status = 'pending_unverified'
-            WHERE verified_at IS NULL AND source != 'manual' AND status NOT IN ('done', 'rejected')`).run()
+          // NOT (status IN (...)) — та же обходка бага pg-mem в BIndex.nin на
+          // индексированной колонке, что и у stage выше (idx_pd_open начинается с status).
+          await tx.prepare(`UPDATE pd_requests SET status = 'pending_unverified'
+            WHERE verified_at IS NULL AND source != 'manual' AND NOT (status IN ('done', 'rejected'))`).run()
         }
-      })()
+      })
     } catch (err) {
       return reply.code(400).send({ error: 'bad_file', detail: String(err) })
     }
-    audit(req, 'import', 'all', 0)
+    await audit(req, 'import', 'all', 0)
     return { ok: true, counts }
   })
 
   app.get('/api/crm/contacts.csv', async (req, reply) => {
     if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
-    const rows = db.prepare('SELECT name, company, phone, email, messenger, source FROM contacts WHERE archived = 0 AND demo = 0 ORDER BY name').all()
+    const rows = await db.prepare('SELECT name, company, phone, email, messenger, source FROM contacts WHERE archived = 0 AND demo = 0 ORDER BY name').all()
     const esc = (v) => {
       let s = String(v ?? '')
       // защита от формул: имена приходят с публичной формы, Excel исполняет =/+/-/@
@@ -966,7 +1086,7 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
 
   // ---------- пользователи (admin) ----------
   app.get('/api/crm/users', async (req) =>
-    ({ items: db.prepare('SELECT id, name, email, role, created_at FROM users').all() }))
+    ({ items: await db.prepare('SELECT id, name, email, role, created_at FROM users').all() }))
 
   app.post('/api/crm/users', async (req, reply) => {
     if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
@@ -977,8 +1097,8 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     const minLen = newRole === 'admin' ? MIN_ADMIN_PASSWORD_LENGTH : MIN_PASSWORD_LENGTH
     if (!name || !email || !password || password.length < minLen) return reply.code(400).send({ error: 'bad_input' })
     try {
-      const info = db.prepare('INSERT INTO users (name, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)').run(trim(name, 100), trim(email, 200).toLowerCase(), await hashPassword(password), newRole, now())
-      audit(req, 'create', 'users', info.lastInsertRowid)
+      const info = await db.prepare('INSERT INTO users (name, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id').run(trim(name, 100), trim(email, 200).toLowerCase(), await hashPassword(password), newRole, now())
+      await audit(req, 'create', 'users', info.lastInsertRowid)
       return { ok: true, id: info.lastInsertRowid }
     } catch {
       return reply.code(400).send({ error: 'email_taken' })
@@ -996,16 +1116,16 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       // Порог зависит от РОЛИ ЦЕЛИ, не от того, кто меняет пароль: смена пароля
       // существующему админу обязана требовать те же 16 символов, что и создание —
       // иначе минимум обходится через смену пароля после создания слабой учётки.
-      const target = db.prepare('SELECT role FROM users WHERE id = ?').get(id)
+      const target = await db.prepare('SELECT role FROM users WHERE id = ?').get(id)
       const minLen = target?.role === 'admin' ? MIN_ADMIN_PASSWORD_LENGTH : MIN_PASSWORD_LENGTH
       if (typeof password !== 'string' || password.length < minLen) return reply.code(400).send({ error: 'bad_input' })
     }
-    if (name) db.prepare('UPDATE users SET name = ? WHERE id = ?').run(trim(name, 100), id)
+    if (name) await db.prepare('UPDATE users SET name = ? WHERE id = ?').run(trim(name, 100), id)
     if (password) {
       // смена пароля инвалидирует все сессии пользователя
-      db.prepare('UPDATE users SET password_hash = ?, token_version = token_version + 1 WHERE id = ?').run(await hashPassword(password), id)
+      await db.prepare('UPDATE users SET password_hash = ?, token_version = token_version + 1 WHERE id = ?').run(await hashPassword(password), id)
     }
-    audit(req, 'update', 'users', id)
+    await audit(req, 'update', 'users', id)
     return { ok: true }
   })
 
@@ -1013,9 +1133,9 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
     const id = Number(req.params.id)
     if (id === req.user.id) return reply.code(400).send({ error: 'cannot_delete_self' })
-    db.prepare('UPDATE users SET token_version = token_version + 1 WHERE id = ?').run(id)
-    db.prepare('DELETE FROM users WHERE id = ?').run(id)
-    audit(req, 'delete', 'users', id)
+    await db.prepare('UPDATE users SET token_version = token_version + 1 WHERE id = ?').run(id)
+    await db.prepare('DELETE FROM users WHERE id = ?').run(id)
+    await audit(req, 'delete', 'users', id)
     return { ok: true }
   })
 
@@ -1024,34 +1144,33 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     const ts = now()
     const LAB = 1
     const VIZOR = 2
-    const seed = db.transaction(() => {
-      const c = (name, company, extra = {}) =>
-        db.prepare("INSERT INTO contacts (name, company, phone, email, source, project_id, demo, created_at, updated_at, created_by) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)")
-          .run(name, company, extra.phone ?? '', extra.email ?? '', extra.source ?? 'manual', extra.project ?? LAB, ts, ts, req.user.id).lastInsertRowid
-      const id1 = c('Марина Соколова', 'ООО «Северный свет»', { phone: '+7 921 555-14-88', source: 'site-form' })
-      const id2 = c('Дмитрий Иванов', '«Балтика-Транс»', { email: 'd.ivanov@baltika.ru' })
-      const id3 = c('Арсений', '', { source: 'site-chat' })
-      const id4 = c('Ольга Р.', 'ЖК «Приморский»', { phone: '+7 911 204-77-31', source: 'site-form', project: VIZOR })
-      const d = (cid, title, stage, amount, project = LAB) =>
-        db.prepare('INSERT INTO deals (contact_id, title, stage, amount, project_id, demo, created_at, updated_at, created_by) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)').run(cid, title, stage, amount, project, ts, ts, req.user.id).lastInsertRowid
-      d(id1, 'Внедрение ИИ в документооборот', 'Новый', 340000)
-      const deal2 = d(id2, 'Пилот: ассистент для логистики', 'Переговоры', 780000)
-      d(id3, 'Чат-бот для клиники', 'Контакт', 210000)
-      d(id4, 'Контроль отделки квартиры по фото', 'Новый', 45000, VIZOR)
-      db.prepare('INSERT INTO tasks (title, contact_id, deal_id, due_date, demo, created_at, updated_at, created_by) VALUES (?, ?, ?, ?, 1, ?, ?, ?)').run('Позвонить Иванову по пилоту', id2, deal2, mskToday(-1), ts, ts, req.user.id)
-      db.prepare('INSERT INTO tasks (title, contact_id, due_date, demo, created_at, updated_at, created_by) VALUES (?, ?, ?, 1, ?, ?, ?)').run('Отправить КП «Северный свет»', id1, mskToday(), ts, ts, req.user.id)
-      db.prepare('INSERT INTO interactions (contact_id, deal_id, type, note, happened_at, demo, created_at, updated_at, created_by) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)').run(id2, deal2, 'звонок', 'Обсудили пилот, ждёт КП до пятницы', ts, ts, ts, req.user.id)
+    await withTransaction(db.pool, async (tx) => {
+      const c = async (name, company, extra = {}) =>
+        (await tx.prepare("INSERT INTO contacts (name, company, phone, email, source, project_id, demo, created_at, updated_at, created_by) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?) RETURNING id")
+          .run(name, company, extra.phone ?? '', extra.email ?? '', extra.source ?? 'manual', extra.project ?? LAB, ts, ts, req.user.id)).lastInsertRowid
+      const id1 = await c('Марина Соколова', 'ООО «Северный свет»', { phone: '+7 921 555-14-88', source: 'site-form' })
+      const id2 = await c('Дмитрий Иванов', '«Балтика-Транс»', { email: 'd.ivanov@baltika.ru' })
+      const id3 = await c('Арсений', '', { source: 'site-chat' })
+      const id4 = await c('Ольга Р.', 'ЖК «Приморский»', { phone: '+7 911 204-77-31', source: 'site-form', project: VIZOR })
+      const d = async (cid, title, stage, amount, project = LAB) =>
+        (await tx.prepare('INSERT INTO deals (contact_id, title, stage, amount, project_id, demo, created_at, updated_at, created_by) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?) RETURNING id').run(cid, title, stage, amount, project, ts, ts, req.user.id)).lastInsertRowid
+      await d(id1, 'Внедрение ИИ в документооборот', 'Новый', 340000)
+      const deal2 = await d(id2, 'Пилот: ассистент для логистики', 'Переговоры', 780000)
+      await d(id3, 'Чат-бот для клиники', 'Контакт', 210000)
+      await d(id4, 'Контроль отделки квартиры по фото', 'Новый', 45000, VIZOR)
+      await tx.prepare('INSERT INTO tasks (title, contact_id, deal_id, due_date, demo, created_at, updated_at, created_by) VALUES (?, ?, ?, ?, 1, ?, ?, ?)').run('Позвонить Иванову по пилоту', id2, deal2, mskToday(-1), ts, ts, req.user.id)
+      await tx.prepare('INSERT INTO tasks (title, contact_id, due_date, demo, created_at, updated_at, created_by) VALUES (?, ?, ?, 1, ?, ?, ?)').run('Отправить КП «Северный свет»', id1, mskToday(), ts, ts, req.user.id)
+      await tx.prepare('INSERT INTO interactions (contact_id, deal_id, type, note, happened_at, demo, created_at, updated_at, created_by) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)').run(id2, deal2, 'звонок', 'Обсудили пилот, ждёт КП до пятницы', ts, ts, ts, req.user.id)
     })
-    seed()
-    audit(req, 'demo-seed', 'all', 0)
+    await audit(req, 'demo-seed', 'all', 0)
     return { ok: true }
   })
 
   app.delete('/api/crm/demo', async (req) => {
-    db.transaction(() => {
-      for (const n of ['interactions', 'tasks', 'deals', 'contacts']) db.prepare(`DELETE FROM ${n} WHERE demo = 1`).run()
-    })()
-    audit(req, 'demo-clear', 'all', 0)
+    await withTransaction(db.pool, async (tx) => {
+      for (const n of ['interactions', 'tasks', 'deals', 'contacts']) await tx.prepare(`DELETE FROM ${n} WHERE demo = 1`).run()
+    })
+    await audit(req, 'demo-clear', 'all', 0)
     return { ok: true }
   })
 
@@ -1070,29 +1189,38 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   // дальше pending_unverified — это и есть шаг «человек проверил» (ADR-015).
   const PD_STATUSES = ['pending_unverified', 'new', 'done', 'rejected']
 
-  function anonymizeContact(contactId, req) {
+  // parentTx — опционально: вызывающий код может уже быть внутри своей транзакции
+  // (PATCH /api/crm/pd-requests ниже — status/contact_id/anonymize мутируются одним
+  // атомарным блоком). Простой withTransaction (server/db-adapter.js) НЕ поддерживает
+  // вложенность через SAVEPOINT (в отличие от better-sqlite3, где db.transaction()
+  // внутри чужой транзакции прозрачно становится SAVEPOINT) — вложенный вызов
+  // withTransaction() взял бы ВТОРОЕ, отдельное соединение из пула, и работал бы вне
+  // атомарности внешней транзакции (а на маленьком пуле мог бы и вовсе исчерпать его).
+  // При наличии parentTx работаем НА НЁМ, не открывая свою транзакцию.
+  async function anonymizeContact(contactId, req, parentTx = null) {
+    const runner = parentTx || db
     // phone/email/messenger читаем ЗАРАНЕЕ, до их обнуления шагом 1 — нужны шагу 5b
     // ниже, чтобы найти осиротевшие слепки согласия ДО того, как значения исчезнут.
-    const contact = db.prepare('SELECT id, phone, email, messenger, project_id, anonymized_at FROM contacts WHERE id = ?').get(contactId)
+    const contact = await runner.prepare('SELECT id, phone, email, messenger, project_id, anonymized_at FROM contacts WHERE id = ?').get(contactId)
     if (!contact) return null
     if (contact.anonymized_at) return contact // повторный вызов безвреден
 
     const ts = now()
-    db.transaction(() => {
+    const doAnonymize = async (tx) => {
       // 1. Сам контакт: имя-заглушка, все опознающие поля пусты
-      db.prepare(`UPDATE contacts SET name = ?, company = '', phone = '', email = '', messenger = '',
+      await tx.prepare(`UPDATE contacts SET name = ?, company = '', phone = '', email = '', messenger = '',
         note = '', anonymized_at = ?, updated_at = ? WHERE id = ?`)
         .run(`Удалённый контакт #${contactId}`, ts, ts, contactId)
       // 2. Взаимодействия: текст затираем (там транскрипты переписок), но строки
       //    оставляем — по ним считается активность на дашборде
-      db.prepare("UPDATE interactions SET note = '', updated_at = ? WHERE contact_id = ?").run(ts, contactId)
+      await tx.prepare("UPDATE interactions SET note = '', updated_at = ? WHERE contact_id = ?").run(ts, contactId)
       // 3. Сделки: заметки могут содержать ПДн, затираем; стадия и сумма остаются
-      db.prepare("UPDATE deals SET note = '', updated_at = ? WHERE contact_id = ?").run(ts, contactId)
+      await tx.prepare("UPDATE deals SET note = '', updated_at = ? WHERE contact_id = ?").run(ts, contactId)
       // 4. Задачи удаляем целиком: во-первых, в заголовке может стоять имя, во-вторых,
       //    человек потребовал прекратить обработку — напоминание «позвонить ему» этому
       //    прямо противоречит. Вместе с ними закрываем воронку возврата.
-      db.prepare('DELETE FROM tasks WHERE contact_id = ?').run(contactId)
-      db.prepare("UPDATE winback_sequences SET status = 'cancelled', finished_at = ? WHERE contact_id = ? AND status = 'active'")
+      await tx.prepare('DELETE FROM tasks WHERE contact_id = ?').run(contactId)
+      await tx.prepare("UPDATE winback_sequences SET status = 'cancelled', finished_at = ? WHERE contact_id = ? AND status = 'active'")
         .run(ts, contactId)
       // 5. Слепки согласия: затираем ВСЁ содержимое — requester, version, text,
       //    accepted_at. Раньше (раунд 20) version/text/accepted_at не трогались —
@@ -1105,7 +1233,7 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       //    анонимизацией. Оставляем только сам факт «согласие когда-то было» —
       //    contact_id/deal_id/project_id/created_at (ссылка на уже анонимизированный
       //    контакт ничего не раскрывает, дата фиксирует момент события).
-      db.prepare("UPDATE consents SET requester = '', version = '', text = '', text_truncated = 0, accepted_at = NULL WHERE contact_id = ?").run(contactId)
+      await tx.prepare("UPDATE consents SET requester = '', version = '', text = '', text_truncated = 0, accepted_at = NULL WHERE contact_id = ?").run(contactId)
       // 5b. Осиротевшие legacy-восстановлением строки (contact_id обнулён импортом
       //     дампа без consents — ADR-015, раунд 17/18 — requester НАМЕРЕННО уцелел
       //     как единственная зацепка). Независимая проверка (раунд 21) поймала: такая
@@ -1115,21 +1243,25 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       //     значению идентификатора С НОРМАЛИЗАЦИЕЙ ТЕЛЕФОНА (раунд 25: точное
       //     сравнение строк пропускало бы совпадение при разных форматах одного
       //     номера) — значения читаны ДО шага 1, пока не затёрты.
-      const orphanIds = orphanedConsentIds(contact.project_id, [contact.phone, contact.email, contact.messenger])
+      const orphanIds = await orphanedConsentIds(tx, contact.project_id, [contact.phone, contact.email, contact.messenger])
       if (orphanIds.length) {
         const marks = orphanIds.map(() => '?').join(',')
-        db.prepare(`UPDATE consents SET requester = '', version = '', text = '', text_truncated = 0, accepted_at = NULL WHERE id IN (${marks})`).run(...orphanIds)
+        await tx.prepare(`UPDATE consents SET requester = '', version = '', text = '', text_truncated = 0, accepted_at = NULL WHERE id IN (${marks})`).run(...orphanIds)
       }
-    })()
-    audit(req, 'anonymize', 'contacts', contactId, 'исполнение запроса субъекта ПДн')
-    return db.prepare('SELECT id, name, anonymized_at FROM contacts WHERE id = ?').get(contactId)
+      // Аудит — ВНУТРИ той же транзакции, на том же tx: иначе (пул вместо
+      // конкретного соединения) запись коммитится независимо от исхода анонимизации.
+      await audit(req, 'anonymize', 'contacts', contactId, 'исполнение запроса субъекта ПДн', tx)
+    }
+    if (parentTx) await doAnonymize(parentTx)
+    else await withTransaction(db.pool, doAnonymize)
+    return await runner.prepare('SELECT id, name, anonymized_at FROM contacts WHERE id = ?').get(contactId)
   }
 
   app.get('/api/crm/pd-requests', async (req) => {
     const status = trim(req.query?.status, 20)
     const where = PD_STATUSES.includes(status) ? 'WHERE r.status = ?' : ''
     const args = where ? [status] : []
-    const items = db
+    const items = await db
       .prepare(`SELECT r.*, c.name contact_name, c.anonymized_at, p.display_name project_name
         FROM pd_requests r
         LEFT JOIN contacts c ON c.id = r.contact_id
@@ -1146,26 +1278,26 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     const contactId = b.contact_id === undefined || b.contact_id === null || b.contact_id === '' ? null : Number(b.contact_id)
     if (contactId !== null && !Number.isInteger(contactId)) return reply.code(400).send({ error: 'bad_input' })
     if (!requester && contactId === null) return reply.code(400).send({ error: 'bad_input' })
-    if (contactId !== null && !db.prepare('SELECT 1 FROM contacts WHERE id = ?').get(contactId)) {
+    if (contactId !== null && !(await db.prepare('SELECT 1 FROM contacts WHERE id = ?').get(contactId))) {
       return reply.code(400).send({ error: 'bad_reference' })
     }
     const projectId = contactId !== null
-      ? db.prepare('SELECT project_id FROM contacts WHERE id = ?').get(contactId).project_id
-      : resolveProjectId(b.project) || DEFAULT_PROJECT_ID
+      ? (await db.prepare('SELECT project_id FROM contacts WHERE id = ?').get(contactId)).project_id
+      : (await resolveProjectId(b.project)) || DEFAULT_PROJECT_ID
     const ts = now()
     // verified_at сразу — ручной ввод сотрудником уже подтверждён самим фактом
     // разговора/переписки, вторично верифицировать в интерфейсе нечего.
-    const info = db.prepare(`INSERT INTO pd_requests (contact_id, kind, requester, note, source, project_id, due_date, verified_at, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    const info = await db.prepare(`INSERT INTO pd_requests (contact_id, kind, requester, note, source, project_id, due_date, verified_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`)
       .run(contactId, kind, requester, trim(b.note, 1000), 'manual', projectId, addWorkdays(mskToday()), ts, ts, ts)
-    audit(req, 'create', 'pd_requests', info.lastInsertRowid, kind)
+    await audit(req, 'create', 'pd_requests', info.lastInsertRowid, kind)
     return { ok: true, id: info.lastInsertRowid, due_date: addWorkdays(mskToday()) }
   })
 
   app.patch('/api/crm/pd-requests/:id', async (req, reply) => {
     const id = Number(req.params.id)
     if (!Number.isInteger(id)) return reply.code(400).send({ error: 'bad_input' })
-    const row = db.prepare('SELECT * FROM pd_requests WHERE id = ?').get(id)
+    const row = await db.prepare('SELECT * FROM pd_requests WHERE id = ?').get(id)
     if (!row) return reply.code(404).send({ error: 'not_found' })
     const b = req.body ?? {}
     const ts = now()
@@ -1183,7 +1315,7 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
         // ДРУГОГО (Лаб ИИ ↔ Визор), «подтвердить» и в итоге обезличить чужого
         // человека. Та же граница, что уже применена к автопоиску контакта выше
         // (ADR-014) и должна была быть здесь с самого начала этого эндпоинта.
-        const target = db.prepare('SELECT project_id FROM contacts WHERE id = ?').get(contactId)
+        const target = await db.prepare('SELECT project_id FROM contacts WHERE id = ?').get(contactId)
         if (!target || target.project_id !== row.project_id) return reply.code(400).send({ error: 'bad_reference' })
       }
       contactChanged = contactId !== row.contact_id
@@ -1237,26 +1369,29 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     }
 
     let anonymized = null
-    db.transaction(() => {
+    await withTransaction(db.pool, async (tx) => {
       if (b.contact_id !== undefined) {
-        db.prepare('UPDATE pd_requests SET contact_id = ?, updated_at = ? WHERE id = ?').run(contactId, ts, id)
+        await tx.prepare('UPDATE pd_requests SET contact_id = ?, updated_at = ? WHERE id = ?').run(contactId, ts, id)
         // Смена привязки аннулирует прежнюю верификацию — та подтверждала личность
         // про СТАРЫЙ контакт, а не про нового. Первичная привязка (row.contact_id
         // был NULL) не аннулирует ничего — верифицировать было ещё нечего.
         if (contactChanged && row.verified_at) {
-          db.prepare("UPDATE pd_requests SET verified_at = NULL, status = 'pending_unverified' WHERE id = ?").run(id)
+          await tx.prepare("UPDATE pd_requests SET verified_at = NULL, status = 'pending_unverified' WHERE id = ?").run(id)
         }
       }
-      if (b.note !== undefined) db.prepare('UPDATE pd_requests SET note = ?, updated_at = ? WHERE id = ?').run(trim(b.note, 1000), ts, id)
+      if (b.note !== undefined) await tx.prepare('UPDATE pd_requests SET note = ?, updated_at = ? WHERE id = ?').run(trim(b.note, 1000), ts, id)
       if (b.status !== undefined) {
         const unresolved = b.status === 'new' || b.status === 'pending_unverified'
-        db.prepare('UPDATE pd_requests SET status = ?, resolved_at = ?, resolved_by = ?, updated_at = ? WHERE id = ?')
+        await tx.prepare('UPDATE pd_requests SET status = ?, resolved_at = ?, resolved_by = ?, updated_at = ? WHERE id = ?')
           .run(b.status, unresolved ? null : ts, unresolved ? null : req.user.id, ts, id)
-        if (verifying) db.prepare('UPDATE pd_requests SET verified_at = ? WHERE id = ?').run(ts, id)
-        audit(req, 'update', 'pd_requests', id, `статус: ${b.status}`)
+        if (verifying) await tx.prepare('UPDATE pd_requests SET verified_at = ? WHERE id = ?').run(ts, id)
+        await audit(req, 'update', 'pd_requests', id, `статус: ${b.status}`, tx)
       }
-      if (b.anonymize === true) anonymized = anonymizeContact(contactId, req)
-    })()
+      // anonymizeContact получает tx (parentTx) — обезличивание и остальные мутации
+      // этого PATCH обязаны быть одной атомарной операцией (см. комментарий выше о
+      // {status:'new', anonymize:true} одним запросом).
+      if (b.anonymize === true) anonymized = await anonymizeContact(contactId, req, tx)
+    })
     return { ok: true, anonymized }
   })
 
@@ -1266,48 +1401,56 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
     const id = Number(req.params.id)
     if (!Number.isInteger(id)) return reply.code(400).send({ error: 'bad_input' })
-    const result = anonymizeContact(id, req)
+    const result = await anonymizeContact(id, req)
     if (!result) return reply.code(404).send({ error: 'not_found' })
     return { ok: true, contact: result }
   })
 
   app.get('/api/crm/audit', async (req, reply) => {
     if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
-    const items = db
+    const items = await db
       .prepare('SELECT * FROM audit_log ORDER BY id DESC LIMIT 300')
       .all()
     return { items }
   })
 
   // ---------- диагностика ----------
-  app.get('/api/crm/diagnostics', async () => ({
-    schemaVersion: db.pragma('user_version', { simple: true }),
-    counts: Object.fromEntries(ENTITY_NAMES.map((n) => [n, db.prepare(`SELECT COUNT(*) c FROM ${n}`).get().c])),
-    outboxPending: {
-      tg: db.prepare('SELECT COUNT(*) c FROM outbox WHERE tg_sent_at IS NULL').get().c,
-      max: db.prepare('SELECT COUNT(*) c FROM outbox WHERE max_sent_at IS NULL').get().c,
-    },
-    serverTimeMsk: mskToday(),
-  }))
+  app.get('/api/crm/diagnostics', async () => {
+    const counts = await Promise.all(ENTITY_NAMES.map((n) => db.prepare(`SELECT COUNT(*) c FROM ${n}`).get()))
+    const [tgPending, maxPending] = await Promise.all([
+      db.prepare('SELECT COUNT(*) c FROM outbox WHERE tg_sent_at IS NULL').get(),
+      db.prepare('SELECT COUNT(*) c FROM outbox WHERE max_sent_at IS NULL').get(),
+    ])
+    return {
+      // PRAGMA user_version — SQLite-специфика, у Postgres нет миграционной истории:
+      // schema.sql — одна цельная схема, применяется целиком и идемпотентно (план
+      // перевода на pg, nevarium-lab#3). 11 — версия последней SQLite-миграции,
+      // которой этот файл эквивалентен (см. docs/DECISIONS.md, ADR-015).
+      schemaVersion: 11,
+      counts: Object.fromEntries(ENTITY_NAMES.map((n, i) => [n, counts[i].c])),
+      outboxPending: { tg: tgPending.c, max: maxPending.c },
+      serverTimeMsk: mskToday(),
+    }
+  })
 
   // ---------- публичный приём лидов ----------
   // Единственная точка без авторизации, поэтому CORS ровно для неё и строго по
   // списку origins проектов (+ localhost в dev). Без этого браузер не даст сайтам
   // отправить форму на другой домен.
-  function leadOriginAllowed(origin) {
+  async function leadOriginAllowed(origin) {
     const o = trim(origin, 200)
     if (!o) return false
     if (!secure && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(o)) return true
-    return Boolean(projectByOrigin(o))
+    return Boolean(await projectByOrigin(o))
   }
 
-  function applyLeadCors(req, reply) {
+  async function applyLeadCors(req, reply) {
     reply.header('vary', 'Origin')
-    if (leadOriginAllowed(req.headers.origin)) reply.header('access-control-allow-origin', req.headers.origin)
+    if (await leadOriginAllowed(req.headers.origin)) reply.header('access-control-allow-origin', req.headers.origin)
   }
 
   app.options('/api/leads', async (req, reply) => {
-    if (!leadOriginAllowed(req.headers.origin)) return reply.header('vary', 'Origin').code(403).send()
+    if (!(await leadOriginAllowed(req.headers.origin))) return reply.header('vary', 'Origin').code(403).send()
     return reply
       .header('vary', 'Origin')
       .header('access-control-allow-origin', req.headers.origin)
@@ -1353,8 +1496,13 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   // и на переданном идентификаторе, и на requester кандидата.
   const phoneKeyIfPlausible = (s) => (s && !String(s).includes('@') ? phoneKey(s) : '')
 
-  function orphanedConsentIds(projectId, identifiers) {
-    const candidates = db.prepare('SELECT id, requester FROM consents WHERE contact_id IS NULL AND project_id = ?').all(projectId)
+  // queryable — db (по умолчанию, вне транзакции) или tx, когда вызывается из уже
+  // открытой транзакции (DELETE /api/crm/contacts/:id, anonymizeContact) — искать и
+  // потом удалять/обновлять кандидатов нужно на ОДНОМ соединении, иначе строка,
+  // только что вставленная/изменённая в той же транзакции, может быть не видна
+  // отдельному соединению до коммита.
+  async function orphanedConsentIds(queryable, projectId, identifiers) {
+    const candidates = await queryable.prepare('SELECT id, requester FROM consents WHERE contact_id IS NULL AND project_id = ?').all(projectId)
     const ids = new Set()
     for (const v of identifiers.filter(Boolean)) {
       const key = phoneKeyIfPlausible(v)
@@ -1375,14 +1523,17 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
    * может быть клиентом обоих независимо. Обезличенных пропускаем: они отозвали
    * согласие, и если пишут снова — это новое согласие и новая карточка (ADR-011).
    *
-   * Перебор в JS, а не в SQL: нормализацию телефона на SQLite не выразить без
-   * лишней колонки. Контактов у малого бизнеса тысячи, не миллионы — приемлемо.
+   * Перебор в JS, а не в SQL: нормализация телефона (phoneKey) — не выражается
+   * запросом без отдельной нормализованной колонки. На Postgres это стало
+   * выразимо (функциональный индекс по regexp_replace), но переносить логику в
+   * SQL — отдельное решение со своей миграцией, а не часть перевода на pg:
+   * контактов у малого бизнеса тысячи, не миллионы, текущий перебор приемлем.
    */
-  function findExistingContact(contactInfo, projectId) {
+  async function findExistingContact(contactInfo, projectId) {
     const raw = trim(contactInfo, 300).toLowerCase()
     if (!raw) return null
     const key = phoneKey(raw)
-    const rows = db
+    const rows = await db
       .prepare('SELECT id, name, email, phone, messenger, archived FROM contacts WHERE project_id = ? AND anonymized_at IS NULL ORDER BY id DESC')
       .all(projectId)
     return rows.find((c) => {
@@ -1396,174 +1547,185 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   // сам по себе стоит CPU/памяти ДО этого — с запасом хватает 64 КБ (transcript ≤ 4000
   // символов + остальные поля). НЕ трогает /api/crm/import — там нужен полный дамп базы.
   app.post('/api/leads', { bodyLimit: 65536 }, async (req, reply) => {
-    applyLeadCors(req, reply)
+    await applyLeadCors(req, reply)
     const b = req.body ?? {}
     const requestId = idempotencyKey(req, b)
-    const replay = idempotencyReplay('leads', requestId)
-    if (replay !== null) return reply.code(replay).send()
-    if (hardRateLimited('leads', req.ip)) return reply.code(429).send()
-    // ПОСЛЕ hardRateLimited (независимая проверка, раунд 27): уже заблокированный по
-    // IP запрос не должен провоцировать даже эту (ограниченную по размеру) запись в
-    // лог — лимитер обязан быть первым, что видит недоверенный запрос, не последним.
-    warnUnknownFields('leads', b, LEAD_FIELDS)
+    // Claim-first (см. комментарий у idempotencyClaim выше) — застолбить ключ ДО
+    // любой бизнес-логики. claim.claimed===false: либо чужая попытка с тем же
+    // ключом уже завершилась (claim.statusCode не null — тот же самый ответ и
+    // возвращаем), либо она ещё идёт/зависла (claim.statusCode===429 после
+    // нескольких попыток дождаться — 429 у этого файла уже значит «не доставлено,
+    // повторите тем же ключом», сайту не нужен новый контракт ответа).
+    const claim = await idempotencyClaim('leads', requestId)
+    if (!claim.claimed) return reply.code(claim.statusCode).send()
+    try {
+      if (hardRateLimited('leads', req.ip)) {
+        // 429 обязан остаться повторяемым (см. комментарий у idempotencyFinish) —
+        // не записываем терминальный код, освобождаем ключ для следующей попытки.
+        await idempotencyAbandon(claim.id)
+        return reply.code(429).send()
+      }
+      // ПОСЛЕ hardRateLimited (независимая проверка, раунд 27): уже заблокированный
+      // по IP запрос не должен провоцировать даже эту (ограниченную по размеру)
+      // запись в лог — лимитер обязан быть первым, что видит недоверенный запрос.
+      warnUnknownFields('leads', b, LEAD_FIELDS)
 
-    // honeypot: скрытое поле website видят только боты — молчаливый дроп. Отвечаем
-    // КАК ПРИ УСПЕХЕ (иначе бот подберёт обход по коду ответа), но не сохраняем и
-    // не уведомляем. IP-эвристика (leadSuspicious) остаётся отдельным мягким
-    // сигналом — только буквальная ловушка даёт жёсткий дроп, честной заявке
-    // с шумного IP терять данные нельзя (CGNAT).
-    if (b.website) {
-      idempotencyRecord('leads', requestId, 204)
-      return reply.code(204).send()
-    }
-    const suspicious = leadSuspicious(req.ip)
-    const contactInfo = trim(b.contact, 300)
-    const isChat = b.source === 'chat' || (!b.name && b.detail !== undefined)
-    const name = trim(b.name, 200) || (contactInfo ? contactInfo.split(/[,;]/)[0].trim() : '') || 'Без имени'
-    const title = isChat ? trim(b.task, 300) || 'Заявка из чата' : [trim(b.task, 200), b.scale ? `масштаб: ${trim(b.scale, 100)}` : ''].filter(Boolean).join(', ') || 'Заявка с сайта'
-    const note = isChat ? trim(b.detail, 1000) : trim(b.note, 1000)
-    // Полная переписка с «Невой» — отдельной записью во взаимодействия, а не в note
-    // сделки: так карточка сделки остаётся короткой сутью, а весь диалог всё равно
-    // виден на карточке контакта. ПДн тут можно — CRM на РФ-сервере, доступ только у сотрудников.
-    const transcript = isChat ? trim(b.transcript, 4000) : ''
-    // Слепок согласия (ТЗ сайта Визор, раздел «Про consent»; 152-ФЗ ст.9 в редакции
-    // с 2026-09-01 требует, чтобы оператор МОГ ДОКАЗАТЬ согласие). Сайт шлёт
-    // {version, text, accepted_at} в каждой заявке — сохраняем как прислано, без
-    // требования непустоты: отсутствие/пустой consent — тоже значимый факт (старая
-    // версия клиента сайта, ручной тест), и это не повод ронять приём заявки.
-    const consentIn = b.consent && typeof b.consent === 'object' ? b.consent : {}
-    // Нераспознанные ключи ВНУТРИ consent — предупреждение, тем же приёмом, что и
-    // у полей верхнего уровня (независимая проверка, раунд 24): без этого опечатка
-    // клиента (например, camelCase acceptedAt вместо контрактного accepted_at) молча
-    // теряла бы поле целиком — accepted_at ушёл бы в NULL без единого следа в логах.
-    warnUnknownFields('leads.consent', consentIn, CONSENT_FIELDS)
-    // version/text — СТРОГО typeof === 'string', тем же правилом, что уже было у
-    // accepted_at (независимая проверка, раунд 24): раньше text через String(v ?? '')
-    // молча стрингифицировал ЛЮБОЙ тип («[object Object]» для вложенного объекта и
-    // т.п.) — не риск инъекции (параметризованный INSERT), но бессмысленные данные
-    // под видом «сохранено как прислано». Неверный тип теперь приравнивается к
-    // отсутствию поля — так же, как уже было у accepted_at.
-    // CONSENT_TEXT_MAX — компромисс между раундом 22 (5000 было тихо мало для
-    // настоящей политики на несколько тысяч слов — обрубало заявленное «хранится
-    // целиком») и раундом 25 (совсем без потолка одна заявка легально уносит до
-    // ~64 КБ — bodyLimit — в consents.text; распределённый флуд по многим IP,
-    // каждый под hardRateLimited, а не под квотой на приём (см. leadNotifyBudgetOk
-    // выше, раунды 17/19: квота НИКОГДА не блокирует приём) — превращает это в
-    // счётчик места на диске, а не просто мусорные карточки). 20 000 символов с
-    // огромным запасом покрывает любую настоящую политику (несколько тысяч слов),
-    // но остаётся конечным, предсказуемым потолком на строку, а не «весь bodyLimit».
-    // Полностью проблему распределённого флуда это НЕ решает — тот же остаточный
-    // риск, что уже принят в раундах 17/19 для роста contacts/deals, просто с
-    // ощутимо более низким потолком на одну запись, чем без этой правки.
-    //
-    // Обрезка ТЕПЕРЬ ВИДНА, а не тиха (независимая проверка, раунд 27): раунд 22
-    // прямо требовал «нельзя тихо обрезать — это же и есть доказательство», а
-    // раунд 25 требовал потолок. textTruncated (миграция v11 → consents.text_truncated)
-    // разрешает оба разом — потолок остаётся (защищает диск), но факт обрезки
-    // записывается рядом с самим текстом, а не теряется молча.
-    const CONSENT_TEXT_MAX = 20000
-    const rawConsentText = typeof consentIn.text === 'string' ? consentIn.text.trim() : ''
-    const consent = {
+      // honeypot: скрытое поле website видят только боты — молчаливый дроп. Отвечаем
+      // КАК ПРИ УСПЕХЕ (иначе бот подберёт обход по коду ответа), но не сохраняем и
+      // не уведомляем. IP-эвристика (leadSuspicious) остаётся отдельным мягким
+      // сигналом — только буквальная ловушка даёт жёсткий дроп, честной заявке
+      // с шумного IP терять данные нельзя (CGNAT).
+      if (b.website) {
+        await idempotencyFinish(claim.id, 204)
+        return reply.code(204).send()
+      }
+      const suspicious = leadSuspicious(req.ip)
+      const contactInfo = trim(b.contact, 300)
+      const isChat = b.source === 'chat' || (!b.name && b.detail !== undefined)
+      const name = trim(b.name, 200) || (contactInfo ? contactInfo.split(/[,;]/)[0].trim() : '') || 'Без имени'
+      const title = isChat ? trim(b.task, 300) || 'Заявка из чата' : [trim(b.task, 200), b.scale ? `масштаб: ${trim(b.scale, 100)}` : ''].filter(Boolean).join(', ') || 'Заявка с сайта'
+      const note = isChat ? trim(b.detail, 1000) : trim(b.note, 1000)
+      // Полная переписка с «Невой» — отдельной записью во взаимодействия, а не в note
+      // сделки: так карточка сделки остаётся короткой сутью, а весь диалог всё равно
+      // виден на карточке контакта. ПДн тут можно — CRM на РФ-сервере, доступ только у сотрудников.
+      const transcript = isChat ? trim(b.transcript, 4000) : ''
+      // Слепок согласия (ТЗ сайта Визор, раздел «Про consent»; 152-ФЗ ст.9 в редакции
+      // с 2026-09-01 требует, чтобы оператор МОГ ДОКАЗАТЬ согласие). Сайт шлёт
+      // {version, text, accepted_at} в каждой заявке — сохраняем как прислано, без
+      // требования непустоты: отсутствие/пустой consent — тоже значимый факт (старая
+      // версия клиента сайта, ручной тест), и это не повод ронять приём заявки.
+      const consentIn = b.consent && typeof b.consent === 'object' ? b.consent : {}
+      // Нераспознанные ключи ВНУТРИ consent — предупреждение, тем же приёмом, что и
+      // у полей верхнего уровня (независимая проверка, раунд 24): без этого опечатка
+      // клиента (например, camelCase acceptedAt вместо контрактного accepted_at) молча
+      // теряла бы поле целиком — accepted_at ушёл бы в NULL без единого следа в логах.
+      warnUnknownFields('leads.consent', consentIn, CONSENT_FIELDS)
+      // version/text — СТРОГО typeof === 'string', тем же правилом, что уже было у
+      // accepted_at (независимая проверка, раунд 24): раньше text через String(v ?? '')
+      // молча стрингифицировал ЛЮБОЙ тип («[object Object]» для вложенного объекта и
+      // т.п.) — не риск инъекции (параметризованный INSERT), но бессмысленные данные
+      // под видом «сохранено как прислано». Неверный тип теперь приравнивается к
+      // отсутствию поля — так же, как уже было у accepted_at.
+      // CONSENT_TEXT_MAX — компромисс между раундом 22 (5000 было тихо мало для
+      // настоящей политики на несколько тысяч слов — обрубало заявленное «хранится
+      // целиком») и раундом 25 (совсем без потолка одна заявка легально уносит до
+      // ~64 КБ — bodyLimit — в consents.text; распределённый флуд по многим IP,
+      // каждый под hardRateLimited, а не под квотой на приём (см. leadNotifyBudgetOk
+      // выше, раунды 17/19: квота НИКОГДА не блокирует приём) — превращает это в
+      // счётчик места на диске, а не просто мусорные карточки). 20 000 символов с
+      // огромным запасом покрывает любую настоящую политику (несколько тысяч слов),
+      // но остаётся конечным, предсказуемым потолком на строку, а не «весь bodyLimit».
+      // Полностью проблему распределённого флуда это НЕ решает — тот же остаточный
+      // риск, что уже принят в раундах 17/19 для роста contacts/deals, просто с
+      // ощутимо более низким потолком на одну запись, чем без этой правки.
+      //
+      // Обрезка ТЕПЕРЬ ВИДНА, а не тиха (независимая проверка, раунд 27): раунд 22
+      // прямо требовал «нельзя тихо обрезать — это же и есть доказательство», а
+      // раунд 25 требовал потолок. textTruncated (миграция v11 → consents.text_truncated)
+      // разрешает оба разом — потолок остаётся (защищает диск), но факт обрезки
+      // записывается рядом с самим текстом, а не теряется молча.
+      const CONSENT_TEXT_MAX = 20000
+      const rawConsentText = typeof consentIn.text === 'string' ? consentIn.text.trim() : ''
+      const consent = {
       version: typeof consentIn.version === 'string' ? trim(consentIn.version, 200) : '',
       text: rawConsentText.slice(0, CONSENT_TEXT_MAX),
       textTruncated: rawConsentText.length > CONSENT_TEXT_MAX,
       acceptedAt: typeof consentIn.accepted_at === 'string' ? trim(consentIn.accepted_at, 64) : '',
-    }
-    if (!contactInfo && name === 'Без имени') {
-      idempotencyRecord('leads', requestId, 204)
+      }
+      if (!contactInfo && name === 'Без имени') {
+      await idempotencyFinish(claim.id, 204)
       return reply.code(204).send()
-    }
+      }
 
-    // Проект: домен сайта (Origin — доверенный сигнал) → поле формы (запасной путь,
-    // только когда Origin не пришёл или не опознан) → проект по умолчанию. Раньше
-    // поле формы могло молча ПЕРЕКРЫТЬ уже определённый по Origin проект —
-    // недоверенный клиент мог так загрязнить инбокс соседнего бизнеса (ТЗ сайта,
-    // §2: «project передаёт сам недоверенный клиент»).
-    // Заявку не отвергаем никогда: потерянный лид хуже, чем лид не в том проекте —
-    // второе видно в CRM и правится одним кликом, первое не восстановить.
-    const byOrigin = projectByOrigin(req.headers.origin)
-    let projectId = byOrigin ? byOrigin.id : DEFAULT_PROJECT_ID
-    if (!byOrigin) {
+      // Проект: домен сайта (Origin — доверенный сигнал) → поле формы (запасной путь,
+      // только когда Origin не пришёл или не опознан) → проект по умолчанию. Раньше
+      // поле формы могло молча ПЕРЕКРЫТЬ уже определённый по Origin проект —
+      // недоверенный клиент мог так загрязнить инбокс соседнего бизнеса (ТЗ сайта,
+      // §2: «project передаёт сам недоверенный клиент»).
+      // Заявку не отвергаем никогда: потерянный лид хуже, чем лид не в том проекте —
+      // второе видно в CRM и правится одним кликом, первое не восстановить.
+      const byOrigin = await projectByOrigin(req.headers.origin)
+      let projectId = byOrigin ? byOrigin.id : DEFAULT_PROJECT_ID
+      if (!byOrigin) {
       const asked = trim(b.project, 100)
       if (asked) {
-        const pid = resolveProjectId(asked)
+        const pid = await resolveProjectId(asked)
         if (pid) projectId = pid
         else app.log?.warn?.({ asked, origin: req.headers.origin }, 'lead: неизвестный проект, беру запасной')
       }
-    }
-    // Дубли: тот же человек мог заполнить форму, а потом написать в чат. Две карточки
-    // на одного клиента рвут историю пополам, поэтому вторую не заводим — привязываем
-    // заявку к существующей (ADR-014). Ошибочную склейку видно сразу и она поправима:
-    // у сделки и у действия можно сменить контакт в обычной форме редактирования.
-    const existing = findExistingContact(contactInfo, projectId)
-    const ts = now()
-    // Запись идемпотентного ключа — ВНУТРИ той же транзакции, что и сама заявка
-    // (независимая проверка нашла: раньше это были отдельные шаги ПОСЛЕ commit —
-    // сбой/исключение между ними оставлял заявку сохранённой, но ключ незаписанным,
-    // и повтор с тем же ключом создавал вторую заявку — ровно то, от чего был весь
-    // этот механизм). Атомарно: либо и заявка, и ключ, либо ни то ни другое.
-    const result = db.transaction(() => {
-      const inner = (() => {
+      }
+      // Дубли: тот же человек мог заполнить форму, а потом написать в чат. Две карточки
+      // на одного клиента рвут историю пополам, поэтому вторую не заводим — привязываем
+      // заявку к существующей (ADR-014). Ошибочную склейку видно сразу и она поправима:
+      // у сделки и у действия можно сменить контакт в обычной форме редактирования.
+      const existing = await findExistingContact(contactInfo, projectId)
+      const ts = now()
+      // ПЕРЕВОД НА POSTGRES: раньше здесь же, внутри ЭТОЙ транзакции, писался и сам
+      // idempotency_keys — атомарно с бизнес-записью. Теперь ключ уже застолблён ДО
+      // транзакции (claim-first, см. idempotencyClaim) — статус проставляется
+      // idempotencyFinish() ПОСЛЕ успешного commit (ниже), отдельным шагом, а не
+      // внутри самой транзакции.
+      const result = await withTransaction(db.pool, async (tx) => {
+      let inner
       if (!existing) {
         const isEmail = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(contactInfo)
         const email = isEmail ? contactInfo : ''
         const messenger = isEmail ? '' : contactInfo
-        const cid = db.prepare('INSERT INTO contacts (name, email, messenger, note, source, suspicious, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-          .run(name, email, messenger, '', isChat ? 'site-chat' : 'site-form', suspicious ? 1 : 0, projectId, ts, ts).lastInsertRowid
-        const did = db.prepare('INSERT INTO deals (contact_id, title, stage, note, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-          .run(cid, title, 'Новый', note, projectId, ts, ts).lastInsertRowid
+        const cid = (await tx.prepare('INSERT INTO contacts (name, email, messenger, note, source, suspicious, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id')
+          .run(name, email, messenger, '', isChat ? 'site-chat' : 'site-form', suspicious ? 1 : 0, projectId, ts, ts)).lastInsertRowid
+        const did = (await tx.prepare('INSERT INTO deals (contact_id, title, stage, note, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id')
+          .run(cid, title, 'Новый', note, projectId, ts, ts)).lastInsertRowid
         if (transcript) {
-          db.prepare('INSERT INTO interactions (contact_id, type, note, happened_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(cid, 'сообщение', transcript, ts, ts, ts)
+          await tx.prepare('INSERT INTO interactions (contact_id, type, note, happened_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(cid, 'сообщение', transcript, ts, ts, ts)
         }
-        return { contactId: cid, dealId: did, repeat: false }
-      }
-
-      const cid = existing.id
-      // Из архива возвращаем: иначе повторная заявка не покажется в инбоксе,
-      // то есть тихо потеряется — а терять заявки нам нельзя ни при каких условиях.
-      if (existing.archived) db.prepare('UPDATE contacts SET archived = 0, updated_at = ? WHERE id = ?').run(ts, cid)
-      else db.prepare('UPDATE contacts SET updated_at = ? WHERE id = ?').run(ts, cid)
-
-      // Открытая сделка уже есть — значит это то же самое обращение, а не новое:
-      // второй карточкой в воронке та же возможность считалась бы дважды.
-      const termMarks = TERMINAL_STAGES.map(() => '?').join(',')
-      const openDeal = db
-        .prepare(`SELECT id FROM deals WHERE contact_id = ? AND stage NOT IN (${termMarks}) ORDER BY id DESC LIMIT 1`)
-        .get(cid, ...TERMINAL_STAGES)
-      let dealId
-      if (openDeal) {
-        dealId = openDeal.id
-        db.prepare('UPDATE deals SET updated_at = ? WHERE id = ?').run(ts, dealId)
+        inner = { contactId: cid, dealId: did, repeat: false }
       } else {
-        // Все сделки закрыты — человек вернулся с новой задачей, это новая сделка.
-        dealId = db.prepare('INSERT INTO deals (contact_id, title, stage, note, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-          .run(cid, title, 'Новый', note, projectId, ts, ts).lastInsertRowid
-      }
+        const cid = existing.id
+        // Из архива возвращаем: иначе повторная заявка не покажется в инбоксе,
+        // то есть тихо потеряется — а терять заявки нам нельзя ни при каких условиях.
+        if (existing.archived) await tx.prepare('UPDATE contacts SET archived = 0, updated_at = ? WHERE id = ?').run(ts, cid)
+        else await tx.prepare('UPDATE contacts SET updated_at = ? WHERE id = ?').run(ts, cid)
 
-      // Повторное обращение записываем в историю целиком: заголовок и заметка
-      // новой заявки иначе потерялись бы, ведь сделку мы переиспользовали.
-      const lines = [
-        openDeal ? 'Повторная заявка (сделка уже в работе)' : 'Клиент вернулся с новой заявкой',
-        title ? `Задача: ${title}` : '',
-        note ? `Заметка: ${note}` : '',
-        `Источник: ${isChat ? 'чат Невы' : 'форма на сайте'}`,
-      ].filter(Boolean).join('\n')
-      db.prepare('INSERT INTO interactions (contact_id, deal_id, type, note, happened_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-        .run(cid, dealId, 'сообщение', lines, ts, ts, ts)
-      if (transcript) {
-        db.prepare('INSERT INTO interactions (contact_id, deal_id, type, note, happened_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-          .run(cid, dealId, 'сообщение', transcript, ts, ts, ts)
-      }
+        // Открытая сделка уже есть — значит это то же самое обращение, а не новое:
+        // второй карточкой в воронке та же возможность считалась бы дважды.
+        const termMarks = TERMINAL_STAGES.map(() => '?').join(',')
+        const openDeal = await tx
+          .prepare(`SELECT id FROM deals WHERE contact_id = ? AND NOT (stage IN (${termMarks})) ORDER BY id DESC LIMIT 1`)
+          .get(cid, ...TERMINAL_STAGES)
+        let dealId
+        if (openDeal) {
+          dealId = openDeal.id
+          await tx.prepare('UPDATE deals SET updated_at = ? WHERE id = ?').run(ts, dealId)
+        } else {
+          // Все сделки закрыты — человек вернулся с новой задачей, это новая сделка.
+          dealId = (await tx.prepare('INSERT INTO deals (contact_id, title, stage, note, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id')
+            .run(cid, title, 'Новый', note, projectId, ts, ts)).lastInsertRowid
+        }
 
-      // Клиент написал сам — напоминания «узнать, не передумал ли» больше не нужны
-      // и выглядели бы невнимательностью. Снимаем незакрытые, выполненные не трогаем.
-      const seqs = db.prepare("SELECT id FROM winback_sequences WHERE contact_id = ? AND status = 'active'").all(cid)
-      for (const seq of seqs) {
-        db.prepare('DELETE FROM tasks WHERE winback_sequence_id = ? AND done = 0').run(seq.id)
-        db.prepare("UPDATE winback_sequences SET status = 'cancelled', finished_at = ? WHERE id = ?").run(ts, seq.id)
+        // Повторное обращение записываем в историю целиком: заголовок и заметка
+        // новой заявки иначе потерялись бы, ведь сделку мы переиспользовали.
+        const lines = [
+          openDeal ? 'Повторная заявка (сделка уже в работе)' : 'Клиент вернулся с новой заявкой',
+          title ? `Задача: ${title}` : '',
+          note ? `Заметка: ${note}` : '',
+          `Источник: ${isChat ? 'чат Невы' : 'форма на сайте'}`,
+        ].filter(Boolean).join('\n')
+        await tx.prepare('INSERT INTO interactions (contact_id, deal_id, type, note, happened_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+          .run(cid, dealId, 'сообщение', lines, ts, ts, ts)
+        if (transcript) {
+          await tx.prepare('INSERT INTO interactions (contact_id, deal_id, type, note, happened_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+            .run(cid, dealId, 'сообщение', transcript, ts, ts, ts)
+        }
+
+        // Клиент написал сам — напоминания «узнать, не передумал ли» больше не нужны
+        // и выглядели бы невнимательностью. Снимаем незакрытые, выполненные не трогаем.
+        const seqs = await tx.prepare("SELECT id FROM winback_sequences WHERE contact_id = ? AND status = 'active'").all(cid)
+        for (const seq of seqs) {
+          await tx.prepare('DELETE FROM tasks WHERE winback_sequence_id = ? AND done = 0').run(seq.id)
+          await tx.prepare("UPDATE winback_sequences SET status = 'cancelled', finished_at = ? WHERE id = ?").run(ts, seq.id)
+        }
+        inner = { contactId: cid, dealId, repeat: true, returned: seqs.length > 0 }
       }
-        return { contactId: cid, dealId, repeat: true, returned: seqs.length > 0 }
-      })()
 
       // Слепок согласия — одна строка на КАЖДУЮ отправку (не только на новый контакт):
       // повторное обращение того же человека может нести другую версию политики или
@@ -1571,51 +1733,43 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
       // сделку — терять из-за этого согласие нельзя, поэтому запись безусловная.
       // requester = contactInfo как прислано в форме — независимое от contact_id
       // доказательство личности, переживающее любой импорт (см. миграцию v11).
-      db.prepare('INSERT INTO consents (contact_id, deal_id, project_id, requester, version, text, text_truncated, accepted_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      await tx.prepare('INSERT INTO consents (contact_id, deal_id, project_id, requester, version, text, text_truncated, accepted_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
         .run(inner.contactId, inner.dealId ?? null, projectId, contactInfo, consent.version, consent.text, consent.textTruncated ? 1 : 0, consent.acceptedAt || null, ts)
+
+      return inner
+      })
+      const contactId = result.contactId
 
       // В уведомление кладём только обезличенное: проект, источник, ссылку на карточку.
       // Имя, контакт и текст заявки остаются в CRM на российском сервере — Telegram
       // зарубежный, и отправка туда ПДн была бы трансграничной передачей (152-ФЗ).
-      // leadNotifyBudgetOk вызывается ЗДЕСЬ, а не до транзакции (независимая проверка,
-      // раунд 24): та версия «тратила» слот бюджета из in-memory Map ДО того, как
-      // транзакция гарантированно прошла — сбой чуть позже (например, INSERT
-      // idempotency_keys ниже, единственное, что может бросить не-UNIQUE ошибку
-      // ПОСЛЕ этой точки) откатил бы SQL, но не откатил бы уже потраченный слот
-      // Map — несостоявшаяся заявка тихо съедала бы бюджет уведомлений впустую. Здесь
-      // это тот же риск, но окно короче на порядок: до этой строки в транзакции
-      // только INSERT/UPDATE контакта/сделки/consents, которые бросают либо сразу
-      // (в самом начале), либо не бросают вовсе. ЕДИНСТВЕННОЕ, что квота на проект
-      // решает — заявка выше уже сохранена безусловно, здесь только вопрос, ставить
-      // ли ещё одно уведомление в очередь при исчерпанном бюджете проекта.
-      if (leadNotifyBudgetOk(projectId)) {
-        const project = db.prepare('SELECT display_name FROM projects WHERE id = ?').get(projectId)
-        enqueue(db, 'lead', {
-          projectName: project?.display_name || '',
-          source: isChat ? 'чат' : 'форма',
-          contactId: inner.contactId,
-          suspicious,
-          // repeat/returned — не ПДн: это про историю обращения, а не про человека
-          repeat: Boolean(inner.repeat),
-          returned: Boolean(inner.returned),
-        })
+      // leadNotifyBudgetOk теперь ПОСЛЕ withTransaction, не внутри неё: withTransaction
+      // резолвится, только если транзакция УЖЕ закоммичена — строже прежней гарантии
+      // (раньше опасались потратить бюджет ДО того, как транзакция гарантированно
+      // пройдёт; сейчас к этой строке она гарантированно уже прошла).
+      if (await leadNotifyBudgetOk(projectId)) {
+      const project = await db.prepare('SELECT display_name FROM projects WHERE id = ?').get(projectId)
+      await enqueue(db, 'lead', {
+        projectName: project?.display_name || '',
+        source: isChat ? 'чат' : 'форма',
+        contactId: result.contactId,
+        suspicious,
+        // repeat/returned — не ПДн: это про историю обращения, а не про человека
+        repeat: Boolean(result.repeat),
+        returned: Boolean(result.returned),
+      })
       }
-      if (requestId) {
-        try {
-          db.prepare('INSERT INTO idempotency_keys (scope, request_id, status_code, created_at) VALUES (?, ?, ?, ?)').run('leads', requestId, 204, ts)
-        } catch (err) {
-          // Только ожидаемый UNIQUE-конфликт — см. комментарий у idempotencyRecord.
-          // Любая другая ошибка обязана откатить ВСЮ транзакцию (мы внутри неё), а не
-          // молча закоммитить бизнес-запись без идемпотентного ключа.
-          if (err.code !== 'SQLITE_CONSTRAINT_UNIQUE') throw err
-        }
-      }
-      return inner
-    })()
-    const contactId = result.contactId
+      await idempotencyFinish(claim.id, 204)
 
-    app.log?.info?.({ contactId, projectId, suspicious, repeat: result.repeat }, 'lead accepted')
-    return reply.code(204).send()
+      app.log?.info?.({ contactId, projectId, suspicious, repeat: result.repeat }, 'lead accepted')
+      return reply.code(204).send()
+    } catch (err) {
+      // Настоящая ошибка (не штатный ранний выход выше, те возвращают до сюда) —
+      // снимаем застолбление ключа, иначе повтор с тем же ключом бьётся в 429
+      // без конца (см. idempotencyAbandon).
+      await idempotencyAbandon(claim.id)
+      throw err
+    }
   })
 
   // ---------- публичный приём запросов по персональным данным ----------
@@ -1623,7 +1777,7 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   // Тот же CORS и та же философия, что у лидов: запрос не отвергаем никогда — потерянный
   // запрос это просроченное обязательство и повод для жалобы в РКН (ADR-011).
   app.options('/api/pd-requests', async (req, reply) => {
-    if (!leadOriginAllowed(req.headers.origin)) return reply.header('vary', 'Origin').code(403).send()
+    if (!(await leadOriginAllowed(req.headers.origin))) return reply.header('vary', 'Origin').code(403).send()
     return reply
       .header('vary', 'Origin')
       .header('access-control-allow-origin', req.headers.origin)
@@ -1635,27 +1789,32 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
   })
 
   app.post('/api/pd-requests', { bodyLimit: 65536 }, async (req, reply) => {
-    applyLeadCors(req, reply)
+    await applyLeadCors(req, reply)
     const b = req.body ?? {}
     const requestId = idempotencyKey(req, b)
-    const replay = idempotencyReplay('pd_requests', requestId)
-    if (replay !== null) return reply.code(replay).send()
-    if (hardRateLimited('pd_requests', req.ip)) return reply.code(429).send()
-    // ПОСЛЕ hardRateLimited — та же причина, что у /api/leads (раунд 27).
-    warnUnknownFields('pd_requests', b, PD_REQUEST_FIELDS)
+    // Claim-first — см. комментарий у /api/leads выше.
+    const claim = await idempotencyClaim('pd_requests', requestId)
+    if (!claim.claimed) return reply.code(claim.statusCode).send()
+    try {
+      if (hardRateLimited('pd_requests', req.ip)) {
+        await idempotencyAbandon(claim.id)
+        return reply.code(429).send()
+      }
+      // ПОСЛЕ hardRateLimited — та же причина, что у /api/leads (раунд 27).
+      warnUnknownFields('pd_requests', b, PD_REQUEST_FIELDS)
 
-    // honeypot — НЕ молчаливый дроп, в отличие от лидов. Независимая проверка указала
-    // на асимметрию: скрытое поле обычно не подделывает ничего, кроме ботов, но
-    // потерянный лид — упущенная продажа, а потерянный запрос по ПДн — просроченное
-    // законное обязательство (10 рабочих дней, ADR-011) без единого следа, при этом
-    // отправителю показан «успех». Цена ложного срабатывания здесь категорически выше
-    // цены пропустить часть спама — поэтому только помечаем подозрительным (как раньше
-    // до этой сессии), запрос всё равно регистрируется и попадает в срок.
-    const requester = trim(b.contact, 300)
-    if (!requester) {
-      idempotencyRecord('pd_requests', requestId, 400)
-      return reply.code(400).send({ error: 'contact_required' })
-    }
+      // honeypot — НЕ молчаливый дроп, в отличие от лидов. Независимая проверка указала
+      // на асимметрию: скрытое поле обычно не подделывает ничего, кроме ботов, но
+      // потерянный лид — упущенная продажа, а потерянный запрос по ПДн — просроченное
+      // законное обязательство (10 рабочих дней, ADR-011) без единого следа, при этом
+      // отправителю показан «успех». Цена ложного срабатывания здесь категорически выше
+      // цены пропустить часть спама — поэтому только помечаем подозрительным (как раньше
+      // до этой сессии), запрос всё равно регистрируется и попадает в срок.
+      const requester = trim(b.contact, 300)
+      if (!requester) {
+        await idempotencyFinish(claim.id, 400)
+        return reply.code(400).send({ error: 'contact_required' })
+      }
     // ПОЛНОСТЬЮ опущенное поле — прежний дефолт «удалить» сохранён: так вело себя
     // публичное API до этой сессии, и уже развёрнутый клиент (сайт), который его не
     // передаёт, не должен тихо получить другой смысл запроса.
@@ -1677,11 +1836,11 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
 
     // Проект: домен сайта (доверенный) → поле формы (запасной путь, только без
     // Origin) → по умолчанию — тот же порядок и та же причина, что у лидов выше.
-    const byOrigin = projectByOrigin(req.headers.origin)
+    const byOrigin = await projectByOrigin(req.headers.origin)
     let projectId = byOrigin ? byOrigin.id : DEFAULT_PROJECT_ID
     if (!byOrigin) {
       const asked = trim(b.project, 100)
-      if (asked) projectId = resolveProjectId(asked) || projectId
+      if (asked) projectId = (await resolveProjectId(asked)) || projectId
     }
     // Запрос по ПДн — БЕЗ квоты на проект вообще, ни на приём, ни на уведомление
     // (см. развёрнутый разбор у leadNotifyBudgetOk выше, раунды 17 и 19): сохраняется,
@@ -1694,7 +1853,7 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     // контакта). Та же граница, что уже используется в findExistingContact/ADR-014.
     // Не нашли — оставляем contact_id пустым: сотрудник сопоставит вручную, а срок
     // уже идёт, поэтому запрос всё равно должен быть зарегистрирован.
-    const found = db
+    const found = await db
       .prepare('SELECT id FROM contacts WHERE anonymized_at IS NULL AND project_id = ? AND (lower(email) = lower(?) OR lower(messenger) = lower(?) OR phone = ?) ORDER BY id DESC LIMIT 1')
       .get(projectId, requester, requester, requester)
 
@@ -1707,41 +1866,39 @@ export function buildApp({ dbFile = ':memory:', secret = 'dev-secret', secure = 
     // PATCH .../anonymize ниже блокирует исполнение, пока сотрудник не подтвердит
     // личность по каналу из карточки контакта в CRM и не переведёт статус дальше.
     //
-    // INSERT + enqueue + запись идемпотентного ключа — ОДНОЙ транзакцией (независимая
-    // проверка нашла: раньше это были отдельные шаги ПОСЛЕ commit — сбой между ними
-    // оставлял запрос сохранённым, но ключ незаписанным, и повтор с тем же ключом
-    // создавал второй запрос, то есть второй 10-дневный срок по 152-ФЗ).
+    // ПЕРЕВОД НА POSTGRES: идемпотентный ключ уже застолблён ДО этой транзакции
+    // (claim-first, см. /api/leads выше) — INSERT + enqueue остаются одной
+    // транзакцией (сбой между ними не должен оставить запрос без уведомления
+    // о сроке), а статус ключа проставляется idempotencyFinish() уже после commit.
     const base = String(process.env.CRM_BASE_URL || '').trim().replace(/\/+$/, '')
-    const infoId = db.transaction(() => {
-      const info = db.prepare(`INSERT INTO pd_requests (contact_id, kind, status, requester, note, source, project_id, due_date, created_at, updated_at)
-        VALUES (?, ?, 'pending_unverified', ?, ?, ?, ?, ?, ?, ?)`)
+    const infoId = await withTransaction(db.pool, async (tx) => {
+      const info = await tx.prepare(`INSERT INTO pd_requests (contact_id, kind, status, requester, note, source, project_id, due_date, created_at, updated_at)
+        VALUES (?, ?, 'pending_unverified', ?, ?, ?, ?, ?, ?, ?) RETURNING id`)
         .run(found?.id ?? null, kind, requester, note, 'site-form', projectId, dueDate, ts, ts)
-
-      // Уведомление обезличено для ОБОИХ каналов, в отличие от заявок: здесь ПДн не
-      // нужны по существу — важны вид запроса и срок, кто именно — видно в CRM по ссылке.
-      // БЕЗ квоты на уведомление (раунд 19, см. комментарий выше) — ПДн-запрос
-      // уведомляет ВСЕГДА, каждый раз, без исключений.
-      enqueue(db, 'text', {
-        text: [
-          '⚠️ <b>Запрос по персональным данным</b>',
-          `Вид: ${PD_REQUEST_KINDS[kind] || `нераспознанный (${escHtml(kind)}) — нужна классификация`}`,
-          `Исполнить до: <b>${dueDate}</b>`,
-          found ? 'Клиент найден в базе автоматически.' : 'Клиента в базе не нашли — сопоставить вручную.',
-          base ? `Открыть: ${base}/crm/privacy` : 'Открыть раздел «Права ПДн» в CRM',
-        ].join('\n'),
-      })
-      if (requestId) {
-        try {
-          db.prepare('INSERT INTO idempotency_keys (scope, request_id, status_code, created_at) VALUES (?, ?, ?, ?)').run('pd_requests', requestId, 204, ts)
-        } catch (err) {
-          // см. аналогичный комментарий в /api/leads выше
-          if (err.code !== 'SQLITE_CONSTRAINT_UNIQUE') throw err
-        }
-      }
       return info.lastInsertRowid
-    })()
+    })
+
+    // Уведомление обезличено для ОБОИХ каналов, в отличие от заявок: здесь ПДн не
+    // нужны по существу — важны вид запроса и срок, кто именно — видно в CRM по ссылке.
+    // БЕЗ квоты на уведомление (раунд 19, см. комментарий выше) — ПДн-запрос
+    // уведомляет ВСЕГДА, каждый раз, без исключений. После commit, тем же принципом,
+    // что и у /api/leads выше.
+    await enqueue(db, 'text', {
+      text: [
+        '⚠️ <b>Запрос по персональным данным</b>',
+        `Вид: ${PD_REQUEST_KINDS[kind] || `нераспознанный (${escHtml(kind)}) — нужна классификация`}`,
+        `Исполнить до: <b>${dueDate}</b>`,
+        found ? 'Клиент найден в базе автоматически.' : 'Клиента в базе не нашли — сопоставить вручную.',
+        base ? `Открыть: ${base}/crm/privacy` : 'Открыть раздел «Права ПДн» в CRM',
+      ].join('\n'),
+    })
+    await idempotencyFinish(claim.id, 204)
     app.log?.info?.({ id: infoId, kind, projectId, matched: Boolean(found), suspicious }, 'pd request accepted')
     return reply.code(204).send()
+    } catch (err) {
+      await idempotencyAbandon(claim.id)
+      throw err
+    }
   })
 
   app.get('/api/health', async () => ({ ok: true }))

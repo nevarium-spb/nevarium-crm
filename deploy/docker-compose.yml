@@ -9,10 +9,14 @@ services:
       dockerfile: deploy/Dockerfile
     restart: unless-stopped
     env_file: .env
-    environment:
-      - DB_FILE=/data/crm.sqlite
-    volumes:
-      - crm-data:/data
+    # DB_FILE=/data/crm.sqlite убран (перевод на Postgres, план в nevarium-lab#3) —
+    # DATABASE_URL теперь приходит из .env (deploy/.env.example). ВАЖНО, ещё не
+    # решено: этот Вариант Б (самостоятельный VPS + docker-compose) предполагал
+    # SQLite прямо в томе контейнера — без него нужен ЛИБО отдельный сервис
+    # postgres: в этом файле (свой том под данные), ЛИБО управляемый Postgres вовне
+    # (как Timeweb в основном Варианте А). Ни один из них сюда пока не добавлен —
+    # не решение, принятое молча, а открытый пункт: этот compose сейчас не поднимет
+    # рабочую базу сам по себе, пока сюда не добавят postgres: или внешний DATABASE_URL.
     expose:
       - '3001'
 
@@ -30,6 +34,5 @@ services:
       - app
 
 volumes:
-  crm-data:
   caddy-data:
   caddy-config:

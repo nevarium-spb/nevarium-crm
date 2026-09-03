@@ -15,8 +15,10 @@ if (!secret || secret.length < 16) {
 // считаем от расположения этого файла, а не от текущей рабочей директории.
 const staticDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist')
 
-const app = buildApp({
-  dbFile: process.env.DB_FILE || './data/crm.sqlite',
+// DB_FILE (путь к SQLite) заменён на DATABASE_URL (строка подключения к Postgres) —
+// перевод на Postgres, план в nevarium-lab#3. buildApp — теперь async.
+const app = await buildApp({
+  dbConfig: process.env.DATABASE_URL,
   secret,
   secure: process.env.NODE_ENV !== 'development',
   logger: true,

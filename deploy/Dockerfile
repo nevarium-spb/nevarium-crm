@@ -4,7 +4,9 @@
 FROM node:20-alpine AS build
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci --ignore-scripts && npm rebuild better-sqlite3
+# better-sqlite3 убран (перевод на Postgres, план в nevarium-lab#3) — npm rebuild
+# для него больше не нужен: `pg` чистый JS, нативных биндингов под платформу нет.
+RUN npm ci --ignore-scripts
 COPY . .
 RUN npm run build
 

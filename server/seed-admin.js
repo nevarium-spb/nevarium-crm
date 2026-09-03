@@ -20,7 +20,10 @@ const isMain = import.meta.main ?? process.argv[1]?.endsWith('seed-admin.js')
 
 if (isMain) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
-  const db = openDb(process.env.DB_FILE || './data/crm.sqlite')
+  // DB_FILE (путь к файлу SQLite) заменён на DATABASE_URL (строка подключения к
+  // Postgres) — перевод на Postgres, план в nevarium-lab#3. openDb() без аргумента
+  // сама берёт его из process.env.
+  const db = await openDb(process.env.DATABASE_URL)
 
   const name = (await rl.question('Имя: ')).trim()
   const email = (await rl.question('Email: ')).trim().toLowerCase()
@@ -32,7 +35,7 @@ if (isMain) {
     process.exit(1)
   }
 
-  db.prepare('INSERT INTO users (name, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)').run(
+  await db.prepare('INSERT INTO users (name, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)').run(
     name, email, await hashPassword(password), 'admin', now()
   )
   console.log(`Администратор ${email} создан.`)

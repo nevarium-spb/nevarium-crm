@@ -7,8 +7,8 @@ const MAX_API = 'https://platform-api2.max.ru'
 // Outbox: уведомление переживает падение канала отправки — запись ретраится
 // каждые ~30 c, до 20 попыток (~10 минут) на каждый канал (Telegram, MAX) отдельно.
 // Исчерпавшие попытки записи остаются в таблице и видны в диагностике как «в очереди».
-export function enqueue(db, kind, payload) {
-  db.prepare('INSERT INTO outbox (kind, payload, created_at) VALUES (?, ?, ?)').run(kind, JSON.stringify(payload), now())
+export async function enqueue(db, kind, payload) {
+  await db.prepare('INSERT INTO outbox (kind, payload, created_at) VALUES (?, ?, ?)').run(kind, JSON.stringify(payload), now())
 }
 
 export async function sendTelegram(text, env = process.env) {
@@ -131,10 +131,10 @@ function leadHeader(lead) {
  * БД по contactId в момент отправки — сам outbox.payload остаётся обезличенным
  * (см. enqueue в app.js), ПДн не дублируются в очередь на диске.
  */
-export function leadMessageFull(lead, db, env = process.env) {
+export async function leadMessageFull(lead, db, env = process.env) {
   const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-  const contact = lead.contactId ? db.prepare('SELECT name, phone, email, messenger FROM contacts WHERE id = ?').get(lead.contactId) : null
-  const deal = lead.contactId ? db.prepare('SELECT title, note FROM deals WHERE contact_id = ? ORDER BY id DESC LIMIT 1').get(lead.contactId) : null
+  const contact = lead.contactId ? await db.prepare('SELECT name, phone, email, messenger FROM contacts WHERE id = ?').get(lead.contactId) : null
+  const deal = lead.contactId ? await db.prepare('SELECT title, note FROM deals WHERE contact_id = ? ORDER BY id DESC LIMIT 1').get(lead.contactId) : null
   const base = String(env.CRM_BASE_URL || '').trim().replace(/\/+$/, '')
   const link = base && lead.contactId ? `${base}/crm/contacts/${lead.contactId}` : null
   const contactLine = contact ? [contact.phone, contact.email, contact.messenger].filter(Boolean).join(' · ') : ''
@@ -154,9 +154,11 @@ export function leadMessageFull(lead, db, env = process.env) {
 // Каждый канал — свои sent_at/attempts/last_error (миграция v7): падение MAX не
 // должно ни блокировать Telegram, ни повторно слать туда, куда уже доставлено.
 // leadText разный: Telegram — обезличенный leadMessage, MAX — полный leadMessageFull.
+// leadText — async у обоих ради единообразия вызова ниже (await channel.leadText(...)):
+// у tg он не трогает БД и просто резолвится немедленно, у max — реально читает БД.
 const CHANNELS = [
-  { name: 'tg', sentCol: 'tg_sent_at', attemptsCol: 'tg_attempts', errorCol: 'tg_last_error', leadText: (payload) => leadMessage(payload) },
-  { name: 'max', sentCol: 'max_sent_at', attemptsCol: 'max_attempts', errorCol: 'max_last_error', leadText: (payload, db) => leadMessageFull(payload, db) },
+  { name: 'tg', sentCol: 'tg_sent_at', attemptsCol: 'tg_attempts', errorCol: 'tg_last_error', leadText: async (payload) => leadMessage(payload) },
+  { name: 'max', sentCol: 'max_sent_at', attemptsCol: 'max_attempts', errorCol: 'max_last_error', leadText: async (payload, db) => leadMessageFull(payload, db) },
 ]
 
 export function startOutboxWorker(db, { intervalMs = 30_000, senders = { tg: sendTelegram, max: sendMax }, log = console, autoStart = true } = {}) {
@@ -165,24 +167,37 @@ export function startOutboxWorker(db, { intervalMs = 30_000, senders = { tg: sen
     if (running) return
     running = true
     try {
+      // Внешний SELECT ниже раньше был синхронным чтением локального файла SQLite и
+      // на практике не падал никогда. Теперь это сетевой запрос к Postgres: обрыв
+      // соединения, исчерпанный пул, рестарт управляемой базы при обслуживании —
+      // штатные события. Без catch отказ здесь уходит НЕОБРАБОТАННЫМ отклонением
+      // промиса из колбэка setInterval, а это в Node по умолчанию валит весь процесс
+      // CRM. Ловим и логируем: следующий тик через intervalMs попробует снова, очередь
+      // в outbox никуда не девается.
       for (const channel of CHANNELS) {
         const send = senders[channel.name]
         if (!send) continue
-        const rows = db
+        const rows = await db
           .prepare(`SELECT * FROM outbox WHERE ${channel.sentCol} IS NULL AND ${channel.attemptsCol} < 20 ORDER BY id LIMIT 10`)
           .all()
         for (const row of rows) {
           try {
             const payload = JSON.parse(row.payload)
-            if (row.kind === 'lead') await send(channel.leadText(payload, db))
+            if (row.kind === 'lead') await send(await channel.leadText(payload, db))
             else if (row.kind === 'text') await send(payload.text)
-            db.prepare(`UPDATE outbox SET ${channel.sentCol} = ? WHERE id = ?`).run(now(), row.id)
+            await db.prepare(`UPDATE outbox SET ${channel.sentCol} = ? WHERE id = ?`).run(now(), row.id)
           } catch (err) {
-            db.prepare(`UPDATE outbox SET ${channel.attemptsCol} = ${channel.attemptsCol} + 1, ${channel.errorCol} = ? WHERE id = ?`).run(String(err), row.id)
+            await db.prepare(`UPDATE outbox SET ${channel.attemptsCol} = ${channel.attemptsCol} + 1, ${channel.errorCol} = ? WHERE id = ?`).run(String(err), row.id)
             log.warn?.(`outbox[${channel.name}]: попытка ${row[channel.attemptsCol] + 1} для #${row.id} не удалась: ${err}`)
           }
         }
       }
+    } catch (err) {
+      // Сюда попадают только отказы САМОЙ базы (внешний SELECT, или UPDATE счётчика
+      // попыток внутри catch выше) — доставка в мессенджеры разбирается своим catch
+      // построчно. Молча глотать нельзя, ронять процесс — тем более: логируем и ждём
+      // следующего тика.
+      log.error?.(`outbox: тик прерван ошибкой базы, повтор через ${Math.round(intervalMs / 1000)} c: ${err}`)
     } finally {
       running = false
     }

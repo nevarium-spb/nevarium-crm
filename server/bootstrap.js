@@ -11,7 +11,7 @@ export async function bootstrapAdmin(db, { log = console, env = process.env } = 
   const { BOOTSTRAP_ADMIN_EMAIL: email, BOOTSTRAP_ADMIN_PASSWORD: password, BOOTSTRAP_ADMIN_NAME: name } = env
   if (!email || !password) return false
 
-  const existing = db.prepare('SELECT COUNT(*) c FROM users').get().c
+  const existing = (await db.prepare('SELECT COUNT(*) c FROM users').get()).c
   if (existing > 0) {
     log.warn?.('BOOTSTRAP_ADMIN_* заданы, но пользователи уже есть — пропускаю (снимите переменные из настроек)')
     return false
@@ -21,7 +21,7 @@ export async function bootstrapAdmin(db, { log = console, env = process.env } = 
     return false
   }
 
-  db.prepare('INSERT INTO users (name, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)').run(
+  await db.prepare('INSERT INTO users (name, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)').run(
     (name || 'Админ').trim(),
     email.trim().toLowerCase(),
     await hashPassword(password),
