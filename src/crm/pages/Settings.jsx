@@ -41,6 +41,11 @@ export default function Settings({ user }) {
       if (err instanceof SyntaxError) toast('Файл повреждён — ничего не импортировано', 'error')
       else if (err.data?.error === 'newer_version') toast('Файл из более новой версии — обновите приложение', 'error')
       else if (err.data?.error === 'bad_file') toast('Файл повреждён — ничего не импортировано', 'error')
+      // Отдельная ветка, и она важна именно в аварии: сервер отличает «файл плохой» от
+      // «база сейчас не может». Без неё временный отказ выглядел бы как испорченный
+      // бэкап, и его могли бы выбросить — а он единственный.
+      else if (err.data?.error === 'db_unavailable') toast('База временно недоступна — файл цел, повторите восстановление', 'error')
+      else if (err.data?.error === 'maintenance') toast('Идёт восстановление базы — повторите через минуту', 'error')
       else apiErrorToast(err)
     } finally {
       if (fileRef.current) fileRef.current.value = ''

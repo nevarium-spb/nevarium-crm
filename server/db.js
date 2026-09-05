@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
-import { createDb, resyncIdentitySequence, withTransaction } from './db-adapter.js'
+import { createDb, resyncIdentitySequence, withReadSnapshot, withTransaction } from './db-adapter.js'
 
 export { STAGES, TERMINAL_STAGES } from '../src/shared/stages.js'
 
@@ -19,6 +19,15 @@ export { STAGES, TERMINAL_STAGES } from '../src/shared/stages.js'
 pg.types.setTypeParser(20, (v) => parseInt(v, 10))
 
 const SCHEMA_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'schema.sql')
+
+/**
+ * Сколько ЛЮБОЙ запрос ждёт блокировки, прежде чем отказаться. Единственное место,
+ * где это задаётся: применяется ко всему пулу при подключении.
+ *
+ * Смысл числа — «дольше самого долгого честного ожидания, но заметно меньше терпения
+ * человека». Восстановление дампа сюда не относится: оно снимает потолок у себя.
+ */
+export const LOCK_WAIT_MS = 10000
 
 /**
  * Проекты — единственные строки со вставленным вручную id (1/2), на которые
@@ -44,10 +53,19 @@ const SEED_PROJECTS = [
  * Не строка и не null/undefined — значит это пул; так и определяем, что делать.
  */
 export async function openDb(dbConfig) {
+  // lock_timeout задаётся НА ВЕСЬ ПУЛ, а не точечно перед ожиданием барьера. Точечный
+  // `SET LOCAL` защищал только тех, кто до барьера дошёл, — а захват ключа
+  // идемпотентности и воркер очереди работают на голом соединении, мимо транзакции, и
+  // на восстановлении вставали бы намертво шагом раньше (найдено red team). На уровне
+  // пула обойти его нельзя ничем. Само восстановление снимает потолок у себя явно
+  // (`SET LOCAL lock_timeout = 0`): оно обязано дождаться, а не отступить.
   const pool =
     dbConfig && typeof dbConfig !== 'string'
       ? dbConfig
-      : new pg.Pool({ connectionString: dbConfig || process.env.DATABASE_URL })
+      : new pg.Pool({
+          connectionString: dbConfig || process.env.DATABASE_URL,
+          options: `-c lock_timeout=${LOCK_WAIT_MS}ms`,
+        })
 
   // schema.sql — целиком IF NOT EXISTS, безопасно применять на каждом старте
   // (см. преамбулу schema.sql) — миграционной истории/PRAGMA user_version
@@ -156,8 +174,22 @@ export const DEFAULT_PROJECT_ID = 1
  */
 export const DUMP_TABLES = ['contacts', 'deals', 'consents', 'tasks', 'interactions', 'pd_requests', 'audit_log']
 
-/** У этих таблиц есть колонка demo — демо-строки в дамп не берём. */
-const DEMO_FILTERED = new Set(['contacts', 'deals', 'tasks', 'interactions'])
+/**
+ * ДЕМО-СТРОКИ ТЕПЕРЬ ВХОДЯТ В ДАМП. Раньше они отсеивались (`WHERE demo = 0`), и в
+ * SQLite это было безобидно — внешних ключей там не было вовсе. После перехода на
+ * Postgres `deals.contact_id`/`interactions.contact_id` — настоящие `NOT NULL
+ * REFERENCES contacts(id)`, а завести НЕ демо-сделку на демо-контакте можно обычным
+ * интерфейсом: демо-контакты видны в общем списке, а обработчик создания колонку
+ * `demo` не проставляет. Такой ребёнок уезжал в дамп без родителя, и импорт этого же
+ * файла падал на внешнем ключе — ночной бэкап оказывался невосстановим, и выяснялось
+ * это только в аварии (найдено независимым ревью, воспроизведено).
+ *
+ * Из двух починок выбрана эта, а не «отсеивать и детей демо-родителей»: та молча
+ * теряла бы НАСТОЯЩУЮ сделку из бэкапа. Демо-строки в дампе безвредны — они помечены
+ * `demo = 1`, импорт колонку принимает, а кнопка «Удалить демо-данные» работает и
+ * после восстановления.
+ */
+const DEMO_FILTERED = new Set()
 
 /**
  * Версия формата дампа. v1 — без pd_requests и audit_log (дампы до 2026-07-30).
@@ -167,13 +199,27 @@ const DEMO_FILTERED = new Set(['contacts', 'deals', 'tasks', 'interactions'])
  */
 export const DUMP_VERSION = 4
 
+/**
+ * Дамп — ОДИН согласованный снимок базы, не серия независимых чтений
+ * (withReadSnapshot, db-adapter.js). Это не перестраховка: заявки приходят с
+ * сайтов круглосуточно и сами, а ночной бэкап читает семь таблиц подряд. Через
+ * пул каждая из них читалась бы своим соединением и своим снимком — заявка,
+ * закоммитившаяся между `contacts` и `deals`, положила бы в файл сделку без её
+ * контакта. `deals.contact_id` — NOT NULL REFERENCES contacts(id), поэтому
+ * импорт такого файла падает на внешнем ключе. Отказ был бы тихим вдвойне:
+ * бэкап создаётся, уходит в MAX, выглядит рабочим — и оказывается негодным
+ * ровно в момент аварии, когда он единственный путь восстановления (ADR-013).
+ */
 export async function buildDump(db) {
   const data = { version: DUMP_VERSION, exportedAt: now() }
-  for (const t of DUMP_TABLES) {
-    data[t] = await db.prepare(`SELECT * FROM ${t}${DEMO_FILTERED.has(t) ? ' WHERE demo = 0' : ''}`).all()
-  }
-  // Пользователи — только для справки «кто был в команде»: импорт их не восстанавливает,
-  // иначе чужие хеши паролей могли бы заменить текущего администратора и запереть вход.
-  data.team = await db.prepare('SELECT id, name, email, role FROM users').all()
+  await withReadSnapshot(db.pool, async (snap) => {
+    for (const t of DUMP_TABLES) {
+      data[t] = await snap.prepare(`SELECT * FROM ${t}${DEMO_FILTERED.has(t) ? ' WHERE demo = 0' : ''}`).all()
+    }
+    // Пользователи — только для справки «кто был в команде»: импорт их не восстанавливает,
+    // иначе чужие хеши паролей могли бы заменить текущего администратора и запереть вход.
+    // Читается тем же снимком — «команда» должна соответствовать остальному файлу.
+    data.team = await snap.prepare('SELECT id, name, email, role FROM users').all()
+  })
   return data
 }

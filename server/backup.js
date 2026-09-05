@@ -40,7 +40,21 @@ export async function runBackup(db, {
   const stamp = new Date().toISOString().slice(0, 10)
 
   const jsonFile = path.join(dir, `crm-${stamp}.json`)
-  fs.writeFileSync(jsonFile, JSON.stringify(await buildDump(db)))
+  // Сборка дампа обязана СООБЩИТЬ о своём провале, а не просто бросить. Ниже уже есть
+  // статус «создан, но не отправился»; а вот «не создан вовсе» уходил только в лог
+  // процесса — который на App Platform теряется при передеплое (ADR-008). Для
+  // неприсматриваемой ночной задачи, чей результат и есть единственный путь
+  // восстановления (ADR-013), это означало: неудавшийся бэкап неотличим от удавшегося,
+  // и владелец узнаёт правду в аварии (найдено red team). У buildDump с этой сессии
+  // появились новые способы упасть — ему теперь нужно соединение пула и снимок
+  // REPEATABLE READ, а пул может быть занят восстановлением.
+  try {
+    fs.writeFileSync(jsonFile, JSON.stringify(await buildDump(db)))
+  } catch (err) {
+    log.error?.(`backup: дамп не собран: ${err}`)
+    try { await sendStatus(`🛑 Бэкап CRM за ${stamp} НЕ СОЗДАН: ${err}. Проверьте базу — восстанавливаться сейчас нечем.`, env) } catch {}
+    throw err
+  }
 
   // Ротация по 7 датам.
   const stamps = [...new Set(fs.readdirSync(dir)

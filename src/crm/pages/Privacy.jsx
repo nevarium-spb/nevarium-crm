@@ -55,6 +55,10 @@ export default function Privacy({ user }) {
       if (err.data?.error === 'no_contact') toast('Сначала укажите, кто из контактов это', 'error')
       else if (err.data?.error === 'kind_not_erasable') toast('Для такого вида запроса обезличивание не нужно', 'error')
       else if (err.data?.error === 'not_verified') toast('Сначала подтвердите личность отправителя', 'error')
+      // Контакт перенесли в другой проект после того, как запрос к нему привязали:
+      // сервер сверяет проект заново под блокировкой и отказывает. Без этой ветки
+      // сотрудник видел бы «Ошибка сервера» на своё же законное действие.
+      else if (err.data?.error === 'bad_reference') toast('Контакт перенесён в другой проект — переприкрепите запрос', 'error')
       else apiErrorToast(err)
     }
   }
@@ -69,7 +73,11 @@ export default function Privacy({ user }) {
       await api(`/crm/pd-requests/${row.id}`, { method: 'PATCH', body: { status: 'new' } })
       toast('Личность подтверждена, запрос можно исполнять')
       load()
-    } catch (err) { apiErrorToast(err) }
+    } catch (err) {
+      if (err.data?.error === 'bad_reference') toast('Контакт перенесён в другой проект — переприкрепите запрос', 'error')
+      else if (err.data?.error === 'no_contact') toast('Сначала укажите, кто из контактов это', 'error')
+      else apiErrorToast(err)
+    }
   }
 
   const reject = async (row) => {

@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { now } from './db.js'
+import { withTransaction, maintenanceBarrier } from './db-adapter.js'
 
 const MAX_API = 'https://platform-api2.max.ru'
 
@@ -182,9 +183,37 @@ export function startOutboxWorker(db, { intervalMs = 30_000, senders = { tg: sen
           .all()
         for (const row of rows) {
           try {
-            const payload = JSON.parse(row.payload)
-            if (row.kind === 'lead') await send(await channel.leadText(payload, db))
-            else if (row.kind === 'text') await send(payload.text)
+            // Текст собирается В ТРАНЗАКЦИИ ПОД БАРЬЕРОМ и с перепроверкой строки
+            // (найдено red team). Очередь намеренно обезличена: в ней только
+            // contactId, а имя и телефон достаются из БД ИМЕННО ЗДЕСЬ (ADR-009).
+            // Партия из 10 строк с таймаутом отправки 10 c растягивается на минуты,
+            // и восстановление дампа успевало закоммититься посреди неё: строку
+            // очереди импорт уже удалил, контакты заменены целиком — и следующая
+            // строка партии разрешала свой contactId в ДРУГОГО человека, отправляя
+            // в MAX его имя и телефон под заголовком чужой заявки. Молча: финальный
+            // UPDATE просто не находил строку. Барьер не даёт восстановлению
+            // вклиниться, а перепроверка ловит уже случившееся: строки нет — значит
+            // заявку откатили вместе с ней, отправлять нечего.
+            //
+            // Сама отправка — СНАРУЖИ транзакции: держать барьер на время сетевого
+            // вызова значило бы, что восстановление ждёт мессенджер.
+            let text = null
+            if (db.pool) {
+              await withTransaction(db.pool, async (tx) => {
+                await maintenanceBarrier(tx)
+                const fresh = await tx.prepare(`SELECT id, kind, payload FROM outbox WHERE id = ? FOR UPDATE`).get(row.id)
+                if (!fresh) return
+                const payload = JSON.parse(fresh.payload)
+                text = fresh.kind === 'lead' ? await channel.leadText(payload, tx) : payload.text
+              })
+            } else {
+              // Путь без пула (старые тесты передают db-подобную заглушку) — прежнее
+              // поведение, без барьера: там восстановления не бывает.
+              const payload = JSON.parse(row.payload)
+              text = row.kind === 'lead' ? await channel.leadText(payload, db) : payload.text
+            }
+            if (text === null || text === undefined) continue
+            await send(text)
             await db.prepare(`UPDATE outbox SET ${channel.sentCol} = ? WHERE id = ?`).run(now(), row.id)
           } catch (err) {
             await db.prepare(`UPDATE outbox SET ${channel.attemptsCol} = ${channel.attemptsCol} + 1, ${channel.errorCol} = ? WHERE id = ?`).run(String(err), row.id)

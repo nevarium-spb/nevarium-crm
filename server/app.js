@@ -3,7 +3,7 @@ import Fastify from 'fastify'
 import cookie from '@fastify/cookie'
 import staticPlugin from '@fastify/static'
 import { DEFAULT_PROJECT_ID, DUMP_TABLES, DUMP_VERSION, PD_REQUEST_KINDS, WINBACK_STEPS, addWorkdays, buildDump, openDb, now, STAGES, TERMINAL_STAGES } from './db.js'
-import { withTransaction, resyncIdentitySequence, tryClaimIdempotencyKey } from './db-adapter.js'
+import { withTransaction, resyncIdentitySequence, lockTablesForRestore, maintenanceBarrier, tryClaimIdempotencyKey } from './db-adapter.js'
 import { hashPassword, verifyPassword, fakeVerifyDelay, verifyOrFake, signToken, verifyToken, reserveVerify, loginSucceeded, sleep, admitLoginRequest, releaseLoginRequest, SESSION_TTL_DAYS, MIN_PASSWORD_LENGTH, MIN_ADMIN_PASSWORD_LENGTH } from './auth.js'
 import { enqueue } from './telegram.js'
 
@@ -56,6 +56,24 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   const app = Fastify({ logger, trustProxy })
   app.register(cookie)
   app.decorate('db', db)
+
+  // «Не дождались барьера обслуживания» — это НЕ сбой приложения, а «идёт
+  // восстановление базы, повторите». Отдаём 503, а не 500: 5xx сайты и так трактуют
+  // как повторяемое, но 503 честно называет причину, и в логи не сыпятся ложные
+  // стектрейсы во время планового восстановления (см. maintenanceBarrier).
+  app.setErrorHandler((err, req, reply) => {
+    // Не дождались блокировки — 503, а не 500. Кроме самого барьера сюда попадают
+    // и построчные блокировки (`SELECT ... FOR UPDATE` в PATCH, DELETE, обезличивании):
+    // потолок ожидания задан на весь пул, поэтому 55P03 может прилететь из любого
+    // места транзакции, а не только из maintenanceBarrier (найдено независимым ревью).
+    // 40P01 — взаимная блокировка, тоже повторяемое состояние, а не порча данных.
+    const sqlState = String(err?.code ?? '')
+    if (err?.maintenanceBusy || sqlState === '55P03' || sqlState === '57014' || sqlState === '40P01') {
+      req.log?.warn?.({ url: req.url, sqlState }, 'запрос отклонён: база занята (вероятно, идёт восстановление)')
+      return reply.code(503).send({ error: 'maintenance', hint: 'база занята, повторите запрос' })
+    }
+    reply.send(err)
+  })
 
   // Скользящее окно per-IP для публичного приёма лидов: не отбрасываем,
   // а помечаем «подозрительный» (CGNAT в РФ делает ложные срабатывания реальными).
@@ -160,16 +178,32 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // заявку — иначе сам сигнал стал бы тем потоком, который призван предотвращать.
   const leadQuotaWarnedAt = new Map()
   /** true — бюджет уведомлений о лидах на проект ещё не исчерпан (можно enqueue). */
-  async function leadNotifyBudgetOk(projectId) {
+  /** `runner` — обязательно передавать `tx`, если вызов идёт ИЗНУТРИ транзакции.
+   * Ветка исчерпанного бюджета сама обращается к базе (читает проект и ставит
+   * эскалационное уведомление), и через пул это означало бы захват ВТОРОГО
+   * соединения при уже удерживаемом первом: на маленьком пуле — верный тупик, а
+   * эскалационное уведомление коммитилось бы независимо от судьбы самой заявки
+   * (найдено независимым ревью). */
+  // Проект, по которому эскалационное уведомление поставлено в очередь, но ещё не
+  // закоммичено. Отметку в leadQuotaWarnedAt ставим только после успешного коммита —
+  // см. комментарий внутри.
+  let pendingQuotaWarn = null
+  async function leadNotifyBudgetOk(projectId, runner = db) {
+    pendingQuotaWarn = null
     const nowMs = Date.now()
     const list = (leadProjectHits.get(projectId) || []).filter((t) => nowMs - t < LEAD_PROJECT_QUOTA_WINDOW_MS)
     if (list.length >= LEAD_PROJECT_QUOTA_MAX) {
       leadProjectHits.set(projectId, list)
       const warnedAt = leadQuotaWarnedAt.get(projectId) || 0
       if (nowMs - warnedAt >= LEAD_PROJECT_QUOTA_WINDOW_MS) {
-        leadQuotaWarnedAt.set(projectId, nowMs)
-        const project = await db.prepare('SELECT display_name FROM projects WHERE id = ?').get(projectId)
-        await enqueue(db, 'text', {
+        // Отметку «уже предупредили» ставит ВЫЗЫВАЮЩИЙ после коммита, не мы здесь
+        // (найдено red team): пометка в памяти откат не переживает, а вот заглушить
+        // эскалацию на целый час она успевала. Откаты как раз наиболее вероятны во
+        // время восстановления — то есть ровно тогда, когда идёт наплыв, и владелец
+        // получил бы вместо предупреждения тишину, неотличимую от затишья.
+        pendingQuotaWarn = projectId
+        const project = await runner.prepare('SELECT display_name FROM projects WHERE id = ?').get(projectId)
+        await enqueue(runner, 'text', {
           text: [
             '⚠️ <b>Много заявок за час</b>',
             `Проект: ${project?.display_name || projectId}`,
@@ -212,6 +246,14 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // отличие от leadHits/hardHits, это таблица в БД на диске, не Map в памяти,
   // которая хотя бы обнуляется рестартом). Сутки — с большим запасом.
   const IDEMPOTENCY_RETENTION_MS = 24 * 60 * 60_000
+
+  // Аренда на НЕЗАВЕРШЁННЫЙ захват ключа (status_code IS NULL). Обработка, которая
+  // не уложилась в это время, считается брошенной — её ключ можно перезахватить
+  // (см. idempotencyClaim). Минута: честный путь — несколько INSERT'ов в одной
+  // транзакции, доли секунды даже при плохой сети, так что ложный перехват живой
+  // обработки практически исключён; а вот держать человека у формы сутками из-за
+  // однажды умершего процесса — нельзя.
+  const IDEMPOTENCY_LEASE_MS = 60_000
 
   const leadSweep = setInterval(() => {
     const nowMs = Date.now()
@@ -308,9 +350,49 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     for (let attempt = 0; attempt < 3; attempt++) {
       const claimedId = await tryClaimIdempotencyKey(db, scope, requestId, now())
       if (claimedId !== null) return { claimed: true, id: claimedId }
-      const row = await db.prepare('SELECT status_code FROM idempotency_keys WHERE scope = ? AND request_id = ?').get(scope, requestId)
+      const row = await db.prepare('SELECT id, status_code, created_at FROM idempotency_keys WHERE scope = ? AND request_id = ?').get(scope, requestId)
       if (row && row.status_code !== null) return { claimed: false, statusCode: row.status_code }
       // Ключ занят, но status_code ещё NULL — чужая обработка не успела закончиться.
+      // ЛИБО не закончится никогда: процесс, застолбивший ключ, мог умереть между
+      // INSERT'ом ключа и своей транзакцией (передеплой, OOM, рестарт контейнера),
+      // и тогда обработчик ошибки не отработал — снимать застолбление стало некому.
+      // Без аренды такой ключ жил бы до уборщика (IDEMPOTENCY_RETENTION_MS = сутки),
+      // а всё это время повторы сайта с ним получали бы 429: человек отправил форму
+      // один раз и не может отправить её снова целые сутки.
+      //
+      // Перезахват брошенного — УДАЛИТЬ просроченную строку и завести НОВУЮ, а не
+      // сдвинуть `created_at` у прежней. Разница принципиальная, и первая версия
+      // этой правки была из-за неё неверной (поймано независимой проверкой).
+      //
+      // Аренда — это догадка о том, что прежний владелец мёртв, а не доказательство:
+      // ни heartbeat'а, ни таймаута на стороне базы у нас нет. Значит «мёртвый»
+      // процесс может ожить (длинная пауза GC, залипшая сеть, медленный ответ базы)
+      // и продолжить с того же места. Пока перезахват сохранял ТОТ ЖЕ id, у ожившего
+      // оставался годный ключ: он дописывал свою транзакцию и отвечал 204 — второй
+      // запрос по ПДн, второе уведомление, второй 10-дневный срок по 152-ФЗ на одно
+      // обращение. Хуже того, его поздний обработчик ошибки удалял бы уже ЧУЖОЙ,
+      // живой захват.
+      //
+      // Новая строка получает новый id (IDENTITY их не переиспользует), поэтому у
+      // ожившего владельца ключ становится мёртвым сам собой: и idempotencyFinish,
+      // и idempotencyAbandon адресуются по id и просто не находят строки. Дальше
+      // finish это замечает (см. ниже) и заставляет откатить уже начатую работу.
+      // Гонку двух перехватчиков разрешает сама база: удалить строку успеет только
+      // один (условный DELETE с RETURNING), а если между его DELETE и INSERT влезет
+      // кто-то третий — INSERT упрётся в UNIQUE и вернёт null, и мы просто пойдём
+      // на следующий круг цикла, а не присвоим себе чужой захват.
+      if (row) {
+        const cutoff = new Date(Date.now() - IDEMPOTENCY_LEASE_MS).toISOString()
+        if (row.created_at < cutoff) {
+          const dropped = await db
+            .prepare('DELETE FROM idempotency_keys WHERE id = ? AND status_code IS NULL AND created_at < ? RETURNING id')
+            .get(row.id, cutoff)
+          if (dropped) {
+            const fresh = await tryClaimIdempotencyKey(db, scope, requestId, now())
+            if (fresh !== null) return { claimed: true, id: fresh }
+          }
+        }
+      }
       // Короткая пауза и повтор: это простые INSERT/UPDATE, не bcrypt, обычно
       // укладывается в первую же паузу.
       await sleep(150)
@@ -318,16 +400,47 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     return { claimed: false, statusCode: 429 }
   }
   /** Записать финальный код ответа по застолблённому ключу. id===null — идемпотентность
-   * не участвовала (ключ не был прислан) — тихо ничего не делаем. */
-  async function idempotencyFinish(id, statusCode) {
-    if (id == null) return
-    await db.prepare('UPDATE idempotency_keys SET status_code = ? WHERE id = ?').run(statusCode, id)
+   * не участвовала (ключ не был прислан) — тихо ничего не делаем.
+   *
+   * `tx` (необязательный, как у audit()) — выполнить внутри уже открытой транзакции,
+   * чтобы «запись создана» и «ключ закрыт успехом» были одним неделимым фактом.
+   * Без него между ними есть окно, в котором запись уже есть, а ключ ещё нет —
+   * и обработчик ошибки, сняв застолбление, открывает дорогу повтору-дублю. */
+  async function idempotencyFinish(id, statusCode, tx = null) {
+    // Ключ не присылали — идемпотентность не участвует, владеть нечем: «успех».
+    if (id == null) return true
+    // `status_code IS NULL` — двойная роль. Во-первых, наш захват мог быть
+    // перехвачен по аренде, и тогда строки с этим id уже нет вовсе (перезахват
+    // заводит НОВУЮ строку, см. idempotencyClaim) — 0 строк, владение потеряно.
+    // Во-вторых, повторно закрыть уже закрытый ключ нельзя: закешированный ответ
+    // не должен подменяться задним числом.
+    const res = await (tx ?? db)
+      .prepare('UPDATE idempotency_keys SET status_code = ? WHERE id = ? AND status_code IS NULL')
+      .run(statusCode, id)
+    return res.changes === 1
+  }
+  /** Ошибка «наш захват перехватили» — обработчик обязан откатить свою работу и
+   * ответить тем, что уже сделал перехватчик, а не создавать вторую запись. */
+  class IdempotencyLost extends Error {
+    constructor() {
+      super('idempotency_claim_lost')
+      this.idempotencyLost = true
+    }
   }
   /** Снять застолбление при настоящей ошибке (не штатный ранний выход) — иначе
-   * ключ висит с status_code=NULL навсегда, и повтор с ним бьётся в 429 без конца. */
+   * ключ висит с status_code=NULL навсегда, и повтор с ним бьётся в 429 без конца.
+   *
+   * `status_code IS NULL` в условии — обязательно, а не для красоты. Сценарий,
+   * который без него ломается (найден независимой проверкой): транзакция УСПЕШНО
+   * коммитит запрос, уведомление и `status_code = 204`, но подтверждение COMMIT
+   * теряется по сети. `withTransaction` видит отказ и пробрасывает ошибку, сюда
+   * приходит вызов — и безусловный DELETE сносил ключ, у которого закоммичен
+   * успешный ответ. Повтор сайта с тем же ключом заводил ВТОРОЙ запрос по ПДн
+   * при уже существующем первом. С этим условием завершённый ключ переживает
+   * неоднозначный коммит, и повтор получает свой законный кешированный 204. */
   async function idempotencyAbandon(id) {
     if (id == null) return
-    await db.prepare('DELETE FROM idempotency_keys WHERE id = ?').run(id).catch(() => {})
+    await db.prepare('DELETE FROM idempotency_keys WHERE id = ? AND status_code IS NULL').run(id).catch(() => {})
   }
 
   const getUser = async (req) => {
@@ -387,14 +500,38 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // запрос) запись аудита закоммитилась бы независимо от исхода транзакции, которую
   // она описывает: полдела отката, полдела нет. У better-sqlite3 (одно соединение
   // на процесс) это было бесплатной гарантией, у pg — нет, нужно явно.
+  /**
+   * Транзакция мутации, начинающаяся с РАЗДЕЛЯЕМОГО барьера обслуживания
+   * (см. maintenanceBarrier в server/db-adapter.js). Использовать везде, где
+   * прочитанные данные определяют, что именно будет записано или удалено:
+   * иначе чтение может прийтись на состояние ДО восстановления дампа, а запись —
+   * уже на восстановленные строки с теми же id, то есть на чужие данные.
+   * Разделяемые барьеры друг с другом не конфликтуют — обычная работа идёт
+   * параллельно, как и раньше; ждать приходится только импорту и во время импорта.
+   */
+  const withMutation = (fn) =>
+    withTransaction(db.pool, async (tx) => {
+      await maintenanceBarrier(tx)
+      return fn(tx)
+    })
+
   const audit = async (req, action, entity, id, detail = '', runner = db) => {
     app.log?.info?.({ user: req.user?.email, action, entity, id, detail }, 'mutation')
     try {
       await runner.prepare('INSERT INTO audit_log (user_id, user_email, action, entity, entity_id, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
         .run(req.user?.id ?? null, req.user?.email ?? '', action, entity, id ?? null, trim(detail, 500), now())
     } catch (err) {
-      // Журнал не должен ломать сам запрос: потерянная строка аудита хуже, чем
-      // упавшее сохранение контакта, но не настолько, чтобы отменять операцию.
+      // ВНУТРИ транзакции ошибку глушить НЕЛЬЗЯ — только снаружи. Разница не
+      // стилистическая: в PostgreSQL любой упавший оператор переводит транзакцию в
+      // состояние отказа, и последующий COMMIT молча выполняется как ROLLBACK, без
+      // ошибки. То есть проглоченная здесь ошибка отменяла бы всю операцию, которую
+      // эта запись описывает, а обработчик всё равно отвечал бы 200: правка исчезла,
+      // сообщений нет. Это ровно противоположно смыслу параметра `runner` (см.
+      // комментарий выше: запись аудита обязана разделить судьбу транзакции).
+      //
+      // Снаружи транзакции прежнее поведение сохраняется: потерянная строка журнала
+      // не повод отменять сохранение контакта.
+      if (runner !== db) throw err
       app.log?.warn?.(`audit: не удалось записать: ${err}`)
     }
   }
@@ -524,44 +661,52 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
    * клиентах просто забывают.
    * Повторно серию не создаём: если активная уже есть, значит сделку уже отказывали.
    */
-  async function startWinback(dealId, userId, reason = '') {
-    const deal = await db.prepare('SELECT contact_id FROM deals WHERE id = ?').get(dealId)
-    if (!deal) return null
-    const active = await db.prepare("SELECT id FROM winback_sequences WHERE deal_id = ? AND status = 'active'").get(dealId)
-    if (active) return active.id
+  /** `parentTx` (необязательный, как у audit()/anonymizeContact) — работать внутри уже
+   * открытой транзакции. Вложенных транзакций адаптер не поддерживает, поэтому свою
+   * НЕ открываем, когда её нам передали. Проверка «активная серия уже есть» обязана
+   * идти по тому же соединению, что и вставка, иначе она читает чужой снимок. */
+  async function startWinback(dealId, userId, reason = '', parentTx = null) {
+    const run = async (q) => {
+      const deal = await q.prepare('SELECT contact_id FROM deals WHERE id = ?').get(dealId)
+      if (!deal) return null
+      const active = await q.prepare("SELECT id FROM winback_sequences WHERE deal_id = ? AND status = 'active'").get(dealId)
+      if (active) return active.id
 
-    const ts = now()
-    return withTransaction(db.pool, async (tx) => {
-      const seqRes = await tx
+      const ts = now()
+      const seqRes = await q
         .prepare('INSERT INTO winback_sequences (deal_id, contact_id, reason, started_at, created_by) VALUES (?, ?, ?, ?, ?) RETURNING id')
         .run(dealId, deal.contact_id, trim(reason, 500), ts, userId ?? null)
       const seqId = seqRes.lastInsertRowid
-      const insert = tx.prepare(
+      const insert = q.prepare(
         'INSERT INTO tasks (title, contact_id, deal_id, due_date, winback_sequence_id, created_at, updated_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
       )
       for (const step of WINBACK_STEPS) {
         await insert.run(step.title, deal.contact_id, dealId, mskToday(step.days), seqId, ts, ts, userId ?? null)
       }
       return seqId
-    })
+    }
+    return parentTx ? run(parentTx) : withMutation(run)
   }
 
   /**
    * Сделку вернули из «Проиграно» в работу — незакрытые напоминания больше не нужны.
    * Выполненные задачи не трогаем: это уже история работы с клиентом.
    */
-  async function cancelWinback(dealId) {
-    const active = await db.prepare("SELECT id FROM winback_sequences WHERE deal_id = ? AND status = 'active'").all(dealId)
-    if (!active.length) return 0
-    return withTransaction(db.pool, async (tx) => {
+  async function cancelWinback(dealId, parentTx = null) {
+    const run = async (q) => {
+      // Список активных серий читается ТЕМ ЖЕ соединением, что и удаление: раньше
+      // он брался снаружи транзакции и мог не увидеть серию, созданную параллельным
+      // запросом, — тогда отмена «ничего не нашла», а серия оставалась жить.
+      const active = await q.prepare("SELECT id FROM winback_sequences WHERE deal_id = ? AND status = 'active'").all(dealId)
       let removed = 0
       for (const seq of active) {
-        const del = await tx.prepare('DELETE FROM tasks WHERE winback_sequence_id = ? AND done = 0').run(seq.id)
+        const del = await q.prepare('DELETE FROM tasks WHERE winback_sequence_id = ? AND done = 0').run(seq.id)
         removed += del.changes
-        await tx.prepare("UPDATE winback_sequences SET status = 'cancelled', finished_at = ? WHERE id = ?").run(now(), seq.id)
+        await q.prepare("UPDATE winback_sequences SET status = 'cancelled', finished_at = ? WHERE id = ?").run(now(), seq.id)
       }
       return removed
-    })
+    }
+    return parentTx ? run(parentTx) : withMutation(run)
   }
 
   /** Проект по origin сайта (см. колонку projects.origins). null — не наш домен. */
@@ -625,59 +770,72 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       const data = pick(req.body ?? {}, spec)
       for (const f of spec.required) if (!data[f]) return reply.code(400).send({ error: `field_required`, field: f })
       if (name === 'deals' && data.stage && !STAGES.includes(data.stage)) return reply.code(400).send({ error: 'bad_stage' })
-      if (PROJECT_SCOPED.has(name)) {
-        if (data.project_id !== undefined) {
-          const pid = await resolveProjectId(data.project_id)
-          if (!pid) return reply.code(400).send({ error: 'bad_project' })
-          data.project_id = pid
-        } else if (name === 'deals') {
-          // сделка наследует проект своего контакта — чтобы они не разъехались
-          const owner = await db.prepare('SELECT project_id FROM contacts WHERE id = ?').get(data.contact_id)
-          if (owner) data.project_id = owner.project_id
-        }
+      if (PROJECT_SCOPED.has(name) && data.project_id !== undefined) {
+        const pid = await resolveProjectId(data.project_id)
+        if (!pid) return reply.code(400).send({ error: 'bad_project' })
+        data.project_id = pid
       }
       if (name === 'interactions') data.happened_at = data.happened_at || now()
       const ts = now()
-      // предупреждение о дубликате контакта по телефону/email
+
+      // Создание — тоже под барьером обслуживания и одной транзакцией (найдено
+      // независимым ревью). Оба чтения ниже определяют, ЧТО будет записано:
+      // наследование проекта берётся у контакта, а предупреждение о дубле — по
+      // существующим карточкам. Через пул они читались до барьера, и во время
+      // восстановления дампа сделка привязывалась бы к контакту №N, каким тот был
+      // ДО restore, тогда как после restore под этим номером уже другой человек.
       let duplicateOf = null
-      if (name === 'contacts' && (data.phone || data.email)) {
-        const dup = await db
-          .prepare("SELECT id, name FROM contacts WHERE archived = 0 AND ((phone != '' AND phone = ?) OR (email != '' AND email = ?)) LIMIT 1")
-          .get(data.phone ?? '', data.email ?? '')
-        if (dup) duplicateOf = dup
-      }
-      const cols = Object.keys(data)
-      const stmt = db.prepare(
-        `INSERT INTO ${name} (${cols.join(',')}, created_at, updated_at, created_by) VALUES (${cols.map(() => '?').join(',')}, ?, ?, ?) RETURNING id`
-      )
-      let info
+      let created = null
       try {
-        info = await stmt.run(...cols.map((c) => data[c]), ts, ts, req.user.id)
+        await withMutation(async (tx) => {
+          if (name === 'deals' && data.project_id === undefined) {
+            // сделка наследует проект своего контакта — чтобы они не разъехались
+            const owner = await tx.prepare('SELECT project_id FROM contacts WHERE id = ?').get(data.contact_id)
+            if (owner) data.project_id = owner.project_id
+          }
+          // предупреждение о дубликате контакта по телефону/email
+          if (name === 'contacts' && (data.phone || data.email)) {
+            const dup = await tx
+              .prepare("SELECT id, name FROM contacts WHERE archived = 0 AND ((phone != '' AND phone = ?) OR (email != '' AND email = ?)) LIMIT 1")
+              .get(data.phone ?? '', data.email ?? '')
+            if (dup) duplicateOf = dup
+          }
+          const cols = Object.keys(data)
+          const stmt = tx.prepare(
+            `INSERT INTO ${name} (${cols.join(',')}, created_at, updated_at, created_by) VALUES (${cols.map(() => '?').join(',')}, ?, ?, ?) RETURNING id`
+          )
+          let info
+          try {
+            info = await stmt.run(...cols.map((c) => data[c]), ts, ts, req.user.id)
+          } catch (err) {
+            // Ссылка на несуществующую строку — ошибка запроса, а не сбой. Но вернуть
+            // отсюда 400 нельзя: упавший оператор уже перевёл транзакцию в состояние
+            // отказа, и её COMMIT выполнился бы как ROLLBACK (страж в withTransaction
+            // это заметит и бросит своё). Поэтому бросаем сигнал и ловим снаружи —
+            // транзакция честно откатывается, а ответ остаётся прежним.
+            if (String(err).includes('foreign key') || err.code === '23503') {
+              const bad = new Error('bad_reference')
+              bad.badReference = true
+              throw bad
+            }
+            throw err
+          }
+          await audit(req, 'create', name, info.lastInsertRowid, '', tx)
+          created = await tx.prepare(`SELECT * FROM ${name} WHERE id = ?`).get(info.lastInsertRowid)
+        })
       } catch (err) {
-        if (String(err).includes('foreign key') || err.code === '23503') return reply.code(400).send({ error: 'bad_reference' })
+        if (err.badReference) return reply.code(400).send({ error: 'bad_reference' })
         throw err
       }
-      await audit(req, 'create', name, info.lastInsertRowid)
-      const row = await db.prepare(`SELECT * FROM ${name} WHERE id = ?`).get(info.lastInsertRowid)
-      return { item: row, duplicateOf }
+      return { item: created, duplicateOf }
     })
 
     app.patch(`/api/crm/${name}/:id`, async (req, reply) => {
       const id = Number(req.params.id)
       if (!Number.isInteger(id)) return reply.code(400).send({ error: 'bad_id' })
-      const existing = await db.prepare(`SELECT * FROM ${name} WHERE id = ?`).get(id)
-      if (!existing) return reply.code(404).send({ error: 'not_found' })
       const expected = req.body?.expectedUpdatedAt
-      if (expected && expected !== existing.updated_at)
-        return reply.code(409).send({ error: 'conflict', current: existing })
       const data = pick(req.body ?? {}, spec)
-      if (name === 'deals' && data.stage) {
-        if (!STAGES.includes(data.stage)) return reply.code(400).send({ error: 'bad_stage' })
-        // Только при РЕАЛЬНОЙ смене стадии — иначе повторный PATCH тем же значением
-        // (форма редактирования всегда шлёт текущую стадию, даже правя только заметку)
-        // переставлял бы дату закрытия на сейчас, стирая настоящую дату.
-        if (data.stage !== existing.stage) data.closed_at = TERMINAL_STAGES.includes(data.stage) ? now() : null
-      }
+      if (name === 'deals' && data.stage && !STAGES.includes(data.stage)) return reply.code(400).send({ error: 'bad_stage' })
       if (PROJECT_SCOPED.has(name) && data.project_id !== undefined) {
         const pid = await resolveProjectId(data.project_id)
         if (!pid) return reply.code(400).send({ error: 'bad_project' })
@@ -685,23 +843,86 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       }
       if (name === 'tasks' && data.done !== undefined) data.done_at = data.done ? now() : null
       const cols = Object.keys(data)
-      if (!cols.length) return { item: existing }
-      await db.prepare(
-        `UPDATE ${name} SET ${cols.map((c) => `${c} = @${c}`).join(', ')}, updated_at = @updated_at WHERE id = @id`
-      ).run({ ...data, updated_at: now(), id })
-      await audit(req, 'update', name, id)
 
-      // Воронка возврата — только на смене стадии сделки, и только когда стадия
-      // действительно поменялась (повторный PATCH тем же значением ничего не заводит).
+      // Ожидаемая версия — в само условие UPDATE, а не только в отдельную проверку.
+      // Между SELECT и UPDATE есть await (сетевой round-trip к Postgres), и в это
+      // окно вклинивается второй PATCH: оба читали одну версию, оба проходили
+      // проверку, оба отвечали 200 — и второй молча затирал правку первого, ровно
+      // то, от чего expectedUpdatedAt и заведён. В SQLite окна не было: SELECT и
+      // UPDATE выполнялись синхронно, подряд, без точки переключения.
+      //
+      // Остаточная узость (не закрыта здесь сознательно): updated_at — ISO с
+      // миллисекундами, и два изменения одной строки внутри ОДНОЙ миллисекунды
+      // дают одинаковую версию, которую этот механизм не различит. Полное
+      // лечение — монотонная колонка ревизии, а это миграция схемы плюс правки
+      // дампа/импорта/фронта; отдельное решение, не побочный эффект этой правки.
+      const guard = expected ? ' AND updated_at = @expectedUpdatedAt' : ''
+      const applyUpdate = (q, extra = {}) =>
+        q.prepare(
+          `UPDATE ${name} SET ${[...cols, ...Object.keys(extra)].map((c) => `${c} = @${c}`).join(', ')}, updated_at = @updated_at WHERE id = @id${guard}`
+        ).run({ ...data, ...extra, updated_at: now(), id, ...(expected ? { expectedUpdatedAt: expected } : {}) })
+
+      // ВЕСЬ обработчик — одна транзакция, и строка читается ПОД FOR UPDATE. Это не
+      // только про потерю правок: так чтение и запись оказываются по одну сторону от
+      // блокировок восстановления (независимая проверка, третий раунд). Импорт дампа
+      // берёт EXCLUSIVE на таблицы, но EXCLUSIVE намеренно ПУСКАЕТ обычные SELECT —
+      // значит PATCH мог прочитать строку ДО восстановления, подождать на UPDATE и
+      // записать уже в ВОССТАНОВЛЕННУЮ строку с тем же id, то есть, возможно, в
+      // совсем другую сущность. `SELECT ... FOR UPDATE` требует ROW SHARE, а он с
+      // EXCLUSIVE конфликтует: теперь запрос ждёт ещё ДО чтения и продолжает работу
+      // с теми данными, которые реально есть после восстановления.
       let winback = null
-      if (name === 'deals' && data.stage && data.stage !== existing.stage) {
-        if (data.stage === LOST_STAGE) {
-          const seqId = await startWinback(id, req.user.id, req.body?.lostReason)
-          if (seqId) winback = { started: true, tasks: WINBACK_STEPS.length }
-        } else if (existing.stage === LOST_STAGE) {
-          const removed = await cancelWinback(id)
-          if (removed) winback = { cancelled: true, tasks: removed }
+      let conflict = false
+      let current = null
+      let notFound = false
+      let unchanged = null
+      await withMutation(async (tx) => {
+        const locked = await tx.prepare(`SELECT * FROM ${name} WHERE id = ? FOR UPDATE`).get(id)
+        if (!locked) { notFound = true; return }
+        // Быстрый отказ по прочитанной (уже заблокированной) строке — дешевле, чем
+        // выполнять UPDATE, и сразу отдаёт актуальную запись фронту.
+        if (expected && expected !== locked.updated_at) { conflict = true; current = locked; return }
+        if (!cols.length) { unchanged = locked; return }
+
+        if (name === 'deals' && data.stage) {
+          // Смена стадии тянет за собой воронку возврата, и решение о ней принимается
+          // по СТАРОЙ стадии. Пока UPDATE и воронка шли разными транзакциями, это
+          // разъезжалось (независимая проверка, второй раунд): T1 переводит
+          // «Новый»→«Проиграно» и ещё не успел завести серию; T2 с законной версией
+          // переводит «Проиграно»→«Переговоры», видит старую стадию, вызывает отмену —
+          // и не находит ничего, потому что серии ещё нет; затем T1 её создаёт. Итог:
+          // сделка снова в работе, а напоминания «клиент ушёл» на ней висят, и оба
+          // запроса честно ответили 200.
+          //
+          // Только при РЕАЛЬНОЙ смене стадии — иначе повторный PATCH тем же значением
+          // (форма редактирования всегда шлёт текущую стадию, даже правя только заметку)
+          // переставлял бы дату закрытия на сейчас, стирая настоящую дату.
+          const changed = data.stage !== locked.stage
+          const extra = changed ? { closed_at: TERMINAL_STAGES.includes(data.stage) ? now() : null } : {}
+          const res = await applyUpdate(tx, extra)
+          if (expected && res.changes !== 1) { conflict = true; return }
+          await audit(req, 'update', name, id, undefined, tx)
+          if (!changed) return
+          if (data.stage === LOST_STAGE) {
+            const seqId = await startWinback(id, req.user.id, req.body?.lostReason, tx)
+            if (seqId) winback = { started: true, tasks: WINBACK_STEPS.length }
+          } else if (locked.stage === LOST_STAGE) {
+            const removed = await cancelWinback(id, tx)
+            if (removed) winback = { cancelled: true, tasks: removed }
+          }
+        } else {
+          const res = await applyUpdate(tx)
+          if (expected && res.changes !== 1) { conflict = true; return }
+          await audit(req, 'update', name, id, undefined, tx)
         }
+      })
+      if (notFound) return reply.code(404).send({ error: 'not_found' })
+      if (unchanged) return { item: unchanged }
+      if (conflict) {
+        // Кто-то успел записать между нашим чтением и нашей записью. Для фронта это
+        // тот же случай, что и устаревшая версия в теле запроса, — различать незачем.
+        const fresh = current ?? (await db.prepare(`SELECT * FROM ${name} WHERE id = ?`).get(id))
+        return reply.code(409).send({ error: 'conflict', current: fresh })
       }
       return { item: await db.prepare(`SELECT * FROM ${name} WHERE id = ?`).get(id), winback }
     })
@@ -709,17 +930,22 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     app.delete(`/api/crm/${name}/:id`, async (req, reply) => {
       const id = Number(req.params.id)
       if (!Number.isInteger(id)) return reply.code(400).send({ error: 'bad_id' })
-      if (name === 'contacts') {
-        const deals = (await db.prepare('SELECT COUNT(*) c FROM deals WHERE contact_id = ?').get(id)).c
-        if (deals > 0) return reply.code(409).send({ error: 'has_deals', hint: 'архивируйте контакт' })
-      }
+      // Проверка «есть ли сделки» переехала ВНУТРЬ транзакции (независимая проверка,
+      // четвёртый раунд). Снаружи она читала до барьера обслуживания: во время
+      // восстановления дампа ответ относился бы к ДОРЕСТОРНЫМ данным, а удаление
+      // потом отработало бы по восстановленной строке с тем же id — то есть по
+      // другому человеку. Заодно исчезает окно, в котором сделку успевают завести
+      // между проверкой и удалением.
+      let hasDeals = false
       // Вся цепочка удаления — ОДНОЙ транзакцией (независимая проверка, раунд 26):
       // раньше это были отдельные db.prepare().run() подряд — сбой посреди (диск,
       // прерывание процесса) мог оставить контакт удалённым, а его consents — нет
       // (или наоборот), то есть ровно ту частичную запись, от которой транзакции
       // в этом файле обычно и защищают.
-      await withTransaction(db.pool, async (tx) => {
+      await withMutation(async (tx) => {
         if (name === 'contacts') {
+          const deals = (await tx.prepare('SELECT COUNT(*) c FROM deals WHERE contact_id = ?').get(id)).c
+          if (Number(deals) > 0) { hasDeals = true; return }
           // phone/email/messenger читаем ДО удаления строки — нужны ниже, чтобы найти
           // осиротевшие legacy-восстановлением слепки согласия того же человека.
           const c = await tx.prepare('SELECT phone, email, messenger, project_id FROM contacts WHERE id = ?').get(id)
@@ -760,6 +986,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         }
         await tx.prepare(`DELETE FROM ${name} WHERE id = ?`).run(id)
       })
+      if (hasDeals) return reply.code(409).send({ error: 'has_deals', hint: 'архивируйте контакт' })
       await audit(req, 'delete', name, id)
       return { ok: true }
     })
@@ -934,7 +1161,14 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     return await buildDump(db)
   })
 
-  app.post('/api/crm/import', async (req, reply) => {
+  // bodyLimit ОБЯЗАТЕЛЕН и щедрый: у Fastify потолок по умолчанию 1 МБ, и без явного
+  // значения любой настоящий дамп отбивался с 413 ещё до входа в обработчик —
+  // то есть единственный путь аварийного восстановления (ADR-013: на App Platform
+  // нет shell, файл базы туда не положить) не работал на реальной базе вовсе.
+  // Проверено независимым ревью: дамп на 1.89 МБ → FST_ERR_CTP_BODY_TOO_LARGE.
+  // Соображение о DoS, из-за которого потолок занижен у публичных /api/leads и
+  // /api/pd-requests, здесь не действует: эндпоинт admin-only.
+  app.post('/api/crm/import', { bodyLimit: 64 * 1024 * 1024 }, async (req, reply) => {
     if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
     const data = req.body
     if (!data || typeof data !== 'object' || !Array.isArray(data.contacts)) return reply.code(400).send({ error: 'bad_file' })
@@ -966,6 +1200,35 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     const counts = {}
     try {
       await withTransaction(db.pool, async (tx) => {
+        // САМОЕ ПЕРВОЕ — ИСКЛЮЧИТЕЛЬНЫЙ барьер обслуживания. Он ждёт, пока
+        // завершатся все текущие мутации, и не пускает новые: те берут его же в
+        // разделяемом режиме, тоже первым действием (см. withMutation выше и
+        // maintenanceBarrier в db-adapter.js). Без него табличные блокировки ниже
+        // защищали только запись — обработчик успевал ПРОЧИТАТЬ данные до
+        // восстановления и записать уже по восстановленным строкам с теми же id.
+        //
+        // Он же снимает взаимную блокировку: раздел ПДн берёт pd_requests, затем
+        // contacts, а этот цикл — наоборот, и встречное ожидание давало 40P01,
+        // который catch ниже превращал в «битый файл» на совершенно целом дампе.
+        // Барьер один и всегда первый — замыкать цикл нечему.
+        await maintenanceBarrier(tx, true)
+        // Дальше — запереть запись во все затрагиваемые таблицы до конца транзакции.
+        // Барьер прикрывает пути, которые его берут; табличные блокировки остаются
+        // страховкой для всего остального (в т.ч. будущего кода, который про барьер
+        // забудет) и от органических вставок между чтением MAX(id) и setval ниже:
+        // иначе вставка займёт id, который восстановление тут же вернёт назад, и
+        // следующая запись упрётся в PRIMARY KEY. Порядок фиксированный, как и ниже
+        // по коду: два одновременных восстановления не встанут в дедлок.
+        // idempotency_keys и outbox СОЗНАТЕЛЬНО НЕ запираются, хотя и чистятся выше.
+        // Их трогают пути, идущие МИМО барьера: захват ключа (idempotencyClaim) идёт до
+        // withMutation, на голом соединении пула, а воркер очереди работает сам по себе.
+        // Запирая их, восстановление вешало бы эти пути на неограниченное ожидание —
+        // на шаг РАНЬШЕ, чем срабатывает потолок ожидания барьера, то есть ровно тот же
+        // DoS, от которого потолок и заведён (найдено red team). Целостности это не
+        // стоит ничего: обе таблицы чистятся безусловно, а записи, попавшие в них уже
+        // после DELETE, относятся к запросам, которые сами ждут барьера и запишутся
+        // после восстановления.
+        await lockTablesForRestore(tx, [...DUMP_TABLES, 'winback_sequences'])
         // winback_sequences в дамп не входит и восстановлению не подлежит (серии
         // выводятся из стадии сделки, а стадия в дампе есть) — очищаем безусловно,
         // но НЕ прямо здесь: у неё теперь ДВЕ настоящих FK-связи в обе стороны
@@ -984,6 +1247,16 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         // восстановления, худшее время для этого). Ключи короткоживущие по смыслу
         // (окно ретраев формы — секунды-минуты), восстанавливать их из бэкапа не нужно.
         await tx.prepare('DELETE FROM idempotency_keys').run()
+        // outbox — по ТОЙ ЖЕ причине, и это не мелочь: очередь уведомлений намеренно
+        // обезличена, в ней лежит только `contactId`, а имя/телефон/почта достаются из
+        // БД В МОМЕНТ ОТПРАВКИ (server/telegram.js, ADR-009 — чтобы ПДн не дублировались
+        // на диск). После восстановления контакты заменены целиком, и неотправленная
+        // строка очереди разрешила бы свой `contactId` в СОВСЕМ ДРУГОГО человека: в MAX
+        // ушли бы его имя и телефон под видом свежей заявки, а ссылка в Telegram вела бы
+        // на чужую карточку. Пережившая аварию очередь — как раз то, что восстановление
+        // и застаёт (воркер ретраит до 20 раз). Потерять неотправленное уведомление здесь
+        // дешевле, чем отправить чужие ПДн (найдено независимым ревью).
+        await tx.prepare('DELETE FROM outbox').run()
         // Таблицы восстанавливаем те, что есть в дампе: из старого файла (v1)
         // запросы ПДн и журнал не придут, и стирать существующие мы не станем.
         // consents младше даже pd_requests: дамп может иметь pd_requests (hasCompliance),
@@ -1024,13 +1297,24 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
             await stmt.run(row)
           }
           counts[n] = rows.length
-          // Явная вставка id НЕ продвигает identity-последовательность сама (см.
-          // schema.sql, преамбула, и resyncIdentitySequence в db-adapter.js) — без
-          // этого следующий органический INSERT в эту таблицу рано или поздно
-          // столкнётся с уже занятым восстановленным id. Только для таблиц, где
-          // явный id вообще был вставлен (пустой rows — нечего резинхронизировать,
-          // и нет риска гонки с уже идущей вставкой без явного id).
-          if (rows.length) await resyncIdentitySequence(tx, n)
+        }
+        // Явная вставка id НЕ продвигает identity-последовательность сама (см.
+        // schema.sql, преамбула, и resyncIdentitySequence в db-adapter.js) — без
+        // этого следующий органический INSERT в эту таблицу рано или поздно
+        // столкнётся с уже занятым восстановленным id. Только для таблиц, где
+        // явный id вообще был вставлен (пустой rows — нечего резинхронизировать,
+        // и нет риска гонки с уже идущей вставкой без явного id).
+        //
+        // ПОСЛЕ всего цикла вставки, а не внутри него: setval нетранзакционен,
+        // откат его не отменяет. Пока вызов стоял внутри цикла, падение на
+        // ПЯТОЙ таблице оставляло счётчики первых четырёх уже переписанными,
+        // хотя их строки откатились. Теперь до этой строки доходит только
+        // импорт, у которого все таблицы вставились успешно. Вместе с монотонным
+        // GREATEST в самой функции это закрывает оба конца проблемы: сюда не
+        // попадёт неудавшийся импорт, а если COMMIT всё же не пройдёт — счётчик
+        // окажется лишь завышен, что безвредно (разрыв в нумерации), а не занижен.
+        for (const n of tables) {
+          if ((data[n] || []).length) await resyncIdentitySequence(tx, n)
         }
         // Старый дамп (v1) запросов ПДн не содержит: существующие оставляем как
         // юридический след, но привязку к контакту рвём — контакты только что
@@ -1076,6 +1360,29 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         }
       })
     } catch (err) {
+      // РАЗЛИЧАЕМ «файл плохой» и «база сейчас не может». Раньше сюда сваливалось всё
+      // подряд, и владелец во время аварии видел «дамп повреждён» на совершенно целом
+      // бэкапе — и мог его выбросить. Это уже случалось с взаимной блокировкой (40P01),
+      // а после этой сессии внутрь try добавились ещё и ожидание барьера, LOCK TABLE и
+      // страж «COMMIT выполнился как ROLLBACK» — все три отказывают по причинам, не
+      // имеющим отношения к содержимому файла.
+      //
+      // Классы SQLSTATE: 08* — обрыв связи, 40* — откат/дедлок/сериализация, 53* —
+      // нехватка ресурсов, 57* — вмешательство оператора и завершение работы, 55P03 —
+      // не дождались блокировки. Всё это повторяемо: отдаём 503 и прямо говорим, что
+      // файл ни при чём. Остальное (неизвестная колонка, чужой формат, нарушение
+      // внешнего ключа) — по-прежнему 400 bad_file.
+      const sqlState = String(err?.code ?? '')
+      const transient = err?.maintenanceBusy || /^(08|40|53|57)/.test(sqlState) || sqlState === '55P03' ||
+        String(err?.message ?? '').includes('COMMIT выполнился как ROLLBACK')
+      if (transient) {
+        req.log?.error?.({ err: String(err), sqlState }, 'import: временный отказ базы, файл не при чём')
+        return reply.code(503).send({
+          error: 'db_unavailable',
+          hint: 'база временно недоступна — файл цел, повторите восстановление',
+          detail: String(err),
+        })
+      }
       return reply.code(400).send({ error: 'bad_file', detail: String(err) })
     }
     await audit(req, 'import', 'all', 0)
@@ -1168,7 +1475,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     const ts = now()
     const LAB = 1
     const VIZOR = 2
-    await withTransaction(db.pool, async (tx) => {
+    await withMutation(async (tx) => {
       const c = async (name, company, extra = {}) =>
         (await tx.prepare("INSERT INTO contacts (name, company, phone, email, source, project_id, demo, created_at, updated_at, created_by) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?) RETURNING id")
           .run(name, company, extra.phone ?? '', extra.email ?? '', extra.source ?? 'manual', extra.project ?? LAB, ts, ts, req.user.id)).lastInsertRowid
@@ -1191,11 +1498,24 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   })
 
   app.delete('/api/crm/demo', async (req) => {
-    await withTransaction(db.pool, async (tx) => {
-      for (const n of ['interactions', 'tasks', 'deals', 'contacts']) await tx.prepare(`DELETE FROM ${n} WHERE demo = 1`).run()
+    // Демо-контакт, на котором завели НАСТОЯЩУЮ сделку, удалить нельзя: у
+    // `deals.contact_id` теперь настоящий `NOT NULL REFERENCES`, и прежний безусловный
+    // DELETE ронял всю транзакцию на внешнем ключе — кнопка отвечала 500 навсегда, без
+    // объяснений (найдено red team). Демо-контакты видны в общем списке, а обработчик
+    // создания колонку `demo` не ставит, так что путь этот совершенно обычный.
+    // Оставляем таких и честно говорим сколько: молча пропустить значило бы соврать
+    // про «демо-данные удалены».
+    const kept = await withMutation(async (tx) => {
+      for (const n of ['interactions', 'tasks']) await tx.prepare(`DELETE FROM ${n} WHERE demo = 1`).run()
+      await tx.prepare('DELETE FROM deals WHERE demo = 1').run()
+      const busy = await tx
+        .prepare('SELECT COUNT(*) c FROM contacts WHERE demo = 1 AND id IN (SELECT contact_id FROM deals)')
+        .get()
+      await tx.prepare('DELETE FROM contacts WHERE demo = 1 AND id NOT IN (SELECT contact_id FROM deals)').run()
+      return Number(busy.c)
     })
-    await audit(req, 'demo-clear', 'all', 0)
-    return { ok: true }
+    await audit(req, 'demo-clear', 'all', 0, kept ? `оставлено демо-контактов с настоящими сделками: ${kept}` : '')
+    return { ok: true, kept }
   })
 
   // ---------- права субъекта ПДн (152-ФЗ) ----------
@@ -1222,10 +1542,15 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // атомарности внешней транзакции (а на маленьком пуле мог бы и вовсе исчерпать его).
   // При наличии parentTx работаем НА НЁМ, не открывая свою транзакцию.
   async function anonymizeContact(contactId, req, parentTx = null) {
-    const runner = parentTx || db
+   const run = async (tx) => {
+    // Чтение — ВНУТРИ транзакции и под блокировкой строки (независимая проверка,
+    // четвёртый раунд). Раньше при прямом вызове (без parentTx) оно шло через пул,
+    // то есть ДО барьера обслуживания: во время восстановления дампа обезличивание
+    // решало по дореcторным данным, а записывало уже по восстановленной строке с тем
+    // же id — необратимо стирая совсем другого человека.
     // phone/email/messenger читаем ЗАРАНЕЕ, до их обнуления шагом 1 — нужны шагу 5b
     // ниже, чтобы найти осиротевшие слепки согласия ДО того, как значения исчезнут.
-    const contact = await runner.prepare('SELECT id, phone, email, messenger, project_id, anonymized_at FROM contacts WHERE id = ?').get(contactId)
+    const contact = await tx.prepare('SELECT id, phone, email, messenger, project_id, anonymized_at FROM contacts WHERE id = ? FOR UPDATE').get(contactId)
     if (!contact) return null
     if (contact.anonymized_at) return contact // повторный вызов безвреден
 
@@ -1276,9 +1601,12 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       // конкретного соединения) запись коммитится независимо от исхода анонимизации.
       await audit(req, 'anonymize', 'contacts', contactId, 'исполнение запроса субъекта ПДн', tx)
     }
-    if (parentTx) await doAnonymize(parentTx)
-    else await withTransaction(db.pool, doAnonymize)
-    return await runner.prepare('SELECT id, name, anonymized_at FROM contacts WHERE id = ?').get(contactId)
+    await doAnonymize(tx)
+    return await tx.prepare('SELECT id, name, anonymized_at FROM contacts WHERE id = ?').get(contactId)
+   }
+   // Свою транзакцию открываем ТОЛЬКО когда нас не позвали изнутри чужой: адаптер
+   // вложенности не поддерживает (см. преамбулу db-adapter.js).
+   return parentTx ? run(parentTx) : withMutation(run)
   }
 
   app.get('/api/crm/pd-requests', async (req) => {
@@ -1302,31 +1630,85 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     const contactId = b.contact_id === undefined || b.contact_id === null || b.contact_id === '' ? null : Number(b.contact_id)
     if (contactId !== null && !Number.isInteger(contactId)) return reply.code(400).send({ error: 'bad_input' })
     if (!requester && contactId === null) return reply.code(400).send({ error: 'bad_input' })
-    if (contactId !== null && !(await db.prepare('SELECT 1 FROM contacts WHERE id = ?').get(contactId))) {
-      return reply.code(400).send({ error: 'bad_reference' })
-    }
-    const projectId = contactId !== null
-      ? (await db.prepare('SELECT project_id FROM contacts WHERE id = ?').get(contactId)).project_id
-      : (await resolveProjectId(b.project)) || DEFAULT_PROJECT_ID
+    const fallbackProject = (await resolveProjectId(b.project)) || DEFAULT_PROJECT_ID
+    const dueDate = addWorkdays(mskToday())
     const ts = now()
-    // verified_at сразу — ручной ввод сотрудником уже подтверждён самим фактом
-    // разговора/переписки, вторично верифицировать в интерфейсе нечего.
-    const info = await db.prepare(`INSERT INTO pd_requests (contact_id, kind, requester, note, source, project_id, due_date, verified_at, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`)
-      .run(contactId, kind, requester, trim(b.note, 1000), 'manual', projectId, addWorkdays(mskToday()), ts, ts, ts)
-    await audit(req, 'create', 'pd_requests', info.lastInsertRowid, kind)
-    return { ok: true, id: info.lastInsertRowid, due_date: addWorkdays(mskToday()) }
+
+    // ПОД БАРЬЕРОМ и одной транзакцией — последний путь, который этого не делал
+    // (найден red team), и худший из возможных: строка рождается СРАЗУ подтверждённой
+    // (`verified_at` в том же INSERT), потому что ручной ввод сотрудником уже означает
+    // состоявшийся разговор. Значит одного последующего `PATCH {anonymize:true}`
+    // достаточно, чтобы необратимо стереть того, кто носит этот id. Читая контакт через
+    // пул, обработчик определял «кого именно» ДО барьера, а записывал после: во время
+    // восстановления дампа запрос привязался бы к человеку, которого под этим номером
+    // уже нет, — и стёрли бы того, кто под ним появился.
+    let badReference = false
+    const created = await withMutation(async (tx) => {
+      let projectId = fallbackProject
+      if (contactId !== null) {
+        // FOR UPDATE: контакт не должен уехать в другой проект (или исчезнуть) между
+        // этой проверкой и записью — тот же приём, что в PATCH .../anonymize.
+        const owner = await tx.prepare('SELECT project_id FROM contacts WHERE id = ? FOR UPDATE').get(contactId)
+        if (!owner) { badReference = true; return null }
+        projectId = owner.project_id
+      }
+      // verified_at сразу — ручной ввод сотрудником уже подтверждён самим фактом
+      // разговора/переписки, вторично верифицировать в интерфейсе нечего.
+      const info = await tx.prepare(`INSERT INTO pd_requests (contact_id, kind, requester, note, source, project_id, due_date, verified_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`)
+        .run(contactId, kind, requester, trim(b.note, 1000), 'manual', projectId, dueDate, ts, ts, ts)
+      await audit(req, 'create', 'pd_requests', info.lastInsertRowid, kind, tx)
+      return info.lastInsertRowid
+    })
+    if (badReference) return reply.code(400).send({ error: 'bad_reference' })
+    return { ok: true, id: created, due_date: dueDate }
   })
 
   app.patch('/api/crm/pd-requests/:id', async (req, reply) => {
     const id = Number(req.params.id)
     if (!Number.isInteger(id)) return reply.code(400).send({ error: 'bad_input' })
-    const row = await db.prepare('SELECT * FROM pd_requests WHERE id = ?').get(id)
-    if (!row) return reply.code(404).send({ error: 'not_found' })
     const b = req.body ?? {}
     const ts = now()
 
-    // Сначала ВСЯ валидация, ни одной записи в БД — только потом мутации одной
+    // Проверки, НЕ зависящие от состояния строки (роль и форма тела) — до транзакции:
+    // держать под блокировкой то, что можно отвергнуть сразу, незачем.
+    //
+    // Обезличивание — необратимо и по чувствительности сравнимо с прямым
+    // POST /api/crm/contacts/:id/anonymize, у которого уже есть admin_only.
+    // У ЭТОГО пути такой проверки не было вообще — независимая проверка нашла
+    // прямой обход: участник (не admin) мог сам подтвердить личность запроса и
+    // тем же PATCH обезличить контакт.
+    if (b.anonymize === true && req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
+    if (b.status !== undefined && !PD_STATUSES.includes(b.status)) return reply.code(400).send({ error: 'bad_input' })
+
+    // Отказ валидации ВНУТРИ транзакции — исключением, а не return: так транзакция
+    // гарантированно откатывается, даже если в будущем перед проверкой появится
+    // мутация. Код и тело ответа едут на самой ошибке.
+    const fail = (code, body) => {
+      const err = new Error('pd_request_patch_rejected')
+      err.pdFail = { code, body }
+      throw err
+    }
+
+    let anonymized = null
+    try {
+    await withMutation(async (tx) => {
+    // Строка читается ВНУТРИ транзакции и БЛОКИРУЕТСЯ (FOR UPDATE) — вся валидация
+    // ниже смотрит на состояние, которое до конца транзакции никто не изменит.
+    // Раньше строка читалась до транзакции, обычным SELECT, и вся защита
+    // verified_at/contactChanged держалась на допущении, что снимок консистентен.
+    // С асинхронным pg это неверно, и допущение ломалось так (найдено ревью):
+    // два PATCH читают ОДИН снимок, где verified_at ещё NULL; первый — {status:'new'}
+    // (сотрудник подтвердил личность по контакту A), второй — {contact_id: B}.
+    // У второго invalidatesVerification = false, ведь в его снимке верификации ещё
+    // нет и аннулировать нечего. Он коммитит привязку к B, затем первый коммитит
+    // verified_at. Итог: запрос привязан к B и помечен подтверждённым, хотя
+    // подтверждали A — и следующий {anonymize:true} необратимо стирает НЕ ТОГО
+    // человека, пройдя все три гейта законно.
+    const row = await tx.prepare('SELECT * FROM pd_requests WHERE id = ? FOR UPDATE').get(id)
+    if (!row) fail(404, { error: 'not_found' })
+
+    // Сначала ВСЯ валидация, ни одной записи в БД — только потом мутации той же
     // транзакцией (обход, который на этом настоял: {status:'new', anonymize:true}
     // одним PATCH иначе успевал записать status ДО того, как anonymize его проверит).
     let contactId = row.contact_id
@@ -1339,18 +1721,11 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         // ДРУГОГО (Лаб ИИ ↔ Визор), «подтвердить» и в итоге обезличить чужого
         // человека. Та же граница, что уже применена к автопоиску контакта выше
         // (ADR-014) и должна была быть здесь с самого начала этого эндпоинта.
-        const target = await db.prepare('SELECT project_id FROM contacts WHERE id = ?').get(contactId)
-        if (!target || target.project_id !== row.project_id) return reply.code(400).send({ error: 'bad_reference' })
+        const target = await tx.prepare('SELECT project_id FROM contacts WHERE id = ?').get(contactId)
+        if (!target || target.project_id !== row.project_id) fail(400, { error: 'bad_reference' })
       }
       contactChanged = contactId !== row.contact_id
     }
-    // Обезличивание — необратимо и по чувствительности сравнимо с прямым
-    // POST /api/crm/contacts/:id/anonymize, у которого уже есть admin_only.
-    // У ЭТОГО пути такой проверки не было вообще — независимая проверка нашла
-    // прямой обход: участник (не admin) мог сам подтвердить личность запроса и
-    // тем же PATCH обезличить контакт.
-    if (b.anonymize === true && req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
-    if (b.status !== undefined && !PD_STATUSES.includes(b.status)) return reply.code(400).send({ error: 'bad_input' })
     // done/anonymize сверяются с `row.verified_at` — фактом, который НЕЛЬЗЯ обнулить
     // никаким последующим PATCH статуса, а не с текущим `status`. Независимая
     // проверка нашла обход прежней версии (гейт «status ≠ pending_unverified»):
@@ -1363,7 +1738,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     // если contact_id меняют В ЭТОМ ЖЕ запросе (contactChanged), старая верификация
     // была про ДРУГОГО человека — независимая проверка поймала именно это: привязать
     // «проверенный» запрос к чужому контакту и тут же обезличить его одним PATCH.
-    if (b.status === 'done' && (contactChanged || !row.verified_at)) return reply.code(400).send({ error: 'not_verified' })
+    if (b.status === 'done' && (contactChanged || !row.verified_at)) fail(400, { error: 'not_verified' })
     // «Подтвердить личность» (переход в new из pending_unverified) без привязанного
     // контакта бессмысленен и опасен: подтверждать личность полагается по каналу ИЗ
     // КАРТОЧКИ в CRM, а без contactId такой карточки просто нет. Отклонить (rejected)
@@ -1380,20 +1755,32 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     const invalidatesVerification = contactChanged && Boolean(row.verified_at)
     const effectiveStatus = invalidatesVerification ? 'pending_unverified' : row.status
     const verifying = b.status === 'new' && effectiveStatus === 'pending_unverified'
-    if (verifying && !contactId) return reply.code(400).send({ error: 'no_contact' })
+    if (verifying && !contactId) fail(400, { error: 'no_contact' })
     // Обезличивание — только по явному запросу и только для «удалить»/«прекратить»:
     // на «узнать, какие данные есть» стирать ничего не надо. pending_unverified:
     // публичная форма не подтверждает личность отправителя — им может быть кто
     // угодно, знающий контакт жертвы (ADR-015, сценарий атаки в ТЗ сайта: чужой
     // email/телефон + kind=delete по умолчанию).
     if (b.anonymize === true) {
-      if (contactChanged || !row.verified_at) return reply.code(400).send({ error: 'not_verified' })
-      if (!contactId) return reply.code(400).send({ error: 'no_contact' })
-      if (!['delete', 'stop'].includes(row.kind)) return reply.code(400).send({ error: 'kind_not_erasable' })
+      if (contactChanged || !row.verified_at) fail(400, { error: 'not_verified' })
+      if (!contactId) fail(400, { error: 'no_contact' })
+      if (!['delete', 'stop'].includes(row.kind)) fail(400, { error: 'kind_not_erasable' })
+    }
+    // Проект контакта перепроверяется ЗАНОВО и ПОД БЛОКИРОВКОЙ — на каждом опасном
+    // действии, а не только при смене привязки. Независимая проверка нашла дыру:
+    // раньше границу проекта стерегла единственная проверка на пути relink, а контакт
+    // после этого можно перенести в другой проект обычным PATCH (такая возможность
+    // есть и покрыта тестом). Тогда подтверждённый запрос «Лаб ИИ» продолжал указывать
+    // на контакт, уехавший в «Визор», и обезличивание необратимо стирало человека
+    // ЧУЖОГО бизнеса — ровно то, ради предотвращения чего эта граница и заведена.
+    // FOR UPDATE держит контакт до конца транзакции: перенести его «прямо сейчас»,
+    // между проверкой и стиранием, тоже не выйдет.
+    if ((b.anonymize === true || verifying) && contactId) {
+      const target = await tx.prepare('SELECT project_id FROM contacts WHERE id = ? FOR UPDATE').get(contactId)
+      if (!target || target.project_id !== row.project_id) fail(400, { error: 'bad_reference' })
     }
 
-    let anonymized = null
-    await withTransaction(db.pool, async (tx) => {
+    // ---- мутации: та же транзакция, та же заблокированная строка ----
       if (b.contact_id !== undefined) {
         await tx.prepare('UPDATE pd_requests SET contact_id = ?, updated_at = ? WHERE id = ?').run(contactId, ts, id)
         // Смена привязки аннулирует прежнюю верификацию — та подтверждала личность
@@ -1416,6 +1803,12 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       // {status:'new', anonymize:true} одним запросом).
       if (b.anonymize === true) anonymized = await anonymizeContact(contactId, req, tx)
     })
+    } catch (err) {
+      // Отказ валидации (fail выше) — штатный ответ, транзакция уже откачена.
+      // Любая другая ошибка — настоящая, пробрасываем как раньше.
+      if (err.pdFail) return reply.code(err.pdFail.code).send(err.pdFail.body)
+      throw err
+    }
     return { ok: true, anonymized }
   })
 
@@ -1553,11 +1946,16 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
    * SQL — отдельное решение со своей миграцией, а не часть перевода на pg:
    * контактов у малого бизнеса тысячи, не миллионы, текущий перебор приемлем.
    */
-  async function findExistingContact(contactInfo, projectId) {
+  /** `runner` — обязательно передавать `tx`, когда результат определяет, КУДА писать:
+   * решение о дубле принимается по прочитанным строкам, и читать их надо по ту же
+   * сторону барьера обслуживания, что и запись (см. withMutation). Иначе чтение
+   * попадает на состояние ДО восстановления дампа, а запись — уже на восстановленные
+   * строки с теми же id, то есть на другого человека. */
+  async function findExistingContact(contactInfo, projectId, runner = db) {
     const raw = trim(contactInfo, 300).toLowerCase()
     if (!raw) return null
     const key = phoneKey(raw)
-    const rows = await db
+    const rows = await runner
       .prepare('SELECT id, name, email, phone, messenger, archived FROM contacts WHERE project_id = ? AND anonymized_at IS NULL ORDER BY id DESC')
       .all(projectId)
     return rows.find((c) => {
@@ -1682,14 +2080,21 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       // на одного клиента рвут историю пополам, поэтому вторую не заводим — привязываем
       // заявку к существующей (ADR-014). Ошибочную склейку видно сразу и она поправима:
       // у сделки и у действия можно сменить контакт в обычной форме редактирования.
-      const existing = await findExistingContact(contactInfo, projectId)
       const ts = now()
-      // ПЕРЕВОД НА POSTGRES: раньше здесь же, внутри ЭТОЙ транзакции, писался и сам
-      // idempotency_keys — атомарно с бизнес-записью. Теперь ключ уже застолблён ДО
-      // транзакции (claim-first, см. idempotencyClaim) — статус проставляется
-      // idempotencyFinish() ПОСЛЕ успешного commit (ниже), отдельным шагом, а не
-      // внутри самой транзакции.
-      const result = await withTransaction(db.pool, async (tx) => {
+      // Ключ идемпотентности застолбляется ДО транзакции (claim-first, см.
+      // idempotencyClaim), а вот его ЗАКРЫТИЕ — внутри неё, последним шагом. Так
+      // владение перепроверяется, пока откат ещё возможен: перехваченный по аренде
+      // захват обязан отменить всю работу, иначе оживший прежний владелец заводит
+      // вторую карточку (см. IdempotencyLost ниже).
+      const result = await withMutation(async (tx) => {
+      // Поиск дубля — ВНУТРИ транзакции, на `tx`, и это не стилистика (найдено
+      // независимым ревью). Он определяет, завести новый контакт или дописать в
+      // существующий; читая его через пул, мы принимали решение ДО барьера
+      // обслуживания, а писали после. Во время восстановления дампа это значило:
+      // прочитали контакт №N (человек А), подождали на барьере, а записали заметку,
+      // транскрипт чата и слепок согласия отправителя в восстановленный контакт №N —
+      // уже человека Б. Смешивание ПДн двух людей, 152-ФЗ.
+      const existing = await findExistingContact(contactInfo, projectId, tx)
       let inner
       if (!existing) {
         const isEmail = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(contactInfo)
@@ -1760,34 +2165,57 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       await tx.prepare('INSERT INTO consents (contact_id, deal_id, project_id, requester, version, text, text_truncated, accepted_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
         .run(inner.contactId, inner.dealId ?? null, projectId, contactInfo, consent.version, consent.text, consent.textTruncated ? 1 : 0, consent.acceptedAt || null, ts)
 
-      return inner
-      })
-      const contactId = result.contactId
-
       // В уведомление кладём только обезличенное: проект, источник, ссылку на карточку.
       // Имя, контакт и текст заявки остаются в CRM на российском сервере — Telegram
       // зарубежный, и отправка туда ПДн была бы трансграничной передачей (152-ФЗ).
-      // leadNotifyBudgetOk теперь ПОСЛЕ withTransaction, не внутри неё: withTransaction
-      // резолвится, только если транзакция УЖЕ закоммичена — строже прежней гарантии
-      // (раньше опасались потратить бюджет ДО того, как транзакция гарантированно
-      // пройдёт; сейчас к этой строке она гарантированно уже прошла).
-      if (await leadNotifyBudgetOk(projectId)) {
-      const project = await db.prepare('SELECT display_name FROM projects WHERE id = ?').get(projectId)
-      await enqueue(db, 'lead', {
-        projectName: project?.display_name || '',
-        source: isChat ? 'чат' : 'форма',
-        contactId: result.contactId,
-        suspicious,
-        // repeat/returned — не ПДн: это про историю обращения, а не про человека
-        repeat: Boolean(result.repeat),
-        returned: Boolean(result.returned),
-      })
+      //
+      // ВСЁ ЭТО — ВНУТРИ транзакции, как и у /api/pd-requests. Раньше здесь стояло
+      // обратное решение с обоснованием «повтор погасит дедупликация», и оно было
+      // ОШИБОЧНЫМ (найдено независимой проверкой и воспроизведено). Дедупликация
+      // читает базу ДО транзакции: если наш захват ключа перехватили по аренде, то
+      // перехватчик и мы работаем ОДНОВРЕМЕННО, оба видим `existing = null`, потому
+      // что ни один ещё не закоммитил, — и оба заводим свой контакт со своей сделкой.
+      // Склеивать там уже нечего. Единственная защита — проверка владения ВНУТРИ
+      // транзакции: не наш ключ, значит откатываемся целиком.
+      //
+      // Цена — бюджет уведомлений тратится до гарантированного коммита (счётчик в
+      // памяти, откатом не возвращается). Это дёшево и осознанно: бюджет всего лишь
+      // прячет уведомления при всплеске, а альтернатива — потерянное уведомление о
+      // заявке, чего допускать нельзя.
+      if (await leadNotifyBudgetOk(projectId, tx)) {
+        const project = await tx.prepare('SELECT display_name FROM projects WHERE id = ?').get(projectId)
+        await enqueue(tx, 'lead', {
+          projectName: project?.display_name || '',
+          source: isChat ? 'чат' : 'форма',
+          contactId: inner.contactId,
+          suspicious,
+          // repeat/returned — не ПДн: это про историю обращения, а не про человека
+          repeat: Boolean(inner.repeat),
+          returned: Boolean(inner.returned),
+        })
       }
-      await idempotencyFinish(claim.id, 204)
+      if (!(await idempotencyFinish(claim.id, 204, tx))) throw new IdempotencyLost()
+
+      return inner
+      })
+      const contactId = result.contactId
+      // Транзакция закоммичена — только теперь эскалация считается отправленной.
+      if (pendingQuotaWarn !== null) { leadQuotaWarnedAt.set(pendingQuotaWarn, Date.now()); pendingQuotaWarn = null }
 
       app.log?.info?.({ contactId, projectId, suspicious, repeat: result.repeat }, 'lead accepted')
       return reply.code(204).send()
     } catch (err) {
+      // Наш захват перехватили по аренде: работа откачена, а логическая отправка
+      // уже обслужена перехватчиком. Отвечаем ЕГО результатом, а не 500 — то же
+      // решение и по той же причине, что у /api/pd-requests ниже. Ключ не трогаем:
+      // он теперь чужой.
+      if (err.idempotencyLost) {
+        const cur = await db
+          .prepare('SELECT status_code FROM idempotency_keys WHERE scope = ? AND request_id = ?')
+          .get('leads', requestId)
+        app.log?.warn?.({ requestId }, 'lead: захват ключа перехвачен по аренде, работа откачена')
+        return reply.code(cur?.status_code ?? 429).send()
+      }
       // Настоящая ошибка (не штатный ранний выход выше, те возвращают до сюда) —
       // снимаем застолбление ключа, иначе повтор с тем же ключом бьётся в 429
       // без конца (см. idempotencyAbandon).
@@ -1877,9 +2305,6 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     // контакта). Та же граница, что уже используется в findExistingContact/ADR-014.
     // Не нашли — оставляем contact_id пустым: сотрудник сопоставит вручную, а срок
     // уже идёт, поэтому запрос всё равно должен быть зарегистрирован.
-    const found = await db
-      .prepare('SELECT id FROM contacts WHERE anonymized_at IS NULL AND project_id = ? AND (lower(email) = lower(?) OR lower(messenger) = lower(?) OR phone = ?) ORDER BY id DESC LIMIT 1')
-      .get(projectId, requester, requester, requester)
 
     const dueDate = addWorkdays(mskToday())
     const ts = now()
@@ -1890,36 +2315,72 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     // PATCH .../anonymize ниже блокирует исполнение, пока сотрудник не подтвердит
     // личность по каналу из карточки контакта в CRM и не переведёт статус дальше.
     //
-    // ПЕРЕВОД НА POSTGRES: идемпотентный ключ уже застолблён ДО этой транзакции
-    // (claim-first, см. /api/leads выше) — INSERT + enqueue остаются одной
-    // транзакцией (сбой между ними не должен оставить запрос без уведомления
-    // о сроке), а статус ключа проставляется idempotencyFinish() уже после commit.
+    // Ключ застолблён ДО этой транзакции (claim-first, см. /api/leads выше), а
+    // закрывается ВНУТРИ неё — вместе с INSERT и enqueue, одним неделимым фактом.
     const base = String(process.env.CRM_BASE_URL || '').trim().replace(/\/+$/, '')
-    const infoId = await withTransaction(db.pool, async (tx) => {
+    // ОДНА транзакция на всё: сам запрос, уведомление в очередь и закрытие ключа
+    // идемпотентности. Раньше в неё входил только INSERT (хотя соседний комментарий
+    // обещал обратное), а enqueue и idempotencyFinish шли после коммита — и это
+    // не теоретическая придирка: если между ними падала база (у управляемого
+    // Postgres рестарт при обслуживании — штатное событие), catch ниже снимал
+    // застолбление ключа, ХОТЯ запрос уже создан. Повтор сайта с тем же ключом
+    // застолблял его заново и заводил ВТОРОЙ запрос. У лидов такой дубль гасит
+    // дедупликация (ADR-014), а у запросов по ПДн её нет вовсе — дубль означает
+    // второй 10-дневный срок по 152-ФЗ на одно и то же обращение.
+    //
+    // enqueue и idempotencyFinish получают `tx`, а не внешний `db` — иначе они
+    // молча выполнились бы на ДРУГОМ соединении, вне транзакции (см. преамбулу
+    // server/db-adapter.js).
+    const accepted = await withMutation(async (tx) => {
+      // Поиск контакта — ВНУТРИ транзакции, на `tx` (найдено независимым ревью).
+      // Его результат уходит в pd_requests.contact_id и дальше служит основанием для
+      // НЕОБРАТИМОГО обезличивания. Через пул он читался ДО барьера обслуживания:
+      // во время восстановления дампа запрос привязывался бы к контакту №N, каким тот
+      // был ДО restore, а после restore под этим номером уже другой человек — и его
+      // бы и стёрли по подтверждённому запросу.
+      const found = await tx
+        .prepare('SELECT id FROM contacts WHERE anonymized_at IS NULL AND project_id = ? AND (lower(email) = lower(?) OR lower(messenger) = lower(?) OR phone = ?) ORDER BY id DESC LIMIT 1')
+        .get(projectId, requester, requester, requester)
       const info = await tx.prepare(`INSERT INTO pd_requests (contact_id, kind, status, requester, note, source, project_id, due_date, created_at, updated_at)
         VALUES (?, ?, 'pending_unverified', ?, ?, ?, ?, ?, ?, ?) RETURNING id`)
         .run(found?.id ?? null, kind, requester, note, 'site-form', projectId, dueDate, ts, ts)
-      return info.lastInsertRowid
-    })
 
-    // Уведомление обезличено для ОБОИХ каналов, в отличие от заявок: здесь ПДн не
-    // нужны по существу — важны вид запроса и срок, кто именно — видно в CRM по ссылке.
-    // БЕЗ квоты на уведомление (раунд 19, см. комментарий выше) — ПДн-запрос
-    // уведомляет ВСЕГДА, каждый раз, без исключений. После commit, тем же принципом,
-    // что и у /api/leads выше.
-    await enqueue(db, 'text', {
-      text: [
-        '⚠️ <b>Запрос по персональным данным</b>',
-        `Вид: ${PD_REQUEST_KINDS[kind] || `нераспознанный (${escHtml(kind)}) — нужна классификация`}`,
-        `Исполнить до: <b>${dueDate}</b>`,
-        found ? 'Клиент найден в базе автоматически.' : 'Клиента в базе не нашли — сопоставить вручную.',
-        base ? `Открыть: ${base}/crm/privacy` : 'Открыть раздел «Права ПДн» в CRM',
-      ].join('\n'),
+      // Уведомление обезличено для ОБОИХ каналов, в отличие от заявок: здесь ПДн не
+      // нужны по существу — важны вид запроса и срок, кто именно — видно в CRM по ссылке.
+      // БЕЗ квоты на уведомление (раунд 19, см. комментарий выше) — ПДн-запрос
+      // уведомляет ВСЕГДА, каждый раз, без исключений.
+      await enqueue(tx, 'text', {
+        text: [
+          '⚠️ <b>Запрос по персональным данным</b>',
+          `Вид: ${PD_REQUEST_KINDS[kind] || `нераспознанный (${escHtml(kind)}) — нужна классификация`}`,
+          `Исполнить до: <b>${dueDate}</b>`,
+          found ? 'Клиент найден в базе автоматически.' : 'Клиента в базе не нашли — сопоставить вручную.',
+          base ? `Открыть: ${base}/crm/privacy` : 'Открыть раздел «Права ПДн» в CRM',
+        ].join('\n'),
+      })
+      // Последним шагом транзакции — и это не формальность: если наш захват за
+      // время работы перехватили по аренде, здесь 0 строк, и мы ОБЯЗАНЫ откатиться.
+      // Иначе перехватчик уже создал запрос и уведомил, а мы добавили бы вторые.
+      // Проверка стоит внутри транзакции именно чтобы откат был возможен: после
+      // COMMIT отменять было бы нечего.
+      if (!(await idempotencyFinish(claim.id, 204, tx))) throw new IdempotencyLost()
+      return { id: info.lastInsertRowid, matched: Boolean(found) }
     })
-    await idempotencyFinish(claim.id, 204)
-    app.log?.info?.({ id: infoId, kind, projectId, matched: Boolean(found), suspicious }, 'pd request accepted')
+    app.log?.info?.({ id: accepted.id, kind, projectId, matched: accepted.matched, suspicious }, 'pd request accepted')
     return reply.code(204).send()
     } catch (err) {
+      // Наш захват перехватили по аренде: работа откачена, а логическая отправка
+      // уже обслужена перехватчиком. Отвечаем ЕГО результатом, а не 500 — с точки
+      // зрения сайта это одна и та же отправка, и она удалась. Ключ не трогаем:
+      // он теперь чужой. status_code ещё NULL (перехватчик не закончил) — 429,
+      // тот же «повторите с тем же ключом», который сайт уже понимает.
+      if (err.idempotencyLost) {
+        const cur = await db
+          .prepare('SELECT status_code FROM idempotency_keys WHERE scope = ? AND request_id = ?')
+          .get('pd_requests', requestId)
+        app.log?.warn?.({ requestId }, 'pd-request: захват ключа перехвачен по аренде, работа откачена')
+        return reply.code(cur?.status_code ?? 429).send()
+      }
       await idempotencyAbandon(claim.id)
       throw err
     }

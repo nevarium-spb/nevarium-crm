@@ -2,6 +2,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import pg from 'pg'
 import { newDb } from 'pg-mem'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { buildApp, mskToday } from './app.js'
@@ -9,7 +10,8 @@ import { hashPassword, resetThrottle, verifyPassword, volatileSize, reserveVerif
 import { bootstrapAdmin } from './bootstrap.js'
 import { validSeedInput } from './seed-admin.js'
 import { runBackup } from './backup.js'
-import { DUMP_VERSION, addWorkdays, now } from './db.js'
+import { DUMP_VERSION, LOCK_WAIT_MS, addWorkdays, now } from './db.js'
+import { lockTablesForRestore } from './db-adapter.js'
 import { leadMessage, startOutboxWorker } from './telegram.js'
 
 // Перевод на Postgres (план в nevarium-lab#3): каждый тест — свежий pg-mem-пул
@@ -17,12 +19,57 @@ import { leadMessage, startOutboxWorker } from './telegram.js'
 // server/db-adapter.js (написанный для настоящего pg.Pool) работает поверх него
 // без изменений — buildApp({ dbConfig }) принимает готовый Pool-совместимый объект
 // точно так же, как строку подключения.
-function makePool() {
-  const mem = newDb()
-  return new (mem.adapters.createPg()).Pool()
+//
+// РЕЖИМ НАСТОЯЩЕГО POSTGRES. `TEST_DATABASE_URL` в окружении переключает набор с
+// pg-mem на живую базу — этим прогоняется обязательный ручной чек-лист из
+// HANDOFF.md, всё то, что эмулятор не умеет в принципе: реальный откат
+// транзакции, блокировки строк и таблиц, уровни изоляции, setval и BIGINT.
+//
+//   TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/db npm test
+//
+// Изоляция — СВОЯ СХЕМА на каждый тест, а не своя база: создание схемы дёшево, и
+// `search_path` в параметрах пула делает её невидимой для остального кода —
+// запросы остаются без квалификации, как и написаны. Пул закрывается вручную:
+// buildApp() этого не делает (под pg-mem не нужно), а на живой базе две сотни
+// незакрытых пулов упрутся в max_connections.
+export const REAL_PG = process.env.TEST_DATABASE_URL || ''
+/** Прогонять только на живой базе — под pg-mem такой тест недоказуем. */
+const itPg = REAL_PG ? it : it.skip
+let schemaSeq = 0
+
+async function makePool() {
+  if (!REAL_PG) {
+    const mem = newDb()
+    return new (mem.adapters.createPg()).Pool()
+  }
+  // Имя обязано быть уникальным МЕЖДУ воркерами, а не только внутри одного: vitest
+  // гоняет файлы в worker_threads, где process.pid у всех общий, а schemaSeq —
+  // счётчик своего модуля. Без VITEST_WORKER_ID два файла (или будущее разделение
+  // этого) сгенерировали бы одинаковое имя, и dropPool одного снёс бы CASCADE живую
+  // схему другого прямо посреди теста. CREATE SCHEMA намеренно без IF NOT EXISTS —
+  // столкновение должно падать громко, а не тихо переиспользовать чужое.
+  const schema = `t${process.pid}_${process.env.VITEST_WORKER_ID ?? 0}_${++schemaSeq}`
+  const admin = new pg.Pool({ connectionString: REAL_PG, max: 1 })
+  await admin.query(`CREATE SCHEMA "${schema}"`)
+  await admin.end()
+  // lock_timeout повторяем за openDb: в проде пул создаёт она сама и ставит потолок,
+  // а здесь пул делает фикстура — без этой строки тесты на ожидание блокировок
+  // висели бы вечно и проверяли не то.
+  const pool = new pg.Pool({ connectionString: REAL_PG, options: `-c search_path="${schema}" -c lock_timeout=${LOCK_WAIT_MS}ms`, max: 4 })
+  pool.__schema = schema
+  return pool
 }
 
-let app, cookie
+async function dropPool(pool) {
+  if (!REAL_PG || !pool?.__schema) return
+  const schema = pool.__schema
+  await pool.end()
+  const admin = new pg.Pool({ connectionString: REAL_PG, max: 1 })
+  await admin.query(`DROP SCHEMA "${schema}" CASCADE`)
+  await admin.end()
+}
+
+let app, cookie, pool
 
 async function login(email = 'a@a.ru', password = 'password123') {
   const res = await app.inject({ method: 'POST', url: '/api/auth/login', payload: { email, password } })
@@ -31,7 +78,8 @@ async function login(email = 'a@a.ru', password = 'password123') {
 
 beforeEach(async () => {
   resetThrottle()
-  app = await buildApp({ dbConfig: makePool(), secure: false })
+  pool = await makePool()
+  app = await buildApp({ dbConfig: pool, secure: false })
   await app.db
     .prepare('INSERT INTO users (name,email,password_hash,role,created_at) VALUES (?,?,?,?,?)')
     .run('Админ', 'a@a.ru', await hashPassword('password123'), 'admin', now())
@@ -39,7 +87,17 @@ beforeEach(async () => {
   cookie = (await login()).headers['set-cookie']
 })
 
-afterEach(async () => { await app.close() })
+afterEach(async () => {
+  // try/finally обязателен: если app.close() падает, без него dropPool не
+  // вызывается — схема в базе остаётся навсегда, а пул не закрывается. На живом
+  // Postgres один такой сбой каскадом выедает max_connections для всего прогона.
+  // Это уже случалось: пришлось вручную вычищать 57 осиротевших схем.
+  try {
+    await app?.close?.()
+  } finally {
+    await dropPool(pool)
+  }
+})
 
 describe('auth', () => {
   it('логин выдаёт cookie, /me работает, logout сбрасывает', async () => {
@@ -455,16 +513,23 @@ describe('APP_ORIGIN: строгая CSRF-проверка, когда доме�
   // Независимый аудит: сравнение с X-Forwarded-Host — это сравнение с заголовком,
   // который в общем случае подставляет клиент, а не прокси. Явный APP_ORIGIN
   // такой лазейки не оставляет — сравниваем строго с настроенным значением.
-  let strictApp, strictCookie
+  let strictApp, strictCookie, strictPool
 
   beforeEach(async () => {
-    strictApp = await buildApp({ dbConfig: makePool(), secure: false, appOrigin: 'https://crm-nevarium.ru' })
+    strictPool = await makePool()
+    strictApp = await buildApp({ dbConfig: strictPool, secure: false, appOrigin: 'https://crm-nevarium.ru' })
     await strictApp.db.prepare('INSERT INTO users (name,email,password_hash,role,created_at) VALUES (?,?,?,?,?)')
       .run('Админ', 'a@a.ru', await hashPassword('password123'), 'admin', now())
     await strictApp.ready()
     strictCookie = (await strictApp.inject({ method: 'POST', url: '/api/auth/login', payload: { email: 'a@a.ru', password: 'password123' } })).headers['set-cookie']
   })
-  afterEach(async () => { await strictApp.close() })
+  afterEach(async () => {
+    try {
+      await strictApp?.close?.()
+    } finally {
+      await dropPool(strictPool)
+    }
+  })
 
   it('верный Origin проходит', async () => {
     const res = await strictApp.inject({
@@ -1432,7 +1497,7 @@ describe('экспорт / импорт / CSV', () => {
   // Обязательный ручной прогон на настоящей Timeweb-базе перед первым продакшен-
   // деплоем (уже в критериях готовности ТЗ, Этап 4 плана переезда) должен включать
   // ИМЕННО эти два сценария.
-  it.skip('битый файл отклоняется атомарно (требует настоящего Postgres — см. комментарий выше)', async () => {
+  itPg('битый файл отклоняется атомарно (требует настоящего Postgres — см. комментарий выше)', async () => {
     await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Живой' }, headers: { cookie } })
     const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload: { version: 1, contacts: [{ nonsense: true }] }, headers: { cookie } })
     expect(res.statusCode).toBe(400)
@@ -1446,7 +1511,7 @@ describe('экспорт / импорт / CSV', () => {
   })
 
   // Тот же pg-mem-предел атомарности отката, что и у теста выше — см. комментарий там.
-  it.skip('импорт с чужеродным именем колонки отклоняется (не SQL-инъекция) (требует настоящего Postgres)', async () => {
+  itPg('импорт с чужеродным именем колонки отклоняется (не SQL-инъекция) (требует настоящего Postgres)', async () => {
     await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Живой' }, headers: { cookie } })
     const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload: { version: 1, contacts: [{ 'name) VALUES (1); DROP TABLE contacts; --': 'x', name: 'Злой' }] }, headers: { cookie } })
     expect(res.statusCode).toBe(400)
@@ -1461,15 +1526,47 @@ describe('экспорт / импорт / CSV', () => {
     expect(csv).not.toMatch(/(^|;|")=HYPERLINK/)
   })
 
-  it('демо-данные исключены из экспорта; CSV экранирует кавычки и точки с запятой', async () => {
+  it('демо-данные ВХОДЯТ в экспорт (иначе дамп невосстановим); CSV их не показывает', async () => {
+    // ПОВЕДЕНИЕ ИЗМЕНЕНО ОСОЗНАННО. Раньше дамп отсеивал demo-строки, и в SQLite это
+    // было безобидно — внешних ключей не было. В Postgres deals.contact_id и
+    // interactions.contact_id это NOT NULL REFERENCES contacts(id), а завести НЕ демо-
+    // сделку на демо-контакте можно обычным интерфейсом (демо-контакты видны в общем
+    // списке, обработчик создания колонку demo не ставит). Такой ребёнок уезжал в дамп
+    // без родителя, и импорт этого же файла падал на внешнем ключе — ночной бэкап был
+    // невосстановим, и выяснялось это только в аварии. Отсеивать заодно и детей значило
+    // бы молча терять НАСТОЯЩУЮ сделку, поэтому demo-строки теперь просто входят в дамп:
+    // они помечены demo = 1, и кнопка «Удалить демо-данные» работает после импорта.
+    // CSV — отдельный путь, он по-прежнему демо не показывает: это витрина, не бэкап.
     await app.inject({ method: 'POST', url: '/api/crm/demo-seed', headers: { cookie } })
     await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'ООО "Ромашка"; и точка' }, headers: { cookie } })
     const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
-    expect(dump.contacts).toHaveLength(1)
+    expect(dump.contacts.length).toBeGreaterThan(1)
+    expect(dump.contacts.some((c) => c.demo === 1 || c.demo === true)).toBe(true)
+    expect(dump.contacts.some((c) => c.name === 'ООО "Ромашка"; и точка')).toBe(true)
     const csv = (await app.inject({ method: 'GET', url: '/api/crm/contacts.csv', headers: { cookie } })).body
     expect(csv).toContain('"ООО ""Ромашка""; и точка"')
     // демо-контактов в CSV нет
     expect(csv).not.toContain('Балтика')
+  })
+
+  it('дамп с НЕ демо-сделкой на демо-контакте импортируется (внешний ключ цел)', async () => {
+    // Ровно тот сценарий, который делал бэкап невосстановимым: демо-контакт виден в
+    // общем списке, сотрудник заводит на нём настоящую сделку. Проверено независимым
+    // ревью на живой базе — до правки импорт падал с 400 bad_file на FK.
+    await app.inject({ method: 'POST', url: '/api/crm/demo-seed', headers: { cookie } })
+    const demoContact = await app.db.prepare('SELECT id FROM contacts WHERE demo = 1 ORDER BY id LIMIT 1').get()
+    expect(demoContact, 'демо-контакт не создался').toBeTruthy()
+    const deal = await app.inject({
+      method: 'POST', url: '/api/crm/deals',
+      payload: { contact_id: demoContact.id, title: 'Настоящая сделка на демо-контакте' }, headers: { cookie },
+    })
+    expect(deal.statusCode).toBe(200)
+
+    const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+    const ids = new Set(dump.contacts.map((c) => c.id))
+    expect(dump.deals.every((d) => ids.has(d.contact_id)), 'в дампе сделка без своего контакта').toBe(true)
+    const imp = await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })
+    expect(imp.statusCode, `импорт своего же дампа: ${imp.body}`).toBe(200)
   })
 
   it('очистка демо удаляет только помеченные записи', async () => {
@@ -2376,4 +2473,1023 @@ describe('мультипроектность', () => {
     const res = await app.inject({ method: 'PATCH', url: '/api/crm/contacts/1', payload: { project_id: 'nevarium-vizor' }, headers: { cookie } })
     expect(JSON.parse(res.body).item.project_id).toBe(2)
   })
+})
+
+// ---------------------------------------------------------------------------
+// Гонки и границы транзакций, вскрытые переводом на Postgres
+// ---------------------------------------------------------------------------
+// Общий корень всех тестов ниже: в better-sqlite3 целостность держалась на
+// синхронности — между «прочитал» и «записал» не было ни одной точки
+// переключения, поэтому вклиниться было физически некому. С асинхронным `pg`
+// каждый шаг это сетевой round-trip, и все эти проверки пришлось сделать явными.
+//
+// pg-mem парсит FOR UPDATE и уровни изоляции, но НЕ обеспечивает их семантику
+// (см. список ограничений в HANDOFF.md), поэтому «настоящую» гонку двух
+// соединений здесь воспроизвести нельзя. Там, где она непроверяема, тест
+// проверяет то, что проверяемо и от чего зависит корректность на настоящем
+// Postgres: КАКИЕ запросы и в КАКОЙ последовательности уходят в базу, и на
+// одном ли соединении. Каждый тест прогонялся на возвращённом баге — без
+// соответствующей правки он падает.
+
+/**
+ * Наблюдатель за пулом: пишет каждый SQL, различая прямые запросы через пул
+ * (autocommit, своё соединение на каждый вызов) и запросы внутри захваченного
+ * соединения (транзакция). Плюс умеет один раз сорвать нужный запрос или
+ * вклиниться сразу после него — так инъекция отказа и «чужая» запись в точное
+ * окно делаются детерминированно, без таймеров и без реального параллелизма.
+ *
+ * ВАЖНОЕ ОГРАНИЧЕНИЕ, установлено опытом: под pg-mem `pool.connect()` отдаёт
+ * объект, чей `query` — это тот же `pool.query`. То есть ПРИНАДЛЕЖНОСТЬ запроса
+ * соединению там ненаблюдаема в принципе, и проверка вида «этот запрос шёл НЕ
+ * через транзакцию» на pg-mem всегда ложно-зелёная — не пишите её снова.
+ *
+ * Поэтому проверки опираются на transactions(): границы задают сами команды
+ * BEGIN/COMMIT/ROLLBACK, а не объекты соединений. Такой разбор одинаково верен
+ * и на pg-mem (одно соединение на всех), и на настоящем Postgres (реальные
+ * отдельные соединения) — один и тот же тест доказывает одно и то же в обоих.
+ *
+ * Что наблюдаемо и чем эти тесты и пользуются: КАКОЙ текст SQL отправлен и в
+ * КАКОМ ПОРЯДКЕ. Этого достаточно, чтобы отличить исправленный код от прежнего —
+ * например, COMMIT, стоящий раньше постановки уведомления, виден как порядок,
+ * а не как выбор соединения.
+ */
+function watchPool(pool) {
+  const all = [] // { conn, sql } — единый поток в порядке отправки
+  const origQuery = pool.query.bind(pool)
+  const origConnect = pool.connect.bind(pool)
+  const hooks = { failBefore: null, failAfter: null, afterOnce: null }
+  const wrapped = new WeakSet()
+  const connOf = new WeakMap()
+  let connSeq = 0
+
+  const runBefore = async (text) => {
+    if (hooks.failBefore && String(text).includes(hooks.failBefore)) {
+      hooks.failBefore = null
+      throw new Error('инъекция отказа (до выполнения): ' + text)
+    }
+  }
+  const runAfter = async (text) => {
+    if (hooks.afterOnce && String(text).includes(hooks.afterOnce.needle)) {
+      const fn = hooks.afterOnce.fn
+      hooks.afterOnce = null
+      await fn()
+    }
+    if (hooks.failAfter && String(text).includes(hooks.failAfter)) {
+      hooks.failAfter = null
+      throw new Error('инъекция отказа (после выполнения): ' + text)
+    }
+  }
+
+  // Обе формы вызова, и у пула, и у соединения: node-postgres внутри пользуется
+  // КОЛБЭЧНОЙ формой (`query(text, values, cb)`), а обёртка, понимающая только
+  // промис, молча теряла колбэк — запрос не завершался никогда, тест висел до
+  // таймаута. Под pg-mem не всплывало: там колбэчной формы в этих путях нет.
+  const wrapQuery = (label, orig) => (...args) => {
+    const text = args[0]
+    all.push({ conn: label(), sql: String(text?.text ?? text) })
+    const cb = typeof args[args.length - 1] === 'function' ? args.pop() : null
+    const run = async () => {
+      await runBefore(text)
+      const res = await orig(...args)
+      await runAfter(text)
+      return res
+    }
+    const p = run()
+    if (cb) {
+      p.then((r) => cb(null, r), (e) => cb(e))
+      return undefined
+    }
+    return p
+  }
+
+  pool.query = wrapQuery(() => 'pool', origQuery)
+
+  // Соединение из пула нумеруем и оборачиваем РОВНО ОДИН раз: настоящий pg
+  // переиспользует объекты клиентов, и повторная обёртка удваивала бы записи.
+  const prepare = (client) => {
+    if (!connOf.has(client)) connOf.set(client, `c${++connSeq}`)
+    if (!wrapped.has(client)) {
+      wrapped.add(client)
+      client.query = wrapQuery(() => connOf.get(client), client.query.bind(client))
+    }
+    return client
+  }
+
+  // ОБЕ формы вызова. node-postgres внутри `pool.query` зовёт `connect(callback)`,
+  // и обёртка, понимающая только промис, роняла запрос в вечное ожидание —
+  // под pg-mem это не проявлялось, потому что там connect() отдаёт сам пул.
+  pool.connect = (cb) => {
+    const p = Promise.resolve(origConnect()).then(prepare)
+    if (typeof cb === 'function') {
+      p.then((c) => cb(undefined, c, c.release?.bind(c)), (e) => cb(e))
+      return undefined
+    }
+    return p
+  }
+
+  return {
+    /** Все запросы подряд, без разбора соединений. */
+    get sql() { return all.map((e) => e.sql) },
+    /**
+     * Транзакции как отдельные куски: от BEGIN до COMMIT/ROLLBACK на ОДНОМ
+     * соединении, в порядке открытия. Так проверки не зависят от того, отдаёт ли
+     * движок настоящие отдельные соединения (настоящий pg) или одно на всех
+     * (pg-mem) — разбор идёт по границам самих команд, а не по объектам.
+     */
+    transactions() {
+      const open = new Map()
+      const done = []
+      for (const { conn, sql } of all) {
+        if (/^\s*BEGIN/i.test(sql)) open.set(conn, [sql])
+        else if (open.has(conn)) {
+          open.get(conn).push(sql)
+          if (/^\s*(COMMIT|ROLLBACK)/i.test(sql)) { done.push(open.get(conn)); open.delete(conn) }
+        }
+      }
+      return [...done, ...open.values()]
+    },
+    /** Сорвать запрос ДО выполнения — падение базы на полпути. */
+    failOnce: (needle) => { hooks.failBefore = needle },
+    /** Сорвать ПОСЛЕ успешного выполнения — потерянное подтверждение (COMMIT прошёл,
+     * ответ не дошёл). Единственный способ воспроизвести неоднозначный коммит. */
+    failAfterOnce: (needle) => { hooks.failAfter = needle },
+    /** Выполнить fn сразу ПОСЛЕ запроса — «чужая» запись в точное окно. */
+    afterOnce: (needle, fn) => { hooks.afterOnce = { needle, fn } },
+    restore: () => { pool.query = origQuery; pool.connect = origConnect },
+  }
+}
+
+describe('границы транзакций и гонки (ревью перевода на Postgres)', () => {
+  let watch
+  afterEach(() => { watch?.restore(); watch = null })
+
+  describe('приём запроса по ПДн — запись, уведомление и ключ неделимы', () => {
+    it('запись, уведомление и закрытие ключа идут одной транзакцией, а не тремя шагами', async () => {
+      // Раньше в транзакции был только INSERT (хотя комментарий рядом обещал
+      // обратное), а enqueue и закрытие ключа шли после коммита. Падение базы
+      // между ними оставляло зарегистрированный запрос по ПДн, о котором никто
+      // не узнал (срок по 152-ФЗ идёт, сотруднику не пришло ничего), а
+      // обработчик ошибки при этом снимал застолбление ключа — и повтор сайта
+      // заводил ВТОРОЙ запрос, то есть второй 10-дневный срок на одно обращение.
+      //
+      // Сам откат под pg-mem непроверяем (см. it.skip ниже), но проверяемо
+      // главное: все три записи обязаны уйти на ОДНО соединение между BEGIN и
+      // COMMIT. До правки outbox и idempotency_keys туда не попадали вовсе.
+      watch = watchPool(app.db.pool)
+      const res = await app.inject({
+        method: 'POST', url: '/api/pd-requests',
+        payload: { contact: 'marina@x.ru', request_id: 'pd-atomic-1' },
+      })
+      expect(res.statusCode).toBe(204)
+
+      const tx = watch.transactions().find((t) => t.some((q) => q.includes('INSERT INTO pd_requests')))
+      expect(tx, 'запрос по ПДн обязан писаться в транзакции').toBeTruthy()
+      const at = (needle) => tx.findIndex((q) => q.includes(needle))
+      expect(tx[0], 'транзакция обязана начинаться с BEGIN').toBe('BEGIN')
+      expect(at('INSERT INTO outbox'), 'уведомление ушло мимо транзакции').toBeGreaterThan(at('INSERT INTO pd_requests'))
+      expect(at('UPDATE idempotency_keys'), 'ключ закрывается мимо транзакции').toBeGreaterThan(at('INSERT INTO outbox'))
+      expect(at('COMMIT'), 'COMMIT обязан быть последним').toBeGreaterThan(at('UPDATE idempotency_keys'))
+    })
+
+    // Настоящая проверка атомичности — на ОТКАТЕ, а его pg-mem не эмулирует:
+    // вставка внутри откаченной транзакции у него остаётся закоммиченной (то же
+    // ограничение, из-за которого пропущены два теста импорта выше). Прогнать
+    // руками на настоящем Postgres вместе с остальным чек-листом из HANDOFF.md:
+    // сорвать `INSERT INTO outbox` — ни запроса, ни ключа остаться не должно,
+    // а повтор с тем же ключом обязан создать РОВНО ОДИН запрос.
+    itPg('сбой на уведомлении не оставляет ни запроса, ни занятого ключа (нужен настоящий Postgres)', async () => {
+      watch = watchPool(app.db.pool)
+      watch.failOnce('INSERT INTO outbox')
+      const payload = { contact: 'marina@x.ru', request_id: 'pd-atomic-2' }
+
+      expect((await app.inject({ method: 'POST', url: '/api/pd-requests', payload })).statusCode).toBe(500)
+      expect((await app.db.prepare('SELECT COUNT(*) c FROM pd_requests').get()).c).toBe(0)
+      expect((await app.db.prepare('SELECT COUNT(*) c FROM idempotency_keys').get()).c).toBe(0)
+
+      // тот же ключ, база снова здорова — как и повторит сайт
+      expect((await app.inject({ method: 'POST', url: '/api/pd-requests', payload })).statusCode).toBe(204)
+      expect((await app.db.prepare('SELECT COUNT(*) c FROM pd_requests').get()).c).toBe(1)
+      expect((await app.db.prepare('SELECT COUNT(*) c FROM outbox').get()).c).toBe(1)
+    })
+
+    it('брошенный ключ умершего процесса перезахватывается, а не держит форму сутки', async () => {
+      // Процесс мог умереть (передеплой, OOM) между застолблением ключа и своей
+      // транзакцией — тогда снимать застолбление стало некому. Уборщик сносит
+      // такой ключ только через сутки, и всё это время повторы получали 429:
+      // человек отправил форму один раз и не может отправить снова целый день.
+      await app.db
+        .prepare('INSERT INTO idempotency_keys (scope, request_id, status_code, created_at) VALUES (?, ?, NULL, ?)')
+        .run('pd_requests', 'pd-orphan', new Date(Date.now() - 5 * 60_000).toISOString())
+
+      const res = await app.inject({
+        method: 'POST', url: '/api/pd-requests',
+        payload: { contact: 'marina@x.ru', request_id: 'pd-orphan' },
+      })
+      expect(res.statusCode).toBe(204)
+      expect((await app.db.prepare('SELECT COUNT(*) c FROM pd_requests').get()).c).toBe(1)
+    })
+
+    it('свежий незавершённый ключ по-прежнему держится — аренда не отключает защиту', async () => {
+      // Обратная сторона предыдущего теста: если бы перезахват срабатывал сразу,
+      // он бы уничтожил саму идемпотентность — два одновременных повтора одной
+      // отправки снова создали бы два запроса.
+      await app.db
+        .prepare('INSERT INTO idempotency_keys (scope, request_id, status_code, created_at) VALUES (?, ?, NULL, ?)')
+        .run('pd_requests', 'pd-fresh', now())
+
+      const res = await app.inject({
+        method: 'POST', url: '/api/pd-requests',
+        payload: { contact: 'marina@x.ru', request_id: 'pd-fresh' },
+      })
+      expect(res.statusCode).toBe(429)
+      expect((await app.db.prepare('SELECT COUNT(*) c FROM pd_requests').get()).c).toBe(0)
+    })
+  })
+
+  describe('бэкап — один согласованный снимок, а не серия независимых чтений', () => {
+    it('все таблицы дампа читаются одним соединением в REPEATABLE READ / READ ONLY', async () => {
+      // Через пул каждая таблица читалась своим соединением и своим снимком:
+      // заявка, пришедшая между чтением contacts и deals, клала в файл сделку
+      // без её контакта, а deals.contact_id — NOT NULL REFERENCES contacts(id).
+      // Такой бэкап не импортируется вовсе, и выясняется это в момент аварии.
+      // Саму изоляцию pg-mem не эмулирует — проверяем то, от чего она зависит
+      // на настоящем Postgres: одно соединение и явно запрошенный уровень.
+      await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+      await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'Пилот' }, headers: { cookie } })
+
+      watch = watchPool(app.db.pool)
+      const res = await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })
+      expect(res.statusCode).toBe(200)
+
+      const snapshot = watch.transactions().find((t) => t.some((q) => q.includes('REPEATABLE READ')))
+      expect(snapshot, 'дамп обязан открыть снимок на закреплённом соединении').toBeTruthy()
+      expect(snapshot.some((q) => q.includes('READ ONLY'))).toBe(true)
+      // ВСЕ таблицы дампа — на этом же соединении, от первой до последней
+      for (const t of ['contacts', 'deals', 'consents', 'tasks', 'interactions', 'pd_requests', 'audit_log']) {
+        expect(snapshot.some((q) => q.includes('FROM ' + t)), t + ' читается вне снимка').toBe(true)
+      }
+      expect(snapshot.some((q) => q.includes('FROM users')), 'состав команды читается вне снимка').toBe(true)
+      // Порядок тоже важен: снимок открыт ДО первого чтения, иначе смысла нет.
+      expect(snapshot.findIndex((q) => q.includes('REPEATABLE READ')))
+        .toBeLessThan(snapshot.findIndex((q) => q.includes('FROM contacts')))
+    })
+  })
+
+  describe('импорт — счётчики id не трогаются, пока импорт не удался целиком', () => {
+    it('упавший импорт не переписывает ни одной последовательности', async () => {
+      // setval в Postgres нетранзакционен: откат его не отменяет. Пока вызов
+      // стоял внутри цикла по таблицам, падение на поздней таблице оставляло
+      // счётчики ранних ПОНИЖЕННЫМИ до максимума из дампа, хотя строки
+      // откатились — и следующее создание записи падало на PRIMARY KEY.
+      await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+      await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'Пилот' }, headers: { cookie } })
+      const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+      // ломаем ПОЗДНЮЮ таблицу: contacts/deals к этому моменту уже вставлены
+      dump.tasks = [{ id: 1, title: 'Позвонить', выдуманное_поле: 'x' }]
+
+      watch = watchPool(app.db.pool)
+      const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })
+      expect(res.statusCode).toBe(400)
+
+      expect(watch.sql.some((q) => q.includes('setval')), 'упавший импорт трогал последовательности').toBe(false)
+    })
+
+    it('успешный импорт последовательности всё-таки чинит, и только вверх', async () => {
+      // Парный к предыдущему: перенос вызова в конец не должен был его потерять —
+      // иначе после восстановления первый же новый контакт падал бы на PRIMARY KEY.
+      await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+      const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+
+      watch = watchPool(app.db.pool)
+      const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })
+      expect(res.statusCode).toBe(200)
+
+      const setvals = watch.sql.filter((q) => q.includes('setval'))
+      expect(setvals.length).toBeGreaterThan(0)
+      // понижение счётчика и есть источник коллизий id — только GREATEST
+      expect(setvals.every((q) => q.includes('GREATEST'))).toBe(true)
+    })
+  })
+
+  describe('раздел ПДн — решение принимается по заблокированной строке', () => {
+    it('PATCH читает запрос внутри транзакции и под FOR UPDATE', async () => {
+      // Строка читалась до транзакции обычным SELECT, и вся защита
+      // verified_at/contactChanged держалась на допущении, что снимок
+      // консистентен. Два PATCH по одному снимку (верификация + смена контакта)
+      // разъезжались так, что запрос оказывался привязан к ОДНОМУ человеку, а
+      // подтверждён по ДРУГОМУ — и следующее обезличивание стирало не того.
+      // Саму блокировку pg-mem не реализует; проверяем, что она запрошена и что
+      // чтение идёт внутри транзакции, а не мимо неё.
+      await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+      await app.inject({
+        method: 'POST', url: '/api/crm/pd-requests',
+        payload: { contact_id: 1, kind: 'delete', requester: 'i@x.ru' }, headers: { cookie },
+      })
+
+      watch = watchPool(app.db.pool)
+      const res = await app.inject({
+        method: 'PATCH', url: '/api/crm/pd-requests/1',
+        payload: { note: 'уточнение' }, headers: { cookie },
+      })
+      expect(res.statusCode).toBe(200)
+
+      const tx = watch.transactions().find((t) => t.some((q) => q.includes('FROM pd_requests WHERE id = $1 FOR UPDATE')))
+      expect(tx, 'запрос по ПДн обязан читаться под FOR UPDATE').toBeTruthy()
+      // Чтение — ПОСЛЕ BEGIN: блокировка вне транзакции ничего не держит.
+      expect(tx[0]).toBe('BEGIN')
+    })
+
+    it('отказ валидации откатывает транзакцию, ничего не записав', async () => {
+      // Валидация переехала ВНУТРЬ транзакции — значит отказ обязан её откатывать,
+      // а не оставлять половину изменений закоммиченной.
+      await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+      await app.inject({
+        method: 'POST', url: '/api/pd-requests',
+        payload: { contact: 'i@x.ru', kind: 'delete' },
+      })
+      // pending_unverified: перевод сразу в done обязан быть отвергнут
+      const res = await app.inject({
+        method: 'PATCH', url: '/api/crm/pd-requests/1',
+        payload: { note: 'записать это не должны', status: 'done' }, headers: { cookie },
+      })
+      expect(res.statusCode).toBe(400)
+      expect(JSON.parse(res.body).error).toBe('not_verified')
+      const row = await app.db.prepare('SELECT note, status FROM pd_requests WHERE id = 1').get()
+      expect(row.note ?? '').not.toContain('записать это не должны')
+      expect(row.status).toBe('pending_unverified')
+    })
+  })
+
+  describe('оптимистичная блокировка — версия проверяется самой базой', () => {
+    it('ожидаемая версия стоит в условии самого UPDATE, а не только в отдельной проверке', async () => {
+      // Быстрая проверка по прочитанной строке пропускала того, кто вклинился ПОСЛЕ
+      // неё: оба PATCH читали одну версию, оба проходили, оба отвечали 200, и второй
+      // молча затирал первого. Лечится тем, что условие проверяет сама база, атомарно
+      // с записью.
+      //
+      // Раньше этот тест воспроизводил чередование напрямую — вклинивал «чужую»
+      // запись сразу после SELECT'а обработчика. Так делать больше НЕЛЬЗЯ, и это
+      // хорошая новость: после переноса чтения под `FOR UPDATE` (третий раунд ревью,
+      // барьер восстановления) строка заблокирована до конца транзакции, и чужая
+      // запись честно ждёт — на настоящем Postgres такой тест просто вешался бы, а
+      // под pg-mem проходил бы ложно-зелёным, потому что блокировок строк там нет.
+      // То есть более поздняя правка сделала само окно недостижимым. Проверяем то,
+      // что осталось проверяемым и от чего защита зависит: предикат в самом UPDATE.
+      // Поведение «устаревшая версия → 409» покрыто отдельно, в блоке «CRUD + конфликты».
+      const created = await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов', note: 'исходная' }, headers: { cookie } })
+      const before = JSON.parse(created.body).item
+
+      watch = watchPool(app.db.pool)
+      const res = await app.inject({
+        method: 'PATCH', url: '/api/crm/contacts/1',
+        payload: { note: 'моя правка', expectedUpdatedAt: before.updated_at }, headers: { cookie },
+      })
+      expect(res.statusCode).toBe(200)
+
+      const upd = watch.sql.find((q) => q.includes('UPDATE contacts SET'))
+      expect(upd, 'ожидали UPDATE контакта').toBeTruthy()
+      expect(upd.includes('updated_at = $'), 'версия не попала в условие UPDATE').toBe(true)
+      expect(/WHERE id = \$\d+ AND updated_at = \$\d+/.test(upd), `предикат без версии: ${upd}`).toBe(true)
+    })
+
+    it('без expectedUpdatedAt поведение прежнее — условие не навязывается', async () => {
+      // Клиенты, которые версию не шлют (например, внутренние вызовы), не должны
+      // начать получать 409 из-за этой правки.
+      await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+      const res = await app.inject({
+        method: 'PATCH', url: '/api/crm/contacts/1',
+        payload: { note: 'без версии' }, headers: { cookie },
+      })
+      expect(res.statusCode).toBe(200)
+      expect(JSON.parse(res.body).item.note).toBe('без версии')
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Второй раунд ревью: дыры, открытые самими правками первого раунда
+// ---------------------------------------------------------------------------
+// Первый раунд закрыл границы транзакций, но аренда ключа идемпотентности была
+// сделана без «ограждения» (fencing), а безусловный DELETE в idempotencyAbandon
+// стал опасен ровно потому, что закрытие ключа переехало ВНУТРЬ транзакции.
+// Обе находки — прямые последствия предыдущей правки, не предсуществующие баги.
+
+describe('идемпотентность: перезахват по аренде огорожен', () => {
+  let watch
+  afterEach(() => { watch?.restore(); watch = null })
+
+  it('перезахват заводит НОВУЮ строку, а прежний id перестаёт существовать', async () => {
+    // Аренда — догадка о смерти владельца, не доказательство. Пока перезахват
+    // сдвигал created_at у ТОЙ ЖЕ строки, у ожившего прежнего владельца
+    // оставался годный ключ, и он дописывал свою работу поверх чужой.
+    await app.db
+      .prepare('INSERT INTO idempotency_keys (scope, request_id, status_code, created_at) VALUES (?, ?, NULL, ?)')
+      .run('pd_requests', 'pd-fence', new Date(Date.now() - 5 * 60_000).toISOString())
+    const before = await app.db
+      .prepare('SELECT id FROM idempotency_keys WHERE scope = ? AND request_id = ?').get('pd_requests', 'pd-fence')
+
+    const res = await app.inject({
+      method: 'POST', url: '/api/pd-requests',
+      payload: { contact: 'marina@x.ru', request_id: 'pd-fence' },
+    })
+    expect(res.statusCode).toBe(204)
+
+    const after = await app.db
+      .prepare('SELECT id, status_code FROM idempotency_keys WHERE scope = ? AND request_id = ?').get('pd_requests', 'pd-fence')
+    expect(after.status_code).toBe(204)
+    // ГЛАВНОЕ: id другой. Прежний владелец, если оживёт, не найдёт своей строки.
+    expect(after.id).not.toBe(before.id)
+    expect((await app.db.prepare('SELECT COUNT(*) c FROM idempotency_keys WHERE id = ?').get(before.id)).c).toBe(0)
+  })
+
+  it('оживший прежний владелец откатывает свою работу, а не дописывает вторую запись', async () => {
+    // Полное чередование: A застолбил ключ и завис; аренда истекла; B перехватил
+    // и всё сделал; A ожил и продолжил с того же места. Раньше A спокойно
+    // дописывал ВТОРОЙ запрос по ПДн и второе уведомление — второй 10-дневный
+    // срок по 152-ФЗ на одно обращение.
+    //
+    // Сам откат pg-mem не исполняет (см. it.skip выше), поэтому проверяем не
+    // содержимое таблиц, а чем закончилась транзакция A: ROLLBACK против COMMIT.
+    // Это наблюдаемо и различает исправленный код от прежнего однозначно.
+    watch = watchPool(app.db.pool)
+    const key = { contact: 'marina@x.ru', request_id: 'pd-revive' }
+    // сразу после того, как A застолбил ключ: состарить его захват и впустить B
+    watch.afterOnce('INSERT INTO idempotency_keys', async () => {
+      await app.db
+        .prepare('UPDATE idempotency_keys SET created_at = ? WHERE scope = ? AND request_id = ?')
+        .run(new Date(Date.now() - 5 * 60_000).toISOString(), 'pd_requests', 'pd-revive')
+      const b = await app.inject({ method: 'POST', url: '/api/pd-requests', payload: key })
+      expect(b.statusCode).toBe(204)
+    })
+
+    const a = await app.inject({ method: 'POST', url: '/api/pd-requests', payload: key })
+    // A отвечает результатом B — с точки зрения сайта это одна и та же отправка
+    expect(a.statusCode).toBe(204)
+
+    // Последний заведённый лог — это соединение самого A: B отработал целиком
+    // раньше, внутри хука. Более ранние логи под pg-mem накапливают и чужие
+    // запросы (см. оговорку у watchPool), поэтому смотрим именно последний.
+    const txA = watch.transactions().at(-1)
+    expect(txA.some((q) => q.includes('INSERT INTO pd_requests')), 'ожидали транзакцию A').toBe(true)
+    expect(txA.includes('ROLLBACK'), 'транзакция ожившего владельца обязана откатиться').toBe(true)
+    expect(txA.includes('COMMIT'), 'оживший владелец закоммитил вторую запись').toBe(false)
+  })
+
+  it('потерянное подтверждение COMMIT не уничтожает уже закрытый ключ', async () => {
+    // Транзакция успела закоммитить запрос, уведомление и status_code = 204, но
+    // подтверждение COMMIT потерялось по сети. withTransaction видит отказ,
+    // обработчик зовёт idempotencyAbandon — и безусловный DELETE сносил ключ с
+    // уже закоммиченным успешным ответом. Повтор сайта заводил второй запрос
+    // при существующем первом.
+    //
+    // Отказ ПОСЛЕ успешного выполнения — единственный честный способ это
+    // воспроизвести. Сорвать сам COMMIT нельзя: тогда его и правда не было, и на
+    // настоящем Postgres всё откатится, то есть проверялся бы не тот сценарий.
+    // Здесь COMMIT реально проходит, а ошибку получает уже вызывающий код.
+    watch = watchPool(app.db.pool)
+    watch.failAfterOnce('COMMIT')
+    const payload = { contact: 'marina@x.ru', request_id: 'pd-ambiguous' }
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload })
+
+    const key = await app.db
+      .prepare('SELECT status_code FROM idempotency_keys WHERE scope = ? AND request_id = ?').get('pd_requests', 'pd-ambiguous')
+    expect(key, 'завершённый ключ не должен удаляться при неоднозначном коммите').toBeTruthy()
+    expect(key.status_code).toBe(204)
+
+    // и повтор получает свой законный кешированный ответ, не заводя второй запрос
+    watch.restore(); watch = null
+    const retry = await app.inject({ method: 'POST', url: '/api/pd-requests', payload })
+    expect(retry.statusCode).toBe(204)
+    expect((await app.db.prepare('SELECT COUNT(*) c FROM pd_requests').get()).c).toBe(1)
+  })
+})
+
+describe('восстановление и стадии сделки — запись заперта на время операции', () => {
+  let watch
+  afterEach(() => { watch?.restore(); watch = null })
+
+  it('импорт запирает запись во все свои таблицы ДО первого удаления', async () => {
+    // DELETE/INSERT берут лишь ROW EXCLUSIVE и параллельную вставку не блокируют.
+    // Значит между чтением MAX(id)/last_value и setval успевает вклиниться заявка
+    // с сайта, занять следующий id, а setval потом откатывает счётчик назад —
+    // и эта вставка сталкивается с восстановленной строкой по PRIMARY KEY.
+    // Монотонный GREATEST один этого не лечит: он сравнивает значения,
+    // прочитанные ДО вставки конкурента. pg-mem LOCK TABLE не разбирает, поэтому
+    // проверяем сам факт и позицию команды.
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+    const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+
+    watch = watchPool(app.db.pool)
+    expect((await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })).statusCode).toBe(200)
+
+    const tx = watch.transactions().find((t) => t.some((q) => q.includes('DELETE FROM contacts')))
+    expect(tx, 'импорт обязан идти транзакцией').toBeTruthy()
+    const firstLock = tx.findIndex((q) => q.includes('LOCK TABLE') && q.includes('EXCLUSIVE MODE'))
+    expect(firstLock, 'импорт не запер запись').toBeGreaterThanOrEqual(0)
+    expect(firstLock).toBeLessThan(tx.findIndex((q) => q.includes('DELETE FROM')))
+    // заперты все таблицы, которые импорт трогает, а не только сущности CRUD
+    const lock = tx[firstLock]
+    // idempotency_keys и outbox в списке НЕТ намеренно: их трогают пути мимо барьера
+    // (захват ключа идёт до withMutation, воркер очереди работает сам по себе), и
+    // блокировка вешала бы их на неограниченное ожидание — шагом раньше, чем
+    // срабатывает потолок. Обе таблицы чистятся импортом безусловно.
+    for (const t of ['contacts', 'deals', 'consents', 'tasks', 'interactions', 'pd_requests', 'audit_log', 'winback_sequences']) {
+      expect(lock.includes(t), `${t} не заперта`).toBe(true)
+    }
+  })
+
+  it('смена стадии и воронка возврата — одна транзакция по заблокированной сделке', async () => {
+    // T1 переводит «Новый»→«Проиграно» и ещё не завёл серию; T2 с законной
+    // версией переводит «Проиграно»→«Переговоры», видит старую стадию, зовёт
+    // отмену — и не находит ничего; затем T1 создаёт серию. Итог: сделка снова
+    // в работе, а напоминания «клиент ушёл» на ней висят, и оба запроса ответили
+    // 200. Настоящую блокировку строки pg-mem не исполняет, поэтому проверяем
+    // то, от чего она зависит: сделка читается FOR UPDATE, и вся производная
+    // работа идёт тем же соединением до COMMIT.
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'Пилот' }, headers: { cookie } })
+
+    watch = watchPool(app.db.pool)
+    const res = await app.inject({
+      method: 'PATCH', url: '/api/crm/deals/1',
+      payload: { stage: 'Проиграно', lostReason: 'дорого' }, headers: { cookie },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(JSON.parse(res.body).winback).toMatchObject({ started: true })
+
+    // Самый поздний лог = последняя открытая транзакция (см. оговорку у watchPool).
+    // Если серия заводится СВОЕЙ транзакцией, последней окажется она — и в ней не
+    // будет ни FOR UPDATE, ни UPDATE deals. Здесь всё обязано быть в одной.
+    const tx = watch.transactions().at(-1)
+    expect(tx[0]).toBe('BEGIN')
+    const at = (needle) => tx.findIndex((q) => q.includes(needle))
+    expect(at('FROM deals WHERE id = $1 FOR UPDATE'), 'сделка обязана читаться под FOR UPDATE').toBeGreaterThanOrEqual(0)
+    expect(at('UPDATE deals SET')).toBeGreaterThan(at('FOR UPDATE'))
+    expect(at('INSERT INTO winback_sequences'), 'серия заводится вне транзакции стадии').toBeGreaterThan(at('UPDATE deals SET'))
+    expect(at('COMMIT')).toBeGreaterThan(at('INSERT INTO winback_sequences'))
+  })
+
+  it('возврат сделки в работу снимает серию той же транзакцией', async () => {
+    // Парный к предыдущему: отмена тоже производная от стадии и обязана быть
+    // в той же транзакции, иначе разъезжается симметрично.
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'Пилот' }, headers: { cookie } })
+    await app.inject({ method: 'PATCH', url: '/api/crm/deals/1', payload: { stage: 'Проиграно' }, headers: { cookie } })
+
+    watch = watchPool(app.db.pool)
+    const res = await app.inject({
+      method: 'PATCH', url: '/api/crm/deals/1', payload: { stage: 'Переговоры' }, headers: { cookie },
+    })
+    expect(JSON.parse(res.body).winback).toMatchObject({ cancelled: true })
+
+    const tx = watch.transactions().at(-1)
+    const at = (needle) => tx.findIndex((q) => q.includes(needle))
+    expect(at('FROM deals WHERE id = $1 FOR UPDATE'), 'сделка обязана читаться под FOR UPDATE').toBeGreaterThanOrEqual(0)
+    expect(at("UPDATE winback_sequences SET status = 'cancelled'")).toBeGreaterThan(at('UPDATE deals SET'))
+    expect(at('COMMIT')).toBeGreaterThan(at("UPDATE winback_sequences SET status = 'cancelled'"))
+  })
+
+  it('стадия и closed_at считаются по заблокированной строке, а не по прочитанной заранее', async () => {
+    // closed_at тоже производный от «стадия действительно поменялась», поэтому
+    // переехал внутрь транзакции вместе с решением о воронке. Регрессия на то,
+    // что перенос не сломал прежнее поведение.
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'Пилот' }, headers: { cookie } })
+    const paid = await app.inject({ method: 'PATCH', url: '/api/crm/deals/1', payload: { stage: 'Оплачено' }, headers: { cookie } })
+    const closedAt = JSON.parse(paid.body).item.closed_at
+    expect(closedAt).toBeTruthy()
+    // повторный PATCH той же стадией не переставляет дату закрытия
+    const again = await app.inject({
+      method: 'PATCH', url: '/api/crm/deals/1', payload: { stage: 'Оплачено', note: 'правка' }, headers: { cookie },
+    })
+    expect(JSON.parse(again.body).item.closed_at).toBe(closedAt)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Третий раунд ревью: дыры, открытые правками второго раунда
+// ---------------------------------------------------------------------------
+// Две из четырёх находок — прямые последствия предыдущих правок: аренда ключа,
+// заведённая для pd-requests, оказалась опасна и для лидов (там её сознательно
+// оставили без ограждения, и обоснование «дубль погасит дедупликация» было
+// неверным), а `audit(..., tx)`, добавленный ради атомарности журнала, глушил
+// свою же ошибку внутри транзакции.
+
+describe('приём лида — владение ключом проверяется до коммита', () => {
+  let watch
+  afterEach(() => { watch?.restore(); watch = null })
+
+  it('заявка, уведомление и закрытие ключа идут одной транзакцией', async () => {
+    // Раньше enqueue и закрытие ключа шли ПОСЛЕ коммита, и потеря владения только
+    // писалась в лог. Обоснование было «повтор погасит дедупликация» — оно неверно:
+    // дедупликация читает базу ДО транзакции, а перехватчик и прежний владелец
+    // работают ОДНОВРЕМЕННО и оба видят «контакта нет», пока ни один не закоммитил.
+    watch = watchPool(app.db.pool)
+    const res = await app.inject({
+      method: 'POST', url: '/api/leads',
+      payload: { name: 'Марина', contact: 'marina@x.ru', request_id: 'lead-atomic' },
+    })
+    expect(res.statusCode).toBe(204)
+
+    const tx = watch.transactions().find((t) => t.some((q) => q.includes('INSERT INTO contacts')))
+    expect(tx, 'заявка обязана писаться в транзакции').toBeTruthy()
+    const at = (needle) => tx.findIndex((q) => q.includes(needle))
+    expect(at('INSERT INTO outbox'), 'уведомление ушло мимо транзакции').toBeGreaterThan(at('INSERT INTO contacts'))
+    expect(at('UPDATE idempotency_keys'), 'ключ закрывается мимо транзакции').toBeGreaterThan(at('INSERT INTO outbox'))
+    expect(at('COMMIT'), 'COMMIT обязан быть последним').toBeGreaterThan(at('UPDATE idempotency_keys'))
+  })
+
+  it('оживший прежний владелец откатывает заявку, а не заводит вторую карточку', async () => {
+    // Полное чередование, то же что у pd-requests: A застолбил ключ и завис, аренда
+    // истекла, B перехватил и всё сделал, A ожил. Дедупликация здесь бессильна —
+    // оба читали базу до того, как кто-либо закоммитил.
+    watch = watchPool(app.db.pool)
+    const key = { name: 'Марина', contact: 'marina@x.ru', request_id: 'lead-revive' }
+    // Хук стоит на захвате ключа — то есть ДО того, как A откроет транзакцию. Раньше
+    // он стоял на запросе дедупликации, чтобы оба увидели «контакта нет»; после того
+    // как дедупликация переехала ВНУТРЬ транзакции (барьер восстановления), так делать
+    // нельзя: B запускался бы посреди открытой транзакции A, а под pg-mem оба идут по
+    // одному соединению, и разбор по границам BEGIN/COMMIT их путает (см. оговорку у
+    // watchPool). Проверяемое свойство от переноса не пострадало: A всё равно доходит
+    // до своей транзакции с чужим ключом и обязан откатиться — просто теперь он идёт
+    // по ветке переиспользования контакта, а не создания.
+    watch.afterOnce('INSERT INTO idempotency_keys', async () => {
+      await app.db
+        .prepare('UPDATE idempotency_keys SET created_at = ? WHERE scope = ? AND request_id = ?')
+        .run(new Date(Date.now() - 5 * 60_000).toISOString(), 'leads', 'lead-revive')
+      const b = await app.inject({ method: 'POST', url: '/api/leads', payload: key })
+      expect(b.statusCode).toBe(204)
+    })
+
+    const a = await app.inject({ method: 'POST', url: '/api/leads', payload: key })
+    expect(a.statusCode).toBe(204) // отвечаем результатом перехватчика
+
+    // Контакт ровно один: вторая карточка и есть тот самый дубль. Проверяется
+    // только на живой базе — pg-mem откат не исполняет, у него строки ожившего
+    // владельца остаются, сколько бы ROLLBACK ни выполнил код (то же ограничение,
+    // из-за которого пропущены тесты атомарности импорта).
+    if (REAL_PG) expect((await app.db.prepare('SELECT COUNT(*) c FROM contacts').get()).c).toBe(1)
+
+    const txA = watch.transactions().at(-1)
+    // Слепок согласия пишется на КАЖДУЮ отправку, обеими ветками (и созданием
+    // контакта, и переиспользованием) — по нему транзакцию A и опознаём.
+    expect(txA.some((q) => q.includes('INSERT INTO consents')), 'ожидали транзакцию A').toBe(true)
+    expect(txA.includes('ROLLBACK'), 'транзакция ожившего владельца обязана откатиться').toBe(true)
+    expect(txA.includes('COMMIT'), 'оживший владелец закоммитил вторую заявку').toBe(false)
+  })
+})
+
+describe('журнал действий внутри транзакции не может провалиться молча', () => {
+  let watch
+  afterEach(() => { watch?.restore(); watch = null })
+
+  it('сбой записи в журнал отменяет саму операцию, а не отвечает 200', async () => {
+    // `audit` намеренно глушит ошибку — журнал не должен ломать сохранение контакта.
+    // Но ВНУТРИ транзакции это ломает всё: в Postgres упавший оператор переводит
+    // транзакцию в состояние отказа, и следующий COMMIT молча выполняется как
+    // ROLLBACK. То есть операция отменялась, а обработчик отвечал 200 — правка
+    // исчезала бесследно. Снаружи транзакции прежнее поведение сохраняется.
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'Пилот' }, headers: { cookie } })
+
+    watch = watchPool(app.db.pool)
+    watch.failOnce('INSERT INTO audit_log')
+    const res = await app.inject({
+      method: 'PATCH', url: '/api/crm/deals/1',
+      payload: { stage: 'Проиграно' }, headers: { cookie },
+    })
+    expect(res.statusCode, 'молчаливый 200 при отменённой операции').not.toBe(200)
+
+    const tx = watch.transactions().at(-1)
+    expect(tx.includes('ROLLBACK'), 'транзакция обязана откатиться').toBe(true)
+  })
+
+  it('снаружи транзакции журнал по-прежнему не ломает запрос', async () => {
+    // Обратная сторона: для путей, где audit вызывается БЕЗ tx, потерянная строка
+    // журнала не повод отменять операцию — это и было исходным решением, оно в силе.
+    // Пример такого пути — удаление: сама цепочка удаления идёт транзакцией, а запись
+    // в журнал делается уже после неё, на пуле. (Создание записи сюда больше не
+    // годится: оно тоже стало транзакционным ради барьера восстановления, и журнал
+    // там теперь обязан разделять судьбу вставки.)
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+    watch = watchPool(app.db.pool)
+    watch.failOnce('INSERT INTO audit_log')
+    const res = await app.inject({
+      method: 'DELETE', url: '/api/crm/contacts/1', headers: { cookie },
+    })
+    expect(res.statusCode).toBe(200)
+    expect((await app.db.prepare('SELECT COUNT(*) c FROM contacts').get()).c).toBe(0)
+  })
+
+  it('создание записи теперь тоже транзакционно — сбой журнала отменяет вставку', async () => {
+    // Парный к предыдущему: создание переехало под барьер обслуживания, значит
+    // audit получает tx, значит его сбой обязан отменить саму вставку, а не оставить
+    // контакт без следа в журнале.
+    watch = watchPool(app.db.pool)
+    watch.failOnce('INSERT INTO audit_log')
+    const res = await app.inject({
+      method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie },
+    })
+    expect(res.statusCode, 'молчаливый 200 при отменённой вставке').not.toBe(200)
+    const tx = watch.transactions().at(-1)
+    expect(tx.includes('ROLLBACK'), 'транзакция обязана откатиться').toBe(true)
+  })
+})
+
+describe('обезличивание ПДн сверяет проект контакта заново', () => {
+  it('контакт, уехавший в другой проект, обезличить по старому запросу нельзя', async () => {
+    // Границу проекта стерегла единственная проверка на пути смены привязки. Но
+    // контакт можно перенести в другой проект обычным PATCH — и подтверждённый
+    // запрос «Лаб ИИ» продолжал указывать на контакт, уехавший в «Визор».
+    // Обезличивание необратимо стирало человека ЧУЖОГО бизнеса.
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов', email: 'i@x.ru' }, headers: { cookie } })
+    await app.inject({
+      method: 'POST', url: '/api/crm/pd-requests',
+      payload: { contact_id: 1, kind: 'delete', requester: 'i@x.ru' }, headers: { cookie },
+    })
+    // перенос контакта в другой проект — штатная возможность CRM
+    const moved = await app.inject({
+      method: 'PATCH', url: '/api/crm/contacts/1',
+      payload: { project_id: 'nevarium-vizor' }, headers: { cookie },
+    })
+    expect(JSON.parse(moved.body).item.project_id).toBe(2)
+
+    const res = await app.inject({
+      method: 'PATCH', url: '/api/crm/pd-requests/1',
+      payload: { anonymize: true }, headers: { cookie },
+    })
+    expect(res.statusCode, 'обезличили контакт чужого проекта').toBe(400)
+    expect(JSON.parse(res.body).error).toBe('bad_reference')
+    const c = await app.db.prepare('SELECT anonymized_at FROM contacts WHERE id = 1').get()
+    expect(c.anonymized_at, 'контакт всё-таки обезличен').toBeFalsy()
+  })
+
+  it('контакт в своём проекте обезличивается как прежде', async () => {
+    // Парный: проверка не должна сломать законный путь.
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов', email: 'i@x.ru' }, headers: { cookie } })
+    await app.inject({
+      method: 'POST', url: '/api/crm/pd-requests',
+      payload: { contact_id: 1, kind: 'delete', requester: 'i@x.ru' }, headers: { cookie },
+    })
+    const res = await app.inject({
+      method: 'PATCH', url: '/api/crm/pd-requests/1',
+      payload: { anonymize: true }, headers: { cookie },
+    })
+    expect(res.statusCode).toBe(200)
+    const c = await app.db.prepare('SELECT anonymized_at FROM contacts WHERE id = 1').get()
+    expect(c.anonymized_at).toBeTruthy()
+  })
+})
+
+describe('мутации читают строку под блокировкой, а не мимо неё', () => {
+  let watch
+  afterEach(() => { watch?.restore(); watch = null })
+
+  it('PATCH любой сущности читает цель внутри транзакции и под FOR UPDATE', async () => {
+    // Импорт дампа берёт EXCLUSIVE на таблицы, но EXCLUSIVE намеренно ПУСКАЕТ
+    // обычные SELECT. Значит PATCH мог прочитать строку ДО восстановления,
+    // подождать на UPDATE и записать уже в ВОССТАНОВЛЕННУЮ строку с тем же id —
+    // возможно, совсем другой сущности. FOR UPDATE требует ROW SHARE, а он с
+    // EXCLUSIVE конфликтует: запрос ждёт ещё до чтения.
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+
+    watch = watchPool(app.db.pool)
+    const res = await app.inject({
+      method: 'PATCH', url: '/api/crm/contacts/1',
+      payload: { note: 'правка' }, headers: { cookie },
+    })
+    expect(res.statusCode).toBe(200)
+
+    const tx = watch.transactions().at(-1)
+    expect(tx[0]).toBe('BEGIN')
+    const at = (needle) => tx.findIndex((q) => q.includes(needle))
+    expect(at('FROM contacts WHERE id = $1 FOR UPDATE'), 'цель читается мимо блокировки').toBeGreaterThanOrEqual(0)
+    expect(at('UPDATE contacts SET')).toBeGreaterThan(at('FOR UPDATE'))
+    expect(at('COMMIT')).toBeGreaterThan(at('UPDATE contacts SET'))
+  })
+
+  it('404 и «нечего менять» по-прежнему отвечают как раньше', async () => {
+    // Перенос чтения внутрь транзакции не должен поменять внешнее поведение.
+    const missing = await app.inject({
+      method: 'PATCH', url: '/api/crm/contacts/999', payload: { note: 'x' }, headers: { cookie },
+    })
+    expect(missing.statusCode).toBe(404)
+
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+    const empty = await app.inject({
+      method: 'PATCH', url: '/api/crm/contacts/1', payload: { чужое_поле: 'x' }, headers: { cookie },
+    })
+    expect(empty.statusCode).toBe(200)
+    expect(JSON.parse(empty.body).item.name).toBe('Иванов')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Четвёртый раунд ревью: барьер «восстановление против обычной работы»
+// ---------------------------------------------------------------------------
+// Табличные блокировки третьего раунда защищали только ЗАПИСЬ: EXCLUSIVE намеренно
+// пускает обычные SELECT. Значит обработчик успевал прочитать данные до
+// восстановления и записать уже по восстановленным строкам с теми же id. Плюс сам
+// порядок захвата таблиц оказался встречным у импорта и у раздела ПДн — то есть
+// готовая взаимная блокировка.
+
+describe('барьер обслуживания: чтение мутаций тоже по эту сторону восстановления', () => {
+  let watch
+  afterEach(() => { watch?.restore(); watch = null })
+
+  const barrierOf = (tx) => tx.findIndex((q) => q.includes('pg_advisory_xact_lock'))
+
+  it('импорт берёт ИСКЛЮЧИТЕЛЬНЫЙ барьер, и берёт его самым первым', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+    const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+
+    watch = watchPool(app.db.pool)
+    expect((await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })).statusCode).toBe(200)
+
+    const tx = watch.transactions().find((t) => t.some((q) => q.includes('DELETE FROM contacts')))
+    expect(tx, 'импорт обязан идти транзакцией').toBeTruthy()
+    const b = barrierOf(tx)
+    expect(b, 'импорт не взял барьер').toBeGreaterThanOrEqual(0)
+    expect(tx[b].includes('pg_advisory_xact_lock_shared'), 'импорту нужен исключительный барьер, не разделяемый').toBe(false)
+    // Барьер — раньше любого обращения к данным (перед ним допустима только
+    // служебная подготовка: BEGIN и снятие потолка ожидания у самого восстановления).
+    const firstData = tx.findIndex((q) => /^s*(SELECT|INSERT|UPDATE|DELETE)/i.test(q) && !q.includes('pg_advisory_xact_lock'))
+    expect(firstData === -1 || b < firstData, `до барьера уже прочитали данные: ${tx.slice(0, b + 1).join(' | ')}`).toBe(true)
+    expect(b).toBeLessThan(tx.findIndex((q) => q.includes('LOCK TABLE')))
+  })
+
+  // Мутации берут РАЗДЕЛЯЕМЫЙ барьер — такие друг с другом не конфликтуют, поэтому
+  // штатная работа не сериализуется; ждать приходится только вокруг восстановления.
+  for (const [name, run] of [
+    ['удаление контакта', async (app, cookie) => {
+      await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+      return app.inject({ method: 'DELETE', url: '/api/crm/contacts/1', headers: { cookie } })
+    }],
+    ['прямое обезличивание контакта', async (app, cookie) => {
+      await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+      return app.inject({ method: 'POST', url: '/api/crm/contacts/1/anonymize', headers: { cookie } })
+    }],
+    ['правка контакта', async (app, cookie) => {
+      await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+      return app.inject({ method: 'PATCH', url: '/api/crm/contacts/1', payload: { note: 'x' }, headers: { cookie } })
+    }],
+    ['приём заявки с сайта', async (app) => app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'М', contact: 'm@x.ru' } })],
+    ['приём запроса по ПДн', async (app) => app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'm@x.ru' } })],
+  ]) {
+    it(`${name} берёт разделяемый барьер первым действием`, async () => {
+      watch = watchPool(app.db.pool)
+      const res = await run(app, cookie)
+      expect(res.statusCode).toBeLessThan(400)
+
+      const tx = watch.transactions().at(-1)
+      expect(tx[0]).toBe('BEGIN')
+      const b = barrierOf(tx)
+      expect(b, 'мутация не взяла барьер — её чтение может прийтись на дореcторные данные').toBeGreaterThanOrEqual(0)
+      expect(tx[b].includes('pg_advisory_xact_lock_shared'), 'мутации нужен РАЗДЕЛЯЕМЫЙ барьер, иначе они сериализуются между собой').toBe(true)
+      // Барьер обязан стоять РАНЬШЕ любого обращения к данным — барьер после чтения
+      // не защищает ничего. Проверяем это по существу, а не по номеру позиции:
+      // перед ним допустима только служебная подготовка (BEGIN, SET LOCAL).
+      const firstData = tx.findIndex((q) => /^\s*(SELECT|INSERT|UPDATE|DELETE)\b/i.test(q) && !q.includes('pg_advisory_xact_lock'))
+      expect(firstData === -1 || b < firstData, `до барьера уже прочитали данные: ${tx.slice(0, b + 1).join(' | ')}`).toBe(true)
+    })
+  }
+
+  it('удаление контакта со сделками по-прежнему отвечает 409, а не удаляет', async () => {
+    // Проверка «есть ли сделки» переехала внутрь транзакции — внешнее поведение
+    // обязано остаться прежним.
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/deals', payload: { contact_id: 1, title: 'Пилот' }, headers: { cookie } })
+    const res = await app.inject({ method: 'DELETE', url: '/api/crm/contacts/1', headers: { cookie } })
+    expect(res.statusCode).toBe(409)
+    expect(JSON.parse(res.body).error).toBe('has_deals')
+    expect((await app.db.prepare('SELECT COUNT(*) c FROM contacts').get()).c).toBe(1)
+  })
+
+  it('раздел ПДн и импорт больше не берут таблицы встречным порядком', async () => {
+    // Раздел ПДн блокировал pd_requests, затем contacts; импорт — contacts, затем
+    // pd_requests. Встречное ожидание давало 40P01, а обработчик импорта переводит
+    // любую ошибку в «битый файл» — владелец увидел бы «дамп повреждён» на целом
+    // бэкапе. Теперь обе стороны начинают с ОДНОГО барьера, и цикл замкнуть нечем.
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Иванов', email: 'i@x.ru' }, headers: { cookie } })
+    await app.inject({
+      method: 'POST', url: '/api/crm/pd-requests',
+      payload: { contact_id: 1, kind: 'delete', requester: 'i@x.ru' }, headers: { cookie },
+    })
+
+    watch = watchPool(app.db.pool)
+    const res = await app.inject({
+      method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { note: 'уточнение' }, headers: { cookie },
+    })
+    expect(res.statusCode).toBe(200)
+
+    const tx = watch.transactions().at(-1)
+    const b = barrierOf(tx)
+    expect(b, 'раздел ПДн не взял барьер').toBeGreaterThanOrEqual(0)
+    // барьер РАНЬШЕ первой блокировки строки — иначе порядок захвата снова свой
+    const firstRowLock = tx.findIndex((q) => q.includes('FOR UPDATE'))
+    expect(firstRowLock).toBeGreaterThan(b)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Пятый раунд (gstack /review, шесть специалистов): блокеры восстановления
+// ---------------------------------------------------------------------------
+// Два из трёх блокеров ниже — предсуществующие, а не последствия правок: они стали
+// фатальными именно после перехода на Postgres, где появились настоящие внешние ключи.
+
+describe('восстановление из дампа: блокеры, найденные ревью специалистов', () => {
+  let watch
+  afterEach(() => { watch?.restore(); watch = null })
+
+  it('дамп больше 1 МБ не отбивается потолком тела запроса', async () => {
+    // У Fastify потолок по умолчанию 1 МБ, и без явного bodyLimit импорт отвечал 413
+    // ещё ДО обработчика — то есть единственный путь аварийного восстановления
+    // (ADR-013) не работал на любой реальной базе. Проверено независимым ревью на
+    // дампе 1.89 МБ. Здесь берём заведомо больший объём и самый дешёвый повод для
+    // отказа (версия из будущего), чтобы тест мерил именно приём тела, а не вставку.
+    const payload = { version: DUMP_VERSION + 1, contacts: [], _pad: 'x'.repeat(1_500_000) }
+    const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload, headers: { cookie } })
+    expect(res.statusCode, 'тело дампа отбито потолком — восстановление невозможно').not.toBe(413)
+    expect(JSON.parse(res.body).error).toBe('newer_version')
+  })
+
+  it('очередь уведомлений очищается импортом — иначе уйдут ПДн другого человека', async () => {
+    // outbox намеренно обезличен: в нём только contactId, а имя и телефон достаются
+    // из БД В МОМЕНТ ОТПРАВКИ (ADR-009). После восстановления контакты заменены
+    // целиком, и пережившая импорт строка разрешила бы свой contactId в другого
+    // человека — его ПДн ушли бы в MAX под видом свежей заявки.
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru' } })
+    expect((await app.db.prepare('SELECT COUNT(*) c FROM outbox').get()).c).toBeGreaterThan(0)
+
+    const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+    expect((await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })).statusCode).toBe(200)
+    expect((await app.db.prepare('SELECT COUNT(*) c FROM outbox').get()).c, 'очередь пережила восстановление').toBe(0)
+  })
+
+  itPg('поиск дубля у заявки идёт ВНУТРИ транзакции, после барьера', async () => {
+    // ТОЛЬКО на живой базе: под pg-mem connect() отдаёт сам пул, поэтому запрос,
+    // отправленный МИМО транзакции, всё равно попадает в её лог — тест был бы
+    // ложно-зелёным (проверено: с откаченной правкой он проходит под pg-mem и
+    // краснеет под настоящим Postgres).
+    // Барьер защищает только то, что за ним. Дедупликация решает, ЗАВЕСТИ контакт или
+    // дописать в существующий; читая её через пул, мы принимали решение до барьера,
+    // а писали после — во время восстановления это смешивало ПДн двух людей.
+    watch = watchPool(app.db.pool)
+    const res = await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru' } })
+    expect(res.statusCode).toBe(204)
+
+    const tx = watch.transactions().find((t) => t.some((q) => q.includes('INSERT INTO consents')))
+    expect(tx, 'ожидали транзакцию приёма заявки').toBeTruthy()
+    const at = (needle) => tx.findIndex((q) => q.includes(needle))
+    expect(at('pg_advisory_xact_lock'), 'заявка не взяла барьер').toBeGreaterThanOrEqual(0)
+    expect(at('archived FROM contacts'), 'дедупликация читается мимо транзакции').toBeGreaterThan(at('pg_advisory_xact_lock'))
+  })
+
+  itPg('поиск контакта у запроса по ПДн идёт ВНУТРИ транзакции, после барьера', async () => {
+    // Здесь цена ошибки выше всего: этот contact_id потом служит основанием для
+    // НЕОБРАТИМОГО обезличивания.
+    watch = watchPool(app.db.pool)
+    const res = await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'm@x.ru' } })
+    expect(res.statusCode).toBe(204)
+
+    const tx = watch.transactions().find((t) => t.some((q) => q.includes('INSERT INTO pd_requests')))
+    expect(tx, 'ожидали транзакцию приёма запроса').toBeTruthy()
+    const at = (needle) => tx.findIndex((q) => q.includes(needle))
+    expect(at('pg_advisory_xact_lock'), 'запрос не взял барьер').toBeGreaterThanOrEqual(0)
+    expect(at('SELECT id FROM contacts WHERE anonymized_at IS NULL'), 'поиск контакта мимо транзакции')
+      .toBeGreaterThan(at('pg_advisory_xact_lock'))
+  })
+
+  itPg('настоящая ошибка базы НЕ глотается как «движок не умеет»', async () => {
+    // Три функции адаптера отличали эмулятор от боевого отказа подстрокой в тексте,
+    // и все три ошибались опасно: настоящий Postgres выдаёт `syntax error` при кривом
+    // LOCK TABLE, а `permission denied for function pg_advisory_xact_lock` содержит имя
+    // функции. Теперь разделитель — SQLSTATE: у боевой ошибки код есть всегда.
+    // Под pg-mem непроверяемо: там у ошибок кода нет вовсе, на том и построен разбор.
+    await expect(lockTablesForRestore(app.db, ['не существует такой таблицы']))
+      .rejects.toThrow()
+  })
+
+  itPg('мутация не ждёт барьер вечно, а отвечает 503 и освобождает соединение', async () => {
+    // Соединение пула занято и BEGIN уже выполнен к моменту ожидания барьера. Без
+    // потолка десяти публичных запросов во время восстановления хватало, чтобы выпить
+    // пул и подвесить ВСЁ, включая проверку сессии и чтения дашборда — ровно то, чего
+    // мы избегали, выбирая EXCLUSIVE вместо ACCESS EXCLUSIVE.
+    const holder = await app.db.pool.connect()
+    try {
+      await holder.query('BEGIN')
+      await holder.query('SELECT pg_advisory_xact_lock($1)', [4127001])
+      const started = Date.now()
+      const res = await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Ждун', contact: 'w@x.ru' } })
+      const waited = Date.now() - started
+      expect(res.statusCode, 'запрос обязан отказаться, а не висеть').toBe(503)
+      expect(JSON.parse(res.body).error).toBe('maintenance')
+      expect(waited, 'ждал дольше собственного потолка').toBeLessThan(15000)
+    } finally {
+      await holder.query('ROLLBACK').catch(() => {})
+      holder.release()
+    }
+    // Потолок теста заведомо больше BARRIER_WAIT_MS (5 с): по умолчанию у vitest
+    // ровно 5 с, и тест падал бы по таймауту раньше, чем сработает проверяемый отказ.
+  }, 30000)
 })
