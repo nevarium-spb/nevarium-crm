@@ -20,6 +20,14 @@ ENV NODE_ENV=production
 ENV NODE_EXTRA_CA_CERTS=/app/server/certs/russian-trusted-root-ca.pem
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/server ./server
+# src/shared — единственное, что сервер импортирует за пределами своей папки:
+# `server/db.js` реэкспортирует оттуда список стадий сделки, общий с фронтом
+# (см. CLAUDE.md). Без этой строки образ СОБИРАЕТСЯ УСПЕШНО и падает только при
+# старте — `ERR_MODULE_NOT_FOUND: /app/src/shared/stages.js`, то есть неудачным
+# оказался бы уже сам деплой. Поймано пробной сборкой образа перед выкаткой.
+# Копируем только shared, не весь src: исходники фронта в рантайме не нужны,
+# в образ уезжает уже собранный dist.
+COPY --from=build /app/src/shared ./src/shared
 COPY --from=build /app/package.json ./
 # Собранный фронт — раньше собирался и терялся: сервер сам отдаёт его
 # (server/index.js → staticDir), лишний контейнер с Caddy для App Platform не нужен.
