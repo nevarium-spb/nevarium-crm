@@ -1,7 +1,7 @@
 # Сборка сайта + сервер CRM в одном образе.
 # При проблемах с Docker Hub из РФ раскомментируйте зеркало:
-# FROM mirror.gcr.io/library/node:20-alpine AS build
-FROM node:20-alpine AS build
+# FROM mirror.gcr.io/library/node:22-alpine AS build
+FROM node:22-alpine AS build
 WORKDIR /app
 COPY package*.json ./
 # better-sqlite3 убран (перевод на Postgres, план в nevarium-lab#3) — npm rebuild
@@ -10,7 +10,7 @@ RUN npm ci --ignore-scripts
 COPY . .
 RUN npm run build
 
-FROM node:20-alpine
+FROM node:22-alpine
 WORKDIR /app
 ENV NODE_ENV=production
 # MAX (platform-api2.max.ru) подписан Национальным удостоверяющим центром Минцифры —
