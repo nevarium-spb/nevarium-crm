@@ -13,6 +13,11 @@ RUN npm run build
 FROM node:22-alpine
 WORKDIR /app
 ENV NODE_ENV=production
+# curl нужен не приложению, а платформе: Timeweb App Platform проверяет healthcheck,
+# выполняя `curl` ВНУТРИ контейнера (не HTTP-запросом снаружи) — в node:*-alpine его
+# нет по умолчанию, без него любой деплой уходит в "unhealthy" независимо от того,
+# отвечает сервер или нет (подтверждено поддержкой Timeweb, тикет 12613721).
+RUN apk add --no-cache curl
 # MAX (platform-api2.max.ru) подписан Национальным удостоверяющим центром Минцифры —
 # этого корня нет в обычном наборе доверенных CA у Node, без него sendMax() будет
 # падать с "unable to get local issuer certificate". Файл сертификата — server/certs/,
