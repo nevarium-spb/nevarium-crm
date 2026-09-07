@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import { repo } from '../api.js'
 import { EntityModal } from '../forms.jsx'
 import { ProjectBadge, ProjectFilter, useProjectFilter } from '../projects.jsx'
-import { SOURCE_LABEL, apiErrorToast, onRefresh } from '../ui.jsx'
+import { SOURCE_LABEL, apiErrorToast, onRefresh, toast } from '../ui.jsx'
 
 export default function Contacts() {
   const [data, setData] = useState(null)
@@ -30,6 +30,18 @@ export default function Contacts() {
     return () => clearTimeout(t)
   }, [q, load])
   useEffect(() => onRefresh(() => load(q)), [q, load])
+
+  const remove = async (c) => {
+    if (!window.confirm(`Удалить контакт «${c.name}» вместе с задачами и историей?`)) return
+    try {
+      await repo.remove('contacts', c.id)
+      toast('Контакт удалён')
+      load(q)
+    } catch (err) {
+      if (err.kind === 'conflict' || err.data?.error === 'has_deals') toast('У контакта есть сделки — используйте архив', 'error')
+      else apiErrorToast(err)
+    }
+  }
 
   return (
     <>
@@ -70,6 +82,12 @@ export default function Contacts() {
               <ProjectBadge id={c.project_id} when={project === 'all'} />
               {c.suspicious ? <span className="badge warn">подозрительный</span> : null}
               {c.archived ? <span className="badge gray">архив</span> : <span className="badge gray">{SOURCE_LABEL[c.source] || c.source}</span>}
+              <button
+                className="btn danger"
+                style={{ minHeight: 28, padding: '2px 10px', fontSize: 12 }}
+                title="Удалить контакт"
+                onClick={() => remove(c)}
+              >✕</button>
             </span>
           </div>
         ))}
