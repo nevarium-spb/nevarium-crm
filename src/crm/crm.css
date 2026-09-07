@@ -365,6 +365,22 @@
 .crm-form select:focus,
 .crm-form textarea:focus { border-color: rgba(47, 107, 255, 0.55); outline: none; }
 .crm-form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.pw-field { position: relative; }
+.pw-field input { width: 100%; padding-right: 42px; }
+.pw-toggle {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  color: var(--text-2);
+  cursor: pointer;
+  padding: 6px 8px;
+  font-size: 13px;
+  line-height: 1;
+}
+.pw-toggle:hover { color: var(--text-1); }
 .crm-form-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 6px; }
 .btn {
   border: 1px solid var(--glass-border);

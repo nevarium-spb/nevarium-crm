@@ -144,6 +144,7 @@ function UserModal({ existing, onDone, onClose }) {
   const [name, setName] = useState(existing?.name ?? '')
   const [email, setEmail] = useState(existing?.email ?? '')
   const [password, setPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
   const [role, setRole] = useState('member')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -193,7 +194,24 @@ function UserModal({ existing, onDone, onClose }) {
         )}
         <label>
           {existing ? 'Новый пароль (необязательно)' : 'Пароль *'}
-          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} minLength={minLen} required={!existing} />
+          <div className="pw-field">
+            <input
+              type={showPassword ? 'text' : 'password'}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              minLength={minLen}
+              required={!existing}
+            />
+            <button
+              type="button"
+              className="pw-toggle"
+              onClick={() => setShowPassword((v) => !v)}
+              aria-label={showPassword ? 'Скрыть пароль' : 'Показать пароль'}
+              tabIndex={-1}
+            >
+              {showPassword ? '🙈' : '👁'}
+            </button>
+          </div>
         </label>
         <div className="crm-cap">
           Минимум {minLen} символов{targetRole === 'admin' ? ' — у администратора доступ к экспорту базы и обезличиванию, порог выше' : ''}.
