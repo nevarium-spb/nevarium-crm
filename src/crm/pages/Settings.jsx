@@ -162,9 +162,9 @@ function UserModal({ existing, onDone, onClose }) {
     setBusy(true)
     setError('')
     try {
-      if (existing) await api(`/crm/users/${existing.id}`, { method: 'PATCH', body: { password } })
+      if (existing) await api(`/crm/users/${existing.id}`, { method: 'PATCH', body: { name, ...(password ? { password } : {}) } })
       else await api('/crm/users', { method: 'POST', body: { name, email, password, role } })
-      toast(existing ? 'Пароль обновлён — его сессии сброшены' : 'Пользователь создан')
+      toast(existing ? 'Изменения сохранены' + (password ? ' — сессии сброшены' : '') : 'Пользователь создан')
       onDone()
       onClose()
     } catch (err) {
@@ -177,11 +177,11 @@ function UserModal({ existing, onDone, onClose }) {
   }
 
   return (
-    <Modal title={existing ? `Сброс пароля: ${existing.name}` : 'Новый пользователь'} onClose={onClose}>
+    <Modal title={existing ? `Пользователь: ${existing.name}` : 'Новый пользователь'} onClose={onClose}>
       <form className="crm-form" onSubmit={submit}>
+        <label>Имя *<input value={name} onChange={(e) => setName(e.target.value)} required autoFocus /></label>
         {!existing && (
           <>
-            <label>Имя *<input value={name} onChange={(e) => setName(e.target.value)} required autoFocus /></label>
             <label>Email *<input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required /></label>
             <label>Роль
               <select value={role} onChange={(e) => setRole(e.target.value)}>
@@ -192,8 +192,8 @@ function UserModal({ existing, onDone, onClose }) {
           </>
         )}
         <label>
-          {existing ? 'Новый пароль *' : 'Пароль *'}
-          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} minLength={minLen} required autoFocus={Boolean(existing)} />
+          {existing ? 'Новый пароль (необязательно)' : 'Пароль *'}
+          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} minLength={minLen} required={!existing} />
         </label>
         <div className="crm-cap">
           Минимум {minLen} символов{targetRole === 'admin' ? ' — у администратора доступ к экспорту базы и обезличиванию, порог выше' : ''}.
