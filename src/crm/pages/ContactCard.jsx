@@ -36,6 +36,15 @@ export default function ContactCard({ user }) {
     } catch (err) { apiErrorToast(err) }
   }
 
+  const removeDeal = async (deal) => {
+    if (!window.confirm(`Удалить сделку «${deal.title}»? Действия по контакту сохранятся.`)) return
+    try {
+      await repo.remove('deals', deal.id)
+      toast('Сделка удалена')
+      load()
+    } catch (err) { apiErrorToast(err) }
+  }
+
   const remove = async () => {
     if (!window.confirm(`Удалить контакт «${contact.name}» вместе с задачами и историей?`)) return
     try {
@@ -110,7 +119,15 @@ export default function ContactCard({ user }) {
                 <div className="row-name">{d.title}</div>
                 <div className="row-meta">{d.stage}{d.note ? ` · ${d.note.slice(0, 80)}` : ''}</div>
               </div>
-              <span className="deal-amount">{fmtMoney(d.amount)}</span>
+              <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span className="deal-amount">{fmtMoney(d.amount)}</span>
+                <button
+                  className="btn danger"
+                  style={{ minHeight: 28, padding: '2px 10px', fontSize: 12 }}
+                  title="Удалить сделку"
+                  onClick={() => removeDeal(d)}
+                >✕</button>
+              </span>
             </div>
           ))}
         </section>
