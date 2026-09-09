@@ -455,7 +455,18 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // (req, reply, done): getUser теперь сам асинхронный (await до БД) — Fastify
   // поддерживает async preHandler нативно, встроенный done() здесь просто не нужен.
   app.addHook('preHandler', async (req, reply) => {
-    if (!req.url.startsWith('/api/crm/')) return
+    // Матчим по КАНОНИЧЕСКОМУ шаблону совпавшего роута, а НЕ по req.url. req.url —
+    // сырой, ещё закодированный URL: `/api/%63rm/contacts` не начинается с
+    // `/api/crm/`, но роутер Fastify декодирует %63→c и всё равно ведёт на CRM-роут.
+    // Матч по req.url пропускал такой запрос МИМО авторизации — полная утечка ПДн без
+    // входа (найдено боевым пентестом). routeOptions.url — зарегистрированный шаблон
+    // (`/api/crm/contacts/:id`), его кодированием в запросе не подделать. Раскодированный
+    // req.url оставлен вторым, fail-safe барьером: если шаблон вдруг недоступен, не
+    // пропускаем под видом «не CRM» ничего, что после декодирования смотрит в /api/crm/.
+    const canonical = req.routeOptions?.url || ''
+    let decoded = req.url
+    try { decoded = decodeURIComponent(req.url) } catch { /* битое кодирование — идём с сырым */ }
+    if (!canonical.startsWith('/api/crm/') && !decoded.startsWith('/api/crm/')) return
     const user = await getUser(req)
     if (!user) return reply.code(401).send({ error: 'unauthorized' })
     if (req.method !== 'GET') {

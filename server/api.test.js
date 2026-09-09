@@ -469,6 +469,22 @@ describe('auth', () => {
     expect(res.statusCode).toBe(401)
   })
 
+  it('процентное кодирование в пути НЕ обходит авторизацию (боевой пентест)', async () => {
+    // req.url остаётся сырым (`/api/%63rm/...`), а роутер Fastify декодирует %63→c и
+    // ведёт на CRM-роут: матч авторизации по req.url пропускал такой запрос без входа
+    // и отдавал ПДн всех клиентов. Барьер теперь по каноническому шаблону роута.
+    for (const path of [
+      '/api/%63rm/contacts',   // %63 = c
+      '/api/c%72m/contacts',   // %72 = r
+      '/api/cr%6d/contacts',   // %6d = m
+      '/api/%63%72%6d/deals',
+      '/api/%63rm/users',
+    ]) {
+      const res = await app.inject({ method: 'GET', url: path })
+      expect(res.statusCode, `${path} обязан быть 401 без cookie`).toBe(401)
+    }
+  })
+
   it('смена пароля инвалидирует старую сессию (tokenVersion)', async () => {
     // Пользователь 1 — admin, порог для него 16 символов (MIN_ADMIN_PASSWORD_LENGTH)
     await app.inject({ method: 'PATCH', url: '/api/crm/users/1', payload: { password: 'newpassword12345' }, headers: { cookie } })
