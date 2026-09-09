@@ -485,6 +485,18 @@ describe('auth', () => {
     }
   })
 
+  it('на ответах стоят заголовки безопасности', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/health' })
+    const csp = res.headers['content-security-policy'] || ''
+    expect(csp).toContain("default-src 'self'")
+    expect(csp).toContain("script-src 'self'")           // без 'unsafe-inline' в script-src
+    expect(csp.includes("script-src 'self' 'unsafe-inline'")).toBe(false)
+    expect(res.headers['strict-transport-security']).toContain('max-age=')
+    expect(res.headers['x-content-type-options']).toBe('nosniff')
+    expect(res.headers['x-frame-options']).toBe('DENY')
+    expect(res.headers['referrer-policy']).toBe('strict-origin-when-cross-origin')
+  })
+
   it('смена пароля инвалидирует старую сессию (tokenVersion)', async () => {
     // Пользователь 1 — admin, порог для него 16 символов (MIN_ADMIN_PASSWORD_LENGTH)
     await app.inject({ method: 'PATCH', url: '/api/crm/users/1', payload: { password: 'newpassword12345' }, headers: { cookie } })

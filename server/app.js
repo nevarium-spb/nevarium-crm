@@ -57,6 +57,34 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   app.register(cookie)
   app.decorate('db', db)
 
+  // Заголовки безопасности на ВСЕ ответы (API, статика, ошибки) — hardening, не
+  // бизнес-логика. onRequest, чтобы попали и на файлы плагина статики, и на 4xx/5xx.
+  // CSP подобран под реальный фронт: единственный внешний ресурс — Google Fonts
+  // (index.html), скрипт и стили самохостятся (Vite → /assets), инлайн-скриптов нет,
+  // поэтому script-src 'self'. 'unsafe-inline' только в style-src — React расставляет
+  // инлайновые style-атрибуты; инъекция стиля несравнимо безобиднее инъекции скрипта.
+  const CSP = [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "object-src 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+    "img-src 'self' data:",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com",
+    "connect-src 'self'",
+  ].join('; ')
+  app.addHook('onRequest', async (req, reply) => {
+    reply.header('X-Content-Type-Options', 'nosniff')
+    reply.header('X-Frame-Options', 'DENY')
+    reply.header('Referrer-Policy', 'strict-origin-when-cross-origin')
+    // HSTS браузер применяет только по HTTPS; за прокси App Platform TLS терминируется
+    // на Caddy, а до контейнера доходит http — заголовок всё равно валиден для клиента.
+    reply.header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+    reply.header('Content-Security-Policy', CSP)
+  })
+
   // «Не дождались барьера обслуживания» — это НЕ сбой приложения, а «идёт
   // восстановление базы, повторите». Отдаём 503, а не 500: 5xx сайты и так трактуют
   // как повторяемое, но 503 честно называет причину, и в логи не сыпятся ложные
