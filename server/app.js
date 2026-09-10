@@ -116,10 +116,25 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // а помечаем «подозрительный» (CGNAT в РФ делает ложные срабатывания реальными).
   // Map живёт в инстансе приложения; пустые ключи выметаются периодически,
   // иначе публичный endpoint растил бы память по одному ключу на IP.
+  // Потолок числа IP-ключей в лимитерах памяти: спрей уникальных IP (ботнет или
+  // сломанный trustProxy) не должен растить Map безгранично между чистками leadSweep
+  // (Codex-аудит). Вытесняем только «холодные» записи (не под лимитом) с самых
+  // старых — Map хранит порядок вставки; горячий (флудящий) IP не трогаем, иначе
+  // вытеснение само сбросит его счётчик. Все горячие → не вытесняем, рост и так
+  // ограничен окном и периодической чисткой.
+  const MAX_IP_BUCKETS = 20000
+  function capBuckets(store, isHot) {
+    if (store.size < MAX_IP_BUCKETS) return
+    for (const [k, v] of store) {
+      if (!isHot(v)) { store.delete(k); return }
+    }
+  }
   const leadHits = new Map()
   function leadSuspicious(ip) {
     const nowMs = Date.now()
-    const list = (leadHits.get(ip) || []).filter((t) => nowMs - t < LEAD_WINDOW_MS)
+    const existing = leadHits.get(ip)
+    if (!existing) capBuckets(leadHits, (l) => l.length > LEAD_MAX_PER_WINDOW)
+    const list = (existing || []).filter((t) => nowMs - t < LEAD_WINDOW_MS)
     list.push(nowMs)
     leadHits.set(ip, list)
     return list.length > LEAD_MAX_PER_WINDOW
@@ -149,7 +164,9 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   function hardRateLimited(scope, ip) {
     const nowMs = Date.now()
     const store = hardHits[scope]
-    const list = (store.get(ip) || []).filter((t) => nowMs - t < HARD_LIMIT_WINDOW_MS)
+    const existing = store.get(ip)
+    if (!existing) capBuckets(store, (l) => l.length >= HARD_LIMIT_MAX)
+    const list = (existing || []).filter((t) => nowMs - t < HARD_LIMIT_WINDOW_MS)
     if (list.length >= HARD_LIMIT_MAX) {
       store.set(ip, list)
       return true
