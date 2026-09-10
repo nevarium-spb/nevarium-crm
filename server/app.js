@@ -100,6 +100,15 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       req.log?.warn?.({ url: req.url, sqlState }, 'запрос отклонён: база занята (вероятно, идёт восстановление)')
       return reply.code(503).send({ error: 'maintenance', hint: 'база занята, повторите запрос' })
     }
+    // Клиентские ошибки (4xx: битый JSON, тело велико, валидация) сохраняют свой
+    // статус и безопасное сообщение Fastify. Непредвиденные серверные (5xx / без
+    // статуса) — наружу обобщённо: текст JS/SQL-ошибки мог бы раскрыть схему БД или
+    // инфраструктуру (Codex-аудит). Детали — только в серверный лог.
+    const status = err?.statusCode || 500
+    if (status >= 500) {
+      req.log?.error?.({ err: String(err?.stack || err), url: req.url }, 'необработанная ошибка запроса')
+      return reply.code(500).send({ error: 'internal' })
+    }
     reply.send(err)
   })
 
@@ -576,7 +585,10 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   }
 
   // ---------- auth ----------
-  app.post('/api/auth/login', async (req, reply) => {
+  // bodyLimit занижен до 4 КБ: логин принимает только email+пароль, а стандартный
+  // потолок Fastify ~1 МБ — публичный неаутентифицированный роут, где параллельные
+  // крупные JSON-тела разбирались бы в память ДО admitLoginRequest() (Codex-аудит).
+  app.post('/api/auth/login', { bodyLimit: 4096 }, async (req, reply) => {
     // Потолок на ЗАПРОС, до всего остального: reserveVerify резервирует слот
     // синхронно (закрывает гонку «проверил — потом сделал»), но сама фаза ожидания
     // своего слота ничем не была ограничена по числу одновременных ожидающих —

@@ -497,6 +497,12 @@ describe('auth', () => {
     expect(res.headers['referrer-policy']).toBe('strict-origin-when-cross-origin')
   })
 
+  it('логин отбивает переросшее тело (bodyLimit) → 413', async () => {
+    const big = { email: 'a@a.ru', password: 'x'.repeat(20000) } // ~20 КБ > 4 КБ лимита
+    const res = await app.inject({ method: 'POST', url: '/api/auth/login', payload: big })
+    expect(res.statusCode).toBe(413)
+  })
+
   it('смена пароля инвалидирует старую сессию (tokenVersion)', async () => {
     // Пользователь 1 — admin, порог для него 16 символов (MIN_ADMIN_PASSWORD_LENGTH)
     await app.inject({ method: 'PATCH', url: '/api/crm/users/1', payload: { password: 'newpassword12345' }, headers: { cookie } })
