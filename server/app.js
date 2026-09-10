@@ -777,13 +777,45 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     return parentTx ? run(parentTx) : withMutation(run)
   }
 
-  /** Проект по origin сайта (см. колонку projects.origins). null — не наш домен. */
-  async function projectByOrigin(origin) {
+  // Кеш origins проектов в памяти — /api/leads и /api/pd-requests, ЕДИНСТВЕННЫЕ
+  // неаутентифицированные ручки, дёргают эту проверку на КАЖДЫЙ запрос с обоих
+  // публичных сайтов. Раньше здесь был живой SELECT на каждый вызов — если БД хоть
+  // немного споткнётся именно на OPTIONS-preflight (app.options ниже), промис
+  // leadOriginAllowed падает необработанным, общий обработчик ошибок отдаёт голый
+  // 500 БЕЗ единого CORS-заголовка — браузер показывает это как «blocked by CORS
+  // policy», хотя причина не в CORS вовсе. Найдено боевой сквозной проверкой
+  // (форма на nevarium-lab.ru → CRM): реальные заявки терялись молча, сайт при этом
+  // показывал «Заявка отправлена!» — сайт не проверяет исход fetch, это отдельный
+  // баг в другом репозитории, отсюда не чинится. Origins проектов меняются почти
+  // никогда — кеш с периодическим обновлением убирает БД с этого горячего пути
+  // совсем, а не просто прячет сбой за try/catch.
+  let projectsOriginCache = []
+  async function refreshProjectsOriginCache() {
+    try {
+      projectsOriginCache = await db.prepare("SELECT id, slug, display_name, origins FROM projects WHERE archived = 0 AND origins != ''").all()
+    } catch (err) {
+      // Транзиентный сбой БД не должен затирать последний РАБОЧИЙ кеш — оставляем
+      // прежний список как есть, следующий тик (или явный вызов) попробует снова.
+      app.log?.warn?.(`projects: не удалось обновить кеш origins: ${err}`)
+    }
+  }
+  await refreshProjectsOriginCache()
+  const projectsCacheTimer = setInterval(refreshProjectsOriginCache, 60_000)
+  projectsCacheTimer.unref?.()
+  app.addHook('onClose', (_i, done) => {
+    clearInterval(projectsCacheTimer)
+    done()
+  })
+  // Только для тестов: прод меняет origins почти никогда, 60с задержки достаточно —
+  // но тесты правят projects.origins напрямую в БД и ждать тик недопустимо долго.
+  app.decorate('refreshProjectsOriginCache', refreshProjectsOriginCache)
+
+  /** Проект по origin сайта (см. колонку projects.origins) — из кеша, без БД на горячем пути. */
+  function projectByOrigin(origin) {
     const o = trim(origin, 200).toLowerCase().replace(/\/+$/, '')
     if (!o) return null
-    const rows = await db.prepare("SELECT id, slug, display_name, origins FROM projects WHERE archived = 0 AND origins != ''").all()
     return (
-      rows.find((p) =>
+      projectsOriginCache.find((p) =>
         p.origins
           .toLowerCase()
           .split(',')

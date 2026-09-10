@@ -715,6 +715,7 @@ describe('приём лидов', () => {
     // ТЗ сайта Визор §2: недоверенный клиент передаёт project сам — если он молча
     // побеждает доверенный Origin, атакующий может загрязнить инбокс чужого бизнеса.
     await app.db.prepare("UPDATE projects SET origins = 'https://vizor.example.ru' WHERE slug = 'nevarium-vizor'").run()
+    await app.refreshProjectsOriginCache()
     await app.inject({
       method: 'POST',
       url: '/api/leads',
@@ -928,6 +929,7 @@ describe('приём лидов', () => {
 
   it('без поля формы проект определяется по домену сайта', async () => {
     await app.db.prepare("UPDATE projects SET origins = 'https://vizor.example.ru' WHERE slug = 'nevarium-vizor'").run()
+    await app.refreshProjectsOriginCache()
     await app.inject({
       method: 'POST',
       url: '/api/leads',
@@ -1244,6 +1246,7 @@ describe('приём лидов', () => {
 
   it('CORS: чужой домен не проходит preflight, свой — проходит', async () => {
     await app.db.prepare("UPDATE projects SET origins = 'https://vizor.example.ru' WHERE slug = 'nevarium-vizor'").run()
+    await app.refreshProjectsOriginCache()
     const alien = await app.inject({ method: 'OPTIONS', url: '/api/leads', headers: { origin: 'https://evil.example' } })
     expect(alien.statusCode).toBe(403)
     expect(alien.headers['access-control-allow-origin']).toBeUndefined()
@@ -1257,10 +1260,32 @@ describe('приём лидов', () => {
     // только content-type — браузер отбивал бы запрос ДО POST, идемпотентность
     // для реальных браузерных отправок просто не работала бы.
     await app.db.prepare("UPDATE projects SET origins = 'https://vizor.example.ru' WHERE slug = 'nevarium-vizor'").run()
+    await app.refreshProjectsOriginCache()
     const leads = await app.inject({ method: 'OPTIONS', url: '/api/leads', headers: { origin: 'https://vizor.example.ru' } })
     expect(leads.headers['access-control-allow-headers']).toContain('idempotency-key')
     const pd = await app.inject({ method: 'OPTIONS', url: '/api/pd-requests', headers: { origin: 'https://vizor.example.ru' } })
     expect(pd.headers['access-control-allow-headers']).toContain('idempotency-key')
+  })
+
+  it('preflight держится на кеше, не на живом запросе к БД (боевая сквозная проверка, 2026-09-10)', async () => {
+    // Раньше projectByOrigin бил в БД на КАЖДЫЙ OPTIONS-запрос — любая заминка там
+    // роняла preflight необработанным исключением: общий обработчик ошибок отдавал
+    // голый 500 БЕЗ единого CORS-заголовка, браузер показывал «blocked by CORS
+    // policy», хотя причина была не в CORS. Реальные заявки с сайта терялись молча,
+    // а сам сайт при этом показывал «Заявка отправлена!» — исход fetch не проверял.
+    // Кеш убирает БД с этого пути совсем: симулируем полный отказ БД и убеждаемся,
+    // что preflight для уже закешированного origin всё равно проходит.
+    await app.db.prepare("UPDATE projects SET origins = 'https://vizor.example.ru' WHERE slug = 'nevarium-vizor'").run()
+    await app.refreshProjectsOriginCache()
+    const originalPrepare = app.db.prepare
+    app.db.prepare = () => { throw new Error('симулированный сбой БД') }
+    try {
+      const res = await app.inject({ method: 'OPTIONS', url: '/api/leads', headers: { origin: 'https://vizor.example.ru' } })
+      expect(res.statusCode).toBe(204)
+      expect(res.headers['access-control-allow-origin']).toBe('https://vizor.example.ru')
+    } finally {
+      app.db.prepare = originalPrepare
+    }
   })
 })
 
