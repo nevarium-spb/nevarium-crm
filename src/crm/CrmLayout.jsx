@@ -8,6 +8,8 @@ const NAV = [
   { to: '/crm/contacts', label: 'Контакты', icon: 'M12 12a4 4 0 100-8 4 4 0 000 8zm0 2c-4 0-7 2-7 5v1h14v-1c0-3-3-5-7-5z' },
   { to: '/crm/tasks', label: 'Задачи', icon: 'M9 11l3 3 8-8M4 6h4M4 12h4M4 18h10' },
   { to: '/crm/privacy', label: 'Права ПДн', icon: 'M12 3l7 3v6c0 4-3 7-7 9-4-2-7-5-7-9V6l7-3zm0 6a2 2 0 00-2 2v4h4v-4a2 2 0 00-2-2z' },
+  // История тарифа Free приложения NVizor (ADR-016) — ПДн клиентов, только admin.
+  { to: '/crm/nvizor-free', label: 'NVizor Free', adminOnly: true, icon: 'M6 3h9l4 4v14H6V3zm9 0v4h4M9 12h7M9 16h7M9 8h3' },
   { to: '/crm/settings', label: 'Настройки', icon: 'M12 15a3 3 0 100-6 3 3 0 000 6zm8-3l2 1-2 3-2-1a7 7 0 01-2 1l-.5 2.5h-3L12 16a7 7 0 01-2-1l-2 1-2-3 2-1a7 7 0 010-2L6 9l2-3 2 1a7 7 0 012-1l.5-2.5h3L16 6a7 7 0 012 1l2-1 2 3-2 1a7 7 0 010 2z' },
 ]
 
@@ -33,7 +35,7 @@ export default function CrmLayout({ user, onLogout }) {
           NEVARIUM<b>/</b>CRM
         </div>
         <nav aria-label="Разделы CRM">
-          {NAV.map((item) => (
+          {NAV.filter((item) => !item.adminOnly || user.role === 'admin').map((item) => (
             <NavLink key={item.to} to={item.to} end={item.end} className={({ isActive }) => `crm-nav${isActive ? ' on' : ''}`}>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d={item.icon} /></svg>
               <span>{item.label}</span>

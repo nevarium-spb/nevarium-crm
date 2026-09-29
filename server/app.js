@@ -6,7 +6,7 @@ import { DEFAULT_PROJECT_ID, DUMP_TABLES, DUMP_VERSION, PD_REQUEST_KINDS, WINBAC
 import { withTransaction, resyncIdentitySequence, lockTablesForRestore, maintenanceBarrier, tryClaimIdempotencyKey } from './db-adapter.js'
 import { hashPassword, verifyPassword, fakeVerifyDelay, verifyOrFake, signToken, verifyToken, reserveVerify, loginSucceeded, sleep, admitLoginRequest, releaseLoginRequest, SESSION_TTL_DAYS, MIN_PASSWORD_LENGTH, MIN_ADMIN_PASSWORD_LENGTH } from './auth.js'
 import { enqueue } from './telegram.js'
-import { registerNvizorRoutes, deleteNvizorFreeReportsForPhone } from './nvizor.js'
+import { registerNvizorRoutes, registerNvizorAdminRoutes, deleteNvizorFreeReportsForPhone } from './nvizor.js'
 
 const COOKIE = 'nv_session'
 const MSK = 'Europe/Moscow'
@@ -607,6 +607,8 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       app.log?.warn?.(`audit: не удалось записать: ${err}`)
     }
   }
+
+  registerNvizorAdminRoutes(app, { db, withMutation, audit })
 
   // ---------- auth ----------
   // bodyLimit занижен до 4 КБ: логин принимает только email+пароль, а стандартный

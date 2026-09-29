@@ -9,6 +9,7 @@ import Contacts from './pages/Contacts.jsx'
 import ContactCard from './pages/ContactCard.jsx'
 import Tasks from './pages/Tasks.jsx'
 import Privacy from './pages/Privacy.jsx'
+import NvizorFree from './pages/NvizorFree.jsx'
 import Settings from './pages/Settings.jsx'
 import { Toasts } from './ui.jsx'
 import './crm.css'
@@ -43,6 +44,7 @@ export default function CrmApp() {
         <Route path="contacts/:id" element={<ContactCard user={me} />} />
         <Route path="tasks" element={<Tasks />} />
         <Route path="privacy" element={<Privacy user={me} />} />
+        <Route path="nvizor-free" element={<NvizorFree user={me} />} />
         <Route path="settings" element={<Settings user={me} />} />
         <Route path="*" element={<Dashboard />} />
       </Route>

@@ -160,3 +160,65 @@ describe('NVizor: персональные данные и резервная к
     expect(await app.db.prepare('SELECT record_id FROM nvizor_free_reports').all()).toHaveLength(1)
   })
 })
+
+describe('NVizor: экран «NVizor Free» в CRM', () => {
+  async function loginAs(role, email) {
+    await app.db
+      .prepare('INSERT INTO users (name,email,password_hash,role,created_at) VALUES (?,?,?,?,?)')
+      .run(role, email, await hashPassword('password123'), role, now())
+    const res = await app.inject({ method: 'POST', url: '/api/auth/login', payload: { email, password: 'password123' } })
+    return res.headers['set-cookie']
+  }
+  const push = (over) => app.inject({ method: 'POST', url: '/api/nvizor/free-reports', headers: auth, payload: record(over) })
+  const list = (cookie, q = '') =>
+    app.inject({ method: 'GET', url: `/api/crm/nvizor-free${q ? `?q=${encodeURIComponent(q)}` : ''}`, headers: cookie ? { cookie } : {} })
+
+  it('без входа — 401, ключ приложения вместо входа не годится, не-админ — 403', async () => {
+    await makeApp()
+    expect((await list()).statusCode).toBe(401)
+    expect((await app.inject({ method: 'GET', url: '/api/crm/nvizor-free', headers: auth })).statusCode).toBe(401)
+    const member = await loginAs('member', 'm@m.ru')
+    expect((await list(member)).statusCode).toBe(403)
+    expect((await app.inject({ method: 'DELETE', url: '/api/crm/nvizor-free/1', headers: { cookie: member } })).statusCode).toBe(403)
+  })
+
+  it('список: свежие сверху, без хешей и координат, только счётчики', async () => {
+    await makeApp()
+    const cookie = await loginAs('admin', 'a@a.ru')
+    await push()
+    await push({ recordId: 'rec-2', clientName: 'Сидорова Анна', clientPhone: '+7 999 111-22-33', usedAt: '2026-09-29T10:00:00.000Z' })
+    const res = await list(cookie)
+    expect(res.statusCode).toBe(200)
+    const body = res.json()
+    expect(body.total).toBe(2)
+    expect(body.items.map((r) => r.recordId)).toEqual(['rec-2', 'rec-1'])
+    expect(body.items[1]).toMatchObject({ clientName: 'Петров Пётр', phoneKey: '9210000001', photoCount: 2, locationCount: 1, devices: ['apple|iphone 15'] })
+    expect(body.items[1].photoHashes).toBeUndefined()
+    expect(body.items[1].locations).toBeUndefined()
+  })
+
+  it('поиск по имени (регистр, ё) и по цифрам телефона', async () => {
+    await makeApp()
+    const cookie = await loginAs('admin', 'a@a.ru')
+    await push()
+    await push({ recordId: 'rec-2', clientName: 'Сидорова Анна', clientPhone: '+7 999 111-22-33' })
+    expect((await list(cookie, 'петров петр')).json().items.map((r) => r.recordId)).toEqual(['rec-1'])
+    expect((await list(cookie, '111-22')).json().items.map((r) => r.recordId)).toEqual(['rec-2'])
+    expect((await list(cookie, 'нет такого')).json().items).toEqual([])
+  })
+
+  it('удаление: запись исчезает и из поиска приложения, в журнале без ПДн; повтор — 404', async () => {
+    await makeApp()
+    const cookie = await loginAs('admin', 'a@a.ru')
+    await push()
+    const [{ id }] = (await list(cookie)).json().items
+    const del = await app.inject({ method: 'DELETE', url: `/api/crm/nvizor-free/${id}`, headers: { cookie } })
+    expect(del.statusCode).toBe(200)
+    expect((await search({ clientPhone: '+7 921 000-00-01' })).json().records).toEqual([])
+    const log = await app.db.prepare("SELECT * FROM audit_log WHERE entity = 'nvizor_free_reports'").all()
+    expect(log).toHaveLength(1)
+    expect(log[0].detail).toBe('record rec-1')
+    expect((await app.inject({ method: 'DELETE', url: `/api/crm/nvizor-free/${id}`, headers: { cookie } })).statusCode).toBe(404)
+    expect((await app.inject({ method: 'DELETE', url: '/api/crm/nvizor-free/abc', headers: { cookie } })).statusCode).toBe(400)
+  })
+})

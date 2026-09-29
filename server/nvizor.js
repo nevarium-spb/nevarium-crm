@@ -166,6 +166,48 @@ export function registerNvizorRoutes(app, { db, token, withMutation, now }) {
 }
 
 /**
+ * Экран «NVizor Free» в самой CRM: просмотр выданных бесплатных отчётов и удаление
+ * записи (например, тестовой или выданной по ошибке — тогда клиент снова сможет получить
+ * бесплатный отчёт на других ПК). Роуты под /api/crm/ — вход в CRM и проверку источника
+ * запроса даёт общий хук app.js; здесь только роль: история содержит ПДн клиентов
+ * приложения, поэтому только admin, как журнал действий.
+ */
+export function registerNvizorAdminRoutes(app, { db, withMutation, audit }) {
+  app.get('/api/crm/nvizor-free', async (req, reply) => {
+    if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
+    const q = str(req.query?.q, MAX.name)
+    const qName = normName(q)
+    const qDigits = q.replace(/\D/g, '')
+    const rows = await db.prepare('SELECT * FROM nvizor_free_reports ORDER BY used_at DESC, id DESC').all()
+    const items = rows
+      .map((row) => ({ id: row.id, ...rowToRecord(row), createdAt: row.created_at }))
+      .filter((r) => {
+        if (!q) return true
+        if (qName && normName(r.clientName).includes(qName)) return true
+        return qDigits.length >= 3 && r.phoneKey.includes(qDigits)
+      })
+      .map(({ photoHashes, locations, ...r }) => ({ ...r, photoCount: photoHashes.length, locationCount: locations.length }))
+    return { items, total: rows.length }
+  })
+
+  app.delete('/api/crm/nvizor-free/:id', async (req, reply) => {
+    if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
+    const id = Number(req.params.id)
+    if (!Number.isInteger(id)) return reply.code(400).send({ error: 'bad_id' })
+    const removed = await withMutation(async (tx) => {
+      const row = await tx.prepare('SELECT record_id FROM nvizor_free_reports WHERE id = ?').get(id)
+      if (!row) return null
+      await tx.prepare('DELETE FROM nvizor_free_reports WHERE id = ?').run(id)
+      // Имя/телефон в журнал не пишем — только id записи приложения.
+      await audit(req, 'delete', 'nvizor_free_reports', id, `record ${row.record_id}`, tx)
+      return row
+    })
+    if (!removed) return reply.code(404).send({ error: 'not_found' })
+    return { ok: true }
+  })
+}
+
+/**
  * Обезличивание / удаление контакта (152-ФЗ): записи Free того же человека стираются
  * вместе с ним. Сопоставление — по ключу телефона, тем же способом, что дедуп лидов.
  * Вызывается ВНУТРИ транзакции обезличивания/удаления, на её tx.
