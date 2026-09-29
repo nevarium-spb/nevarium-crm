@@ -51,6 +51,30 @@ npm run build        # ожидается успех, фронт не менял
 
 ---
 
+## 🆕 Тариф Free приложения NVizor — ветка `feat/nvizor-free-reports`, НЕ закоммичено (2026-09-29)
+
+Рабочая копия `.claude/worktrees/nvizor-free-reports` (от `main` `fac296c`). Владелец
+попросил общую историю бесплатных отчётов настольного приложения NVizor
+(`G:\nvizor-app`) для всех своих ПК — решение и обоснование в **ADR-016**.
+- `server/nvizor.js` — `/api/nvizor/ping`, `/api/nvizor/free-reports`,
+  `/api/nvizor/free-reports/search`; доступ по `NVIZOR_APP_TOKEN` (Bearer), хук по
+  `routeOptions.url`, регресс-тест на процентное кодирование. Не задан ключ — 503.
+- `schema.sql` — таблица `nvizor_free_reports`; `DUMP_VERSION` 5, таблица в
+  `DUMP_TABLES`, импорт принимает дампы с ней и без неё (`hasFreeReports`).
+- `anonymizeContact` шаг 5c стирает записи Free того же ключа телефона; обычное
+  удаление карточки — нет (ADR-016).
+- Тесты: `server/nvizor.test.js` (8); весь набор — 242 зелёных + 7 it.skip.
+  Сквозная проверка с приложением по HTTP (pg-mem) прошла.
+
+**Чтобы выкатить (по команде владельца):** закоммитить ветку, влить в `main`,
+запушить (автодеплой); в «Настройках деплоя» Timeweb добавить `NVIZOR_APP_TOKEN`
+(значение — у владельца в `%USERPROFILE%\nvizor-crm-app-key.txt`), нажать
+**«Сохранить данные»**, при необходимости передеплоить. Проверка:
+`GET https://crm-nevarium.ru/api/nvizor/ping` без ключа → 401, с ключом → `{ok:true}`.
+Схема применяется сама при старте (`CREATE TABLE IF NOT EXISTS`).
+
+---
+
 ## ✅ Первый деплой на Timeweb App Platform — решено (2026-09-07)
 
 Приложение живо: `https://nevarium-spb-nevarium-crm-7a7a.twc1.net` — вход и работа

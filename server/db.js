@@ -172,7 +172,7 @@ export const DEFAULT_PROJECT_ID = 1
  * consents стоит СРАЗУ после deals (не в конце): вставка идёт в этом порядке, а
  * consents.deal_id ссылается на уже вставленную строку deals.
  */
-export const DUMP_TABLES = ['contacts', 'deals', 'consents', 'tasks', 'interactions', 'pd_requests', 'audit_log']
+export const DUMP_TABLES = ['contacts', 'deals', 'consents', 'tasks', 'interactions', 'pd_requests', 'audit_log', 'nvizor_free_reports']
 
 /**
  * ДЕМО-СТРОКИ ТЕПЕРЬ ВХОДЯТ В ДАМП. Раньше они отсеивались (`WHERE demo = 0`), и в
@@ -193,11 +193,12 @@ const DEMO_FILTERED = new Set()
 
 /**
  * Версия формата дампа. v1 — без pd_requests и audit_log (дампы до 2026-07-30).
- * v3 — pd_requests обзавёлся verified_at. v4 — новая таблица consents. Импорт
- * обязан принимать все — старый бэкап должен восстанавливаться (см. app.js,
- * hasCompliance/hasConsents).
+ * v3 — pd_requests обзавёлся verified_at. v4 — новая таблица consents. v5 — новая
+ * таблица nvizor_free_reports (тариф Free приложения NVizor). Импорт обязан
+ * принимать все — старый бэкап должен восстанавливаться (см. app.js,
+ * hasCompliance/hasConsents/hasFreeReports).
  */
-export const DUMP_VERSION = 4
+export const DUMP_VERSION = 5
 
 /**
  * Дамп — ОДИН согласованный снимок базы, не серия независимых чтений

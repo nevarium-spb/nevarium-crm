@@ -6,6 +6,7 @@ import { DEFAULT_PROJECT_ID, DUMP_TABLES, DUMP_VERSION, PD_REQUEST_KINDS, WINBAC
 import { withTransaction, resyncIdentitySequence, lockTablesForRestore, maintenanceBarrier, tryClaimIdempotencyKey } from './db-adapter.js'
 import { hashPassword, verifyPassword, fakeVerifyDelay, verifyOrFake, signToken, verifyToken, reserveVerify, loginSucceeded, sleep, admitLoginRequest, releaseLoginRequest, SESSION_TTL_DAYS, MIN_PASSWORD_LENGTH, MIN_ADMIN_PASSWORD_LENGTH } from './auth.js'
 import { enqueue } from './telegram.js'
+import { registerNvizorRoutes, deleteNvizorFreeReportsForPhone } from './nvizor.js'
 
 const COOKIE = 'nv_session'
 const MSK = 'Europe/Moscow'
@@ -38,10 +39,14 @@ const TRUST_PROXY = Number(process.env.TRUST_PROXY_HOPS) || 1
 // путь сравнения с X-Forwarded-Host.
 const APP_ORIGIN = trim(process.env.APP_ORIGIN, 300) || null
 
+// Ключ настольного приложения NVizor для /api/nvizor/* (server/nvizor.js). Не задан —
+// эти эндпоинты отвечают 503. Задаётся в настройках деплоя, как APP_ORIGIN.
+const NVIZOR_APP_TOKEN = trim(process.env.NVIZOR_APP_TOKEN, 200) || null
+
 // dbConfig (было dbFile — SQLite-путь; перевод на Postgres, план в nevarium-lab#3):
 // строка подключения (DATABASE_URL, прод) ИЛИ уже готовый Pool-совместимый объект
 // (тесты — pg-mem). Без аргумента openDb() сама берёт process.env.DATABASE_URL.
-export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true, logger = false, staticDir = null, trustProxy = TRUST_PROXY, appOrigin = APP_ORIGIN } = {}) {
+export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true, logger = false, staticDir = null, trustProxy = TRUST_PROXY, appOrigin = APP_ORIGIN, nvizorToken = NVIZOR_APP_TOKEN } = {}) {
   const db = await openDb(dbConfig)
   // trustProxy — число доверенных прокси-хопов, НЕ `true`. С `true` Fastify берёт
   // самый левый X-Forwarded-For как req.ip, а его подставляет клиент — тогда всё,
@@ -579,6 +584,8 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       await maintenanceBarrier(tx)
       return fn(tx)
     })
+
+  registerNvizorRoutes(app, { db, token: nvizorToken, withMutation, now })
 
   const audit = async (req, action, entity, id, detail = '', runner = db) => {
     app.log?.info?.({ user: req.user?.email, action, entity, id, detail }, 'mutation')
@@ -1292,6 +1299,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       pd_requests: ['contact_id', 'kind', 'status', 'requester', 'note', 'source', 'project_id', 'due_date', 'resolved_at', 'resolved_by', 'verified_at', 'created_at', 'updated_at'],
       audit_log: ['user_id', 'user_email', 'action', 'entity', 'entity_id', 'detail', 'created_at'],
       consents: ['contact_id', 'deal_id', 'project_id', 'requester', 'version', 'text', 'text_truncated', 'accepted_at', 'created_at'],
+      nvizor_free_reports: ['record_id', 'object_ref', 'client_name', 'phone_key', 'devices', 'locations', 'photo_hashes', 'used_at', 'created_at'],
     }
     const allowedCols = (n) =>
       PLAIN_COLS[n]
@@ -1365,7 +1373,13 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         // проверяем наличие СВОЕГО ключа отдельно, тем же принципом, что verified_at
         // ниже: по факту присутствия в JSON, а не по общей версии формата.
         const hasConsents = Array.isArray(data.consents)
-        const tables = (hasCompliance ? DUMP_TABLES : ENTITY_NAMES).filter((n) => n !== 'consents' || hasConsents)
+        // nvizor_free_reports (v5) — тем же принципом: дамп до её появления её не несёт,
+        // и существующие записи Free не стираются. Связей с контактами у неё нет, так что
+        // рвать после восстановления нечего.
+        const hasFreeReports = Array.isArray(data.nvizor_free_reports)
+        const tables = (hasCompliance ? DUMP_TABLES : ENTITY_NAMES)
+          .filter((n) => n !== 'consents' || hasConsents)
+          .filter((n) => n !== 'nvizor_free_reports' || hasFreeReports)
         // удаляем детей раньше родителей (FK), вставляем в прямом порядке
         for (const n of [...tables].reverse()) {
           await tx.prepare(`DELETE FROM ${n}`).run()
@@ -1683,6 +1697,9 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       //    contact_id/deal_id/project_id/created_at (ссылка на уже анонимизированный
       //    контакт ничего не раскрывает, дата фиксирует момент события).
       await tx.prepare("UPDATE consents SET requester = '', version = '', text = '', text_truncated = 0, accepted_at = NULL WHERE contact_id = ?").run(contactId)
+      // 5c. Записи тарифа Free приложения NVizor с тем же телефоном — признаки того же
+      //     человека (server/nvizor.js); значения телефона читаны ДО шага 1.
+      await deleteNvizorFreeReportsForPhone(tx, contact.phone)
       // 5b. Осиротевшие legacy-восстановлением строки (contact_id обнулён импортом
       //     дампа без consents — ADR-015, раунд 17/18 — requester НАМЕРЕННО уцелел
       //     как единственная зацепка). Независимая проверка (раунд 21) поймала: такая
