@@ -1,7 +1,4 @@
 // @vitest-environment node
-import fs from 'node:fs'
-import os from 'node:os'
-import path from 'node:path'
 import pg from 'pg'
 import { newDb } from 'pg-mem'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -9,7 +6,6 @@ import { buildApp, mskToday } from './app.js'
 import { hashPassword, resetThrottle, verifyPassword, volatileSize, reserveVerify, serializeVerify, verifyOrFake, admitLoginRequest, releaseLoginRequest, inFlightLoginCount, MAX_BUCKETS, MAX_QUEUED_PER_KEY, MAX_QUEUED_PER_SOURCE, MAX_INFLIGHT_LOGIN_REQUESTS, THROTTLE_IP_FREE_ATTEMPTS } from './auth.js'
 import { bootstrapAdmin } from './bootstrap.js'
 import { validSeedInput } from './seed-admin.js'
-import { runBackup } from './backup.js'
 import { DUMP_VERSION, LOCK_WAIT_MS, addWorkdays, now } from './db.js'
 import { lockTablesForRestore } from './db-adapter.js'
 import { leadMessage, startOutboxWorker } from './telegram.js'
@@ -2336,95 +2332,6 @@ describe('права субъекта ПДн (152-ФЗ)', () => {
     const memberCookie = (await login('m@m.ru', 'password123')).headers['set-cookie']
     const asMember = await app.inject({ method: 'GET', url: '/api/crm/audit', headers: { cookie: memberCookie } })
     expect(asMember.statusCode).toBe(403)
-  })
-})
-
-describe('бэкап: файл базы уходит в MAX, но никогда в Telegram', () => {
-  const silent = { warn() {}, error() {}, info() {} }
-  const maxEnv = { MAX_BOT_TOKEN: 'max-token', MAX_CHAT_ID: '42' }
-  let dir
-
-  beforeEach(() => {
-    dir = path.join(os.tmpdir(), `nv-backup-${Date.now()}-${Math.random().toString(36).slice(2)}`)
-  })
-  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }))
-
-  // Перевод на Postgres (план в nevarium-lab#3): VACUUM INTO (.sqlite-копия) убран
-  // из runBackup — у Postgres нет прямого аналога, снимок делается снаружи
-  // (pg_dump/управляемые бэкапы Timeweb). Единственный формат бэкапа теперь — JSON.
-
-  it('в MAX уходит JSON для восстановления', async () => {
-    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина Соколова', contact: '+7 921 555-14-88' } })
-    const sent = []
-    const { jsonFile } = await runBackup(app.db, {
-      dir,
-      env: maxEnv,
-      log: silent,
-      sendDocument: async (f, caption) => sent.push({ f, caption }),
-      sendStatus: async () => { throw new Error('статус не нужен, когда всё прошло') },
-    })
-    expect(fs.existsSync(jsonFile)).toBe(true)
-    expect(sent.map((s) => s.f)).toEqual([jsonFile])
-    expect(sent[0].caption).toContain('Импорт JSON')
-
-    // в копии действительно лежат ПДн — именно поэтому её нельзя в Telegram
-    expect(JSON.parse(fs.readFileSync(jsonFile, 'utf8')).contacts[0].name).toBe('Марина Соколова')
-  })
-
-  it('ночной JSON пригоден для восстановления: его принимает «Импорт JSON»', async () => {
-    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru' } })
-    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'm@x.ru', kind: 'delete' } })
-    const { jsonFile } = await runBackup(app.db, { dir, env: {}, log: silent, sendDocument: async () => {}, sendStatus: async () => {} })
-
-    // катастрофа: база опустела
-    await app.db.query('DELETE FROM pd_requests; DELETE FROM interactions; DELETE FROM tasks; DELETE FROM deals; DELETE FROM contacts')
-    const dump = JSON.parse(fs.readFileSync(jsonFile, 'utf8'))
-    const res = await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })
-    expect(res.statusCode).toBe(200)
-    expect((await app.db.prepare('SELECT name FROM contacts WHERE id = 1').get()).name).toBe('Марина')
-    expect((await app.db.prepare('SELECT COUNT(*) c FROM pd_requests').get()).c).toBe(1)
-  })
-
-  it('если MAX не настроен — копия остаётся на сервере, статус обезличен, файл никуда не уходит', async () => {
-    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина Соколова', contact: '+7 921 555-14-88' } })
-    const docs = []
-    const statuses = []
-    const { jsonFile } = await runBackup(app.db, {
-      dir,
-      env: {},
-      log: silent,
-      sendDocument: async (f) => docs.push(f),
-      sendStatus: async (text) => statuses.push(text),
-    })
-    expect(fs.existsSync(jsonFile)).toBe(true)
-    expect(docs).toHaveLength(0)
-    expect(statuses).toHaveLength(1)
-    expect(statuses[0]).not.toMatch(/Марина|555-14-88/)
-  })
-
-  it('ошибка отправки не теряет копию и сообщает обезличенным статусом', async () => {
-    const statuses = []
-    const { jsonFile } = await runBackup(app.db, {
-      dir,
-      env: maxEnv,
-      log: silent,
-      sendDocument: async () => { throw new Error('MAX недоступен') },
-      sendStatus: async (text) => statuses.push(text),
-    })
-    expect(fs.existsSync(jsonFile)).toBe(true)
-    expect(statuses[0]).toContain('не отправился')
-  })
-
-  it('ротация оставляет 7 последних дат', async () => {
-    fs.mkdirSync(dir, { recursive: true })
-    for (const d of ['01', '02', '03', '04', '05', '06', '07', '08', '09']) {
-      fs.writeFileSync(path.join(dir, `crm-2026-01-${d}.json`), '{}')
-    }
-    await runBackup(app.db, { dir, env: {}, log: silent, sendDocument: async () => {}, sendStatus: async () => {} })
-    const stamps = [...new Set(fs.readdirSync(dir).filter((f) => f.startsWith('crm-')).map((f) => f.slice(4, 14)))]
-    expect(stamps).toHaveLength(7)
-    expect(stamps).not.toContain('2026-01-01')
-    expect(stamps).toContain(new Date().toISOString().slice(0, 10))
   })
 })
 

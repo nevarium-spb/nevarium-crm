@@ -1,5 +1,3 @@
-import fs from 'node:fs'
-import path from 'node:path'
 import { now } from './db.js'
 import { withTransaction, maintenanceBarrier } from './db-adapter.js'
 
@@ -41,56 +39,6 @@ export async function sendMax(text, env = process.env) {
     signal: AbortSignal.timeout(10_000),
   })
   if (!res.ok) throw new Error(`MAX HTTP ${res.status}`)
-}
-
-/**
- * Отправка файла в MAX — этим уходит ночной бэкап базы (см. server/backup.js).
- * Именно MAX, а не Telegram: в файле базы лежат ПДн всех клиентов, а Telegram
- * зарубежный — это была бы трансграничная передача (152-ФЗ). ADR-009.
- *
- * Три шага, как требует MAX Bot API: получить URL → залить файл → прикрепить
- * к сообщению по токену. Файл обрабатывается на их стороне асинхронно, поэтому
- * сразу после загрузки прикрепление отвечает `attachment.not.ready` — это
- * нормальный ход событий (проверено на живом боте), ждём и повторяем.
- */
-export async function sendMaxDocument(filePath, caption, env = process.env, { attempts = 10, delayMs = 2000 } = {}) {
-  const token = env.MAX_BOT_TOKEN
-  const chatId = env.MAX_CHAT_ID
-  if (!token || !chatId) throw new Error('MAX_BOT_TOKEN/MAX_CHAT_ID не заданы')
-
-  const urlRes = await fetch(`${MAX_API}/uploads?type=file`, {
-    method: 'POST',
-    headers: { Authorization: token },
-    signal: AbortSignal.timeout(30_000),
-  })
-  if (!urlRes.ok) throw new Error(`MAX uploads HTTP ${urlRes.status}`)
-  const { url: uploadUrl } = await urlRes.json()
-  if (!uploadUrl) throw new Error('MAX uploads: не вернул url для загрузки')
-
-  const form = new FormData()
-  form.append('data', new Blob([fs.readFileSync(filePath)]), path.basename(filePath))
-  const upRes = await fetch(uploadUrl, { method: 'POST', body: form, signal: AbortSignal.timeout(120_000) })
-  if (!upRes.ok) throw new Error(`MAX upload HTTP ${upRes.status}`)
-  const fileToken = (await upRes.json())?.token
-  if (!fileToken) throw new Error('MAX upload: не вернул token файла')
-
-  const msgUrl = new URL(`${MAX_API}/messages`)
-  msgUrl.searchParams.set('chat_id', chatId)
-  let lastError = ''
-  for (let i = 0; i < attempts; i++) {
-    const res = await fetch(msgUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', Authorization: token },
-      body: JSON.stringify({ text: caption, attachments: [{ type: 'file', payload: { token: fileToken } }] }),
-      signal: AbortSignal.timeout(30_000),
-    })
-    if (res.ok) return
-    lastError = await res.text().catch(() => `HTTP ${res.status}`)
-    // Не «ещё не готово» — повторять бессмысленно, ошибка настоящая
-    if (!lastError.includes('not.ready')) throw new Error(`MAX attach HTTP ${res.status}: ${lastError.slice(0, 200)}`)
-    await new Promise((resolve) => setTimeout(resolve, delayMs))
-  }
-  throw new Error(`MAX attach: файл так и не обработался за ${attempts} попыток: ${lastError.slice(0, 200)}`)
 }
 
 /**
