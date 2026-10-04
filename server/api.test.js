@@ -1373,6 +1373,25 @@ describe('outbox: лид не теряется при падении Telegram и
   })
 })
 
+describe('мессенджеры без ПДн (ADR-018)', () => {
+  it('email заявителя не уходит ни в Telegram, ни в MAX — тексты одинаковые', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { task: 'аудит процессов', name: 'Ольга Петрова', contact: 'olga.petrova@example.ru', note: 'перезвонить вечером' } })
+    const texts = {}
+    const worker = startOutboxWorker(app.db, {
+      senders: { tg: async (t) => { texts.tg = t }, max: async (t) => { texts.max = t } },
+      log: { warn() {} },
+      autoStart: false,
+    })
+    worker.stop()
+    await worker.tick()
+    for (const ch of ['tg', 'max']) {
+      expect(texts[ch], ch).toBeTruthy()
+      expect(texts[ch], ch).not.toMatch(/Ольга|Петрова|olga|example\.ru|аудит процессов|перезвонить/)
+    }
+    expect(texts.max).toBe(texts.tg)
+  })
+})
+
 describe('экспорт / импорт / CSV', () => {
   it('импорт стирает idempotency_keys — иначе повтор после восстановления молча теряет данные', async () => {
     // Находка Codex: idempotency_keys вне DUMP_TABLES (короткоживущие по смыслу, не
@@ -1426,7 +1445,7 @@ describe('экспорт / импорт / CSV', () => {
     await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru' } })
     await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'm@x.ru', kind: 'delete', note: 'прошу удалить' } })
     // подтверждение личности — обязательный шаг перед исполнением (pending_unverified)
-    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new' }, headers: { cookie } })
+    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new', verify_method: 'call' }, headers: { cookie } })
     await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'done', anonymize: true }, headers: { cookie } })
 
     const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
@@ -1601,6 +1620,16 @@ describe('экспорт / импорт / CSV', () => {
     expect(csv).toContain('"ООО ""Ромашка""; и точка"')
     // демо-контактов в CSV нет
     expect(csv).not.toContain('Балтика')
+  })
+
+  it('CSV не портит ведущий «+» телефона, но по-прежнему гасит формулы', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Телефон', phone: '+7 (921) 555-14-88' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: '+SUM(A1:A9)', phone: '+1+1' }, headers: { cookie } })
+    const csv = (await app.inject({ method: 'GET', url: '/api/crm/contacts.csv', headers: { cookie } })).body
+    expect(csv).toContain(';+7 (921) 555-14-88;')
+    expect(csv).not.toContain("'+7 (921)")
+    expect(csv).toContain("'+SUM(A1:A9)")
+    expect(csv).toContain("'+1+1")
   })
 
   it('дамп с НЕ демо-сделкой на демо-контакте импортируется (внешний ключ цел)', async () => {
@@ -2148,7 +2177,7 @@ describe('права субъекта ПДн (152-ФЗ)', () => {
     // весь смысл раздельного человеческого шага верификации исчезает.
     await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'marina@x.ru' } })
     await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'marina@x.ru', kind: 'delete' } })
-    const res = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new', anonymize: true }, headers: { cookie } })
+    const res = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new', verify_method: 'call', anonymize: true }, headers: { cookie } })
     expect(res.statusCode).toBe(400)
     expect(JSON.parse(res.body).error).toBe('not_verified')
     expect((await app.db.prepare('SELECT anonymized_at FROM contacts WHERE id = 1').get()).anonymized_at).toBeNull()
@@ -2162,7 +2191,7 @@ describe('права субъекта ПДн (152-ФЗ)', () => {
     const res = await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'неизвестный@нигде.ru', kind: 'delete' } })
     expect(res.statusCode).toBe(204)
     expect((await app.db.prepare('SELECT contact_id FROM pd_requests WHERE id = 1').get()).contact_id).toBeNull()
-    const verify = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new' }, headers: { cookie } })
+    const verify = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new', verify_method: 'call' }, headers: { cookie } })
     expect(verify.statusCode).toBe(400)
     expect(JSON.parse(verify.body).error).toBe('no_contact')
     expect((await app.db.prepare('SELECT status FROM pd_requests WHERE id = 1').get()).status).toBe('pending_unverified')
@@ -2172,7 +2201,7 @@ describe('права субъекта ПДн (152-ФЗ)', () => {
     const verifyWithLink = await app.inject({
       method: 'PATCH',
       url: '/api/crm/pd-requests/1',
-      payload: { contact_id: 1, status: 'new' },
+      payload: { contact_id: 1, status: 'new', verify_method: 'call' },
       headers: { cookie },
     })
     expect(verifyWithLink.statusCode).toBe(200)
@@ -2195,7 +2224,7 @@ describe('права субъекта ПДн (152-ФЗ)', () => {
     expect(JSON.parse(anonymize.body).error).toBe('not_verified')
 
     // и попытка «переоткрыть» через new → done тоже не должна проходить без verified_at
-    const reopen = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new' }, headers: { cookie } })
+    const reopen = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new', verify_method: 'call' }, headers: { cookie } })
     expect(reopen.statusCode).toBe(200) // rejected → new сам по себе не запрещён…
     const done = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'done' }, headers: { cookie } })
     expect(done.statusCode).toBe(400) // …но done без verified_at всё равно недоступен
@@ -2210,7 +2239,7 @@ describe('права субъекта ПДн (152-ФЗ)', () => {
     await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'marina@x.ru' } })
     await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Пётр', contact: 'petr@x.ru' } })
     await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'marina@x.ru', kind: 'delete' } })
-    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new' }, headers: { cookie } })
+    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new', verify_method: 'call' }, headers: { cookie } })
     expect((await app.db.prepare('SELECT verified_at FROM pd_requests WHERE id = 1').get()).verified_at).toBeTruthy()
 
     // подмена контакта и обезличивание ОДНИМ запросом
@@ -2241,12 +2270,12 @@ describe('права субъекта ПДн (152-ФЗ)', () => {
     await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'marina@x.ru' } })
     await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Пётр', contact: 'petr@x.ru' } })
     await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'marina@x.ru', kind: 'delete' } })
-    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new' }, headers: { cookie } }) // верифицирован на Марине
+    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new', verify_method: 'call' }, headers: { cookie } }) // верифицирован на Марине
 
     const relinkAndVerify = await app.inject({
       method: 'PATCH',
       url: '/api/crm/pd-requests/1',
-      payload: { contact_id: 2, status: 'new' },
+      payload: { contact_id: 2, status: 'new', verify_method: 'call' },
       headers: { cookie },
     })
     expect(relinkAndVerify.statusCode).toBe(200)
@@ -2280,7 +2309,7 @@ describe('права субъекта ПДн (152-ФЗ)', () => {
 
     await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'marina@x.ru' } })
     await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'marina@x.ru', kind: 'delete' } })
-    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new' }, headers: { cookie: memberCookie } })
+    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new', verify_method: 'call' }, headers: { cookie: memberCookie } })
 
     const res = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { anonymize: true }, headers: { cookie: memberCookie } })
     expect(res.statusCode).toBe(403)
@@ -2291,7 +2320,7 @@ describe('права субъекта ПДн (152-ФЗ)', () => {
   it('после подтверждения личности: статус done + обезличивание одним действием', async () => {
     await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'marina@x.ru' } })
     await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'marina@x.ru', kind: 'delete' } })
-    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new' }, headers: { cookie } })
+    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new', verify_method: 'call' }, headers: { cookie } })
     const res = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'done', anonymize: true }, headers: { cookie } })
     expect(res.statusCode).toBe(200)
     expect(JSON.parse(res.body).anonymized.name).toBe('Удалённый контакт #1')
@@ -2303,7 +2332,7 @@ describe('права субъекта ПДн (152-ФЗ)', () => {
   it('на запрос «узнать, какие данные есть» обезличивание не срабатывает даже после подтверждения', async () => {
     await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'marina@x.ru' } })
     await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: 'marina@x.ru', kind: 'access' } })
-    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new' }, headers: { cookie } })
+    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new', verify_method: 'call' }, headers: { cookie } })
     const res = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { anonymize: true }, headers: { cookie } })
     expect(res.statusCode).toBe(400)
     expect(JSON.parse(res.body).error).toBe('kind_not_erasable')
@@ -2331,6 +2360,88 @@ describe('права субъекта ПДн (152-ФЗ)', () => {
     const memberCookie = (await login('m@m.ru', 'password123')).headers['set-cookie']
     const asMember = await app.inject({ method: 'GET', url: '/api/crm/audit', headers: { cookie: memberCookie } })
     expect(asMember.statusCode).toBe(403)
+  })
+})
+
+describe('телефон — основной идентификатор; кто и как подтвердил личность (задание сайтов 2026-10-03, §4)', () => {
+  it('заявка с телефоном кладёт его в contacts.phone, а не в messenger; email — в email', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: '+79215551488' } })
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Ольга', contact: 'olga@example.ru' } })
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Ник', contact: '@nickname' } })
+    const rows = await app.db.prepare('SELECT name, phone, email, messenger FROM contacts ORDER BY id').all()
+    expect(rows[0]).toMatchObject({ name: 'Марина', phone: '+79215551488', messenger: '' })
+    expect(rows[1]).toMatchObject({ name: 'Ольга', email: 'olga@example.ru', phone: '' })
+    expect(rows[2]).toMatchObject({ name: 'Ник', messenger: '@nickname', phone: '' })
+  })
+
+  it('повторная заявка с тем же номером в другом формате не заводит вторую карточку', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: '+79215551488' } })
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: '8 (921) 555-14-88' } })
+    expect((await app.db.prepare('SELECT COUNT(*) c FROM contacts').get()).c).toBe(1)
+  })
+
+  it('email с 10 цифрами подряд не склеивается с чужим телефоном', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Телефон', contact: '+7 123 456-78-90' } })
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Почта', contact: 'buyer1234567890@example.ru' } })
+    expect((await app.db.prepare('SELECT COUNT(*) c FROM contacts').get()).c).toBe(2)
+  })
+
+  it('запрос по ПДн с номером в другом формате находит карточку (старый номер «8 921…»)', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Старый клиент', phone: '8 921 555-14-88' }, headers: { cookie } })
+    const res = await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: '+79215551488', kind: 'delete' } })
+    expect(res.statusCode).toBe(204)
+    expect((await app.db.prepare('SELECT contact_id FROM pd_requests WHERE id = 1').get()).contact_id).toBe(1)
+  })
+
+  it('подтверждение личности без способа отклоняется; со способом — записывает кто и как', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: '+79215551488' } })
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: '+79215551488', kind: 'delete' } })
+
+    for (const bad of [undefined, '', 'manual', 'toString', 'telepathy']) {
+      const res = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new', verify_method: bad }, headers: { cookie } })
+      expect(res.statusCode, String(bad)).toBe(400)
+      expect(JSON.parse(res.body).error).toBe('verify_method_required')
+    }
+    expect(await app.db.prepare('SELECT status, verified_at FROM pd_requests WHERE id = 1').get()).toMatchObject({ status: 'pending_unverified', verified_at: null })
+
+    const ok = await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new', verify_method: 'call' }, headers: { cookie } })
+    expect(ok.statusCode).toBe(200)
+    const row = await app.db.prepare('SELECT status, verified_at, verified_by, verified_method FROM pd_requests WHERE id = 1').get()
+    expect(row).toMatchObject({ status: 'new', verified_by: 1, verified_method: 'call' })
+    expect(row.verified_at).toBeTruthy()
+
+    const list = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/pd-requests', headers: { cookie } })).body)
+    expect(list.items[0].verified_by_name).toBeTruthy()
+    expect(list.verifyMethods.call).toBe('звонок')
+    const audit = await app.db.prepare("SELECT detail FROM audit_log WHERE entity = 'pd_requests' ORDER BY id DESC LIMIT 1").get()
+    expect(audit.detail).toContain('звонок')
+  })
+
+  it('смена привязки контакта сбрасывает и verified_by, и verified_method', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: '+79215551488' } })
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Ольга', contact: '+79217770000' } })
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: '+79215551488', kind: 'delete' } })
+    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new', verify_method: 'message' }, headers: { cookie } })
+    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { contact_id: 2 }, headers: { cookie } })
+    expect(await app.db.prepare('SELECT status, verified_at, verified_by, verified_method FROM pd_requests WHERE id = 1').get())
+      .toMatchObject({ status: 'pending_unverified', verified_at: null, verified_by: null, verified_method: '' })
+  })
+
+  it('ручной запрос сотрудника сразу подтверждён способом manual и автором', async () => {
+    await app.inject({ method: 'POST', url: '/api/crm/contacts', payload: { name: 'Клиент' }, headers: { cookie } })
+    await app.inject({ method: 'POST', url: '/api/crm/pd-requests', payload: { contact_id: 1, kind: 'access' }, headers: { cookie } })
+    expect(await app.db.prepare('SELECT verified_by, verified_method FROM pd_requests WHERE id = 1').get())
+      .toMatchObject({ verified_by: 1, verified_method: 'manual' })
+  })
+
+  it('кто и как подтвердил — переживает экспорт → импорт', async () => {
+    await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: '+79215551488' } })
+    await app.inject({ method: 'POST', url: '/api/pd-requests', payload: { contact: '+79215551488', kind: 'access' } })
+    await app.inject({ method: 'PATCH', url: '/api/crm/pd-requests/1', payload: { status: 'new', verify_method: 'email' }, headers: { cookie } })
+    const dump = JSON.parse((await app.inject({ method: 'GET', url: '/api/crm/export', headers: { cookie } })).body)
+    expect((await app.inject({ method: 'POST', url: '/api/crm/import', payload: dump, headers: { cookie } })).statusCode).toBe(200)
+    expect(await app.db.prepare('SELECT verified_by, verified_method FROM pd_requests WHERE id = 1').get())
+      .toMatchObject({ verified_by: 1, verified_method: 'email' })
   })
 })
 

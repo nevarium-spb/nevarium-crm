@@ -10,6 +10,9 @@ export default function Privacy({ user }) {
   const isAdmin = user.role === 'admin'
   const [data, setData] = useState(null)
   const [kinds, setKinds] = useState({})
+  const [verifyMethods, setVerifyMethods] = useState({})
+  // Выбранный в строке способ подтверждения личности — по id запроса, до нажатия кнопки.
+  const [verifyDraft, setVerifyDraft] = useState({})
   const [today, setToday] = useState('')
   const [contacts, setContacts] = useState([])
   const [modal, setModal] = useState(null)
@@ -21,6 +24,7 @@ export default function Privacy({ user }) {
       .then((r) => {
         setData(r.items)
         setKinds(r.kinds)
+        setVerifyMethods(r.verifyMethods ?? {})
         setToday(r.today)
       })
       .catch(apiErrorToast)
@@ -68,16 +72,26 @@ export default function Privacy({ user }) {
   // УЖЕ СОХРАНЁННОМУ в карточке контакта в CRM, а не по тому, что указано в форме
   // (иначе подтверждение получит тот, кто прислал запрос, будь он вообще посторонним).
   const verify = async (row) => {
-    if (!window.confirm('Подтвердите: вы связались с человеком по контакту ИЗ КАРТОЧКИ в CRM (не по тому, что указан в форме) и убедились, что запрос от него?')) return
+    const method = verifyDraft[row.id]
+    if (!method) return toast('Выберите, как подтвердили личность', 'error')
+    if (!window.confirm(`Подтвердите: вы связались с человеком по контакту ИЗ КАРТОЧКИ в CRM (не по тому, что указан в форме) — способ: «${verifyMethods[method]}» — и убедились, что запрос от него?`)) return
     try {
-      await api(`/crm/pd-requests/${row.id}`, { method: 'PATCH', body: { status: 'new' } })
+      await api(`/crm/pd-requests/${row.id}`, { method: 'PATCH', body: { status: 'new', verify_method: method } })
       toast('Личность подтверждена, запрос можно исполнять')
       load()
     } catch (err) {
       if (err.data?.error === 'bad_reference') toast('Контакт перенесён в другой проект — переприкрепите запрос', 'error')
       else if (err.data?.error === 'no_contact') toast('Сначала укажите, кто из контактов это', 'error')
+      else if (err.data?.error === 'verify_method_required') toast('Выберите, как подтвердили личность', 'error')
       else apiErrorToast(err)
     }
+  }
+
+  // «подтверждено: звонок · Александр · 2 часа назад» — кто и как, для журнала и проверки.
+  const verifiedLine = (row) => {
+    if (!row.verified_at) return null
+    const how = row.verified_method === 'manual' ? 'заведён вручную' : verifyMethods[row.verified_method] || 'способ не записан'
+    return `подтверждено: ${how}${row.verified_by_name ? ` · ${row.verified_by_name}` : ''} · ${relTime(row.verified_at)}`
   }
 
   const reject = async (row) => {
@@ -140,6 +154,7 @@ export default function Privacy({ user }) {
                   {` · принят ${relTime(row.created_at)}`}
                 </div>
                 {row.note ? <div className="row-meta" style={{ whiteSpace: 'pre-wrap' }}>{row.note}</div> : null}
+                {verifiedLine(row) ? <div className="row-meta">{verifiedLine(row)}</div> : null}
                 {!row.contact_id && (
                   <select
                     style={{ marginTop: 6, maxWidth: 260 }}
@@ -159,9 +174,22 @@ export default function Privacy({ user }) {
                 </span>
                 {row.status === 'pending_unverified' ? (
                   row.contact_id ? (
-                    <button className="btn" style={{ minHeight: 32, fontSize: 12 }} onClick={() => verify(row)}>
-                      Подтвердить личность
-                    </button>
+                    <>
+                      <select
+                        style={{ minHeight: 32, fontSize: 12, maxWidth: 200 }}
+                        value={verifyDraft[row.id] ?? ''}
+                        onChange={(e) => setVerifyDraft((d) => ({ ...d, [row.id]: e.target.value }))}
+                        aria-label="Как подтвердили личность"
+                      >
+                        <option value="">как подтвердили…</option>
+                        {Object.entries(verifyMethods).map(([k, label]) => (
+                          <option key={k} value={k}>{label} (по контакту из карточки)</option>
+                        ))}
+                      </select>
+                      <button className="btn" style={{ minHeight: 32, fontSize: 12 }} disabled={!verifyDraft[row.id]} onClick={() => verify(row)}>
+                        Подтвердить личность
+                      </button>
+                    </>
                   ) : (
                     <span className="row-meta">сначала сопоставьте контакт</span>
                   )
@@ -194,6 +222,7 @@ export default function Privacy({ user }) {
                 <div className="row-meta">
                   {row.requester || '—'} · {row.status === 'done' ? 'исполнен' : 'отказ'} {row.resolved_at ? relTime(row.resolved_at) : ''}
                   {row.anonymized_at ? ' · контакт обезличен' : ''}
+                  {verifiedLine(row) ? ` · ${verifiedLine(row)}` : ''}
                 </div>
               </div>
             </div>

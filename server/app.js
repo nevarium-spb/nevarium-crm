@@ -1298,7 +1298,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     }
     // У таблиц вне ENTITIES нет конфига CRUD — перечисляем их колонки явно.
     const PLAIN_COLS = {
-      pd_requests: ['contact_id', 'kind', 'status', 'requester', 'note', 'source', 'project_id', 'due_date', 'resolved_at', 'resolved_by', 'verified_at', 'created_at', 'updated_at'],
+      pd_requests: ['contact_id', 'kind', 'status', 'requester', 'note', 'source', 'project_id', 'due_date', 'resolved_at', 'resolved_by', 'verified_at', 'verified_by', 'verified_method', 'created_at', 'updated_at'],
       audit_log: ['user_id', 'user_email', 'action', 'entity', 'entity_id', 'detail', 'created_at'],
       consents: ['contact_id', 'deal_id', 'project_id', 'requester', 'version', 'text', 'text_truncated', 'accepted_at', 'created_at'],
       nvizor_free_reports: ['record_id', 'object_ref', 'client_name', 'phone_key', 'devices', 'locations', 'photo_hashes', 'used_at', 'created_at'],
@@ -1510,8 +1510,12 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     const rows = await db.prepare('SELECT name, company, phone, email, messenger, source FROM contacts WHERE archived = 0 AND demo = 0 ORDER BY name').all()
     const esc = (v) => {
       let s = String(v ?? '')
-      // защита от формул: имена приходят с публичной формы, Excel исполняет =/+/-/@
-      if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`
+      // защита от формул: имена приходят с публичной формы, Excel исполняет =/+/-/@.
+      // Исключение — значение, которое целиком телефон («+7 (921) 555-14-88»): с
+      // ведущим «+» и одними цифрами/скобками/дефисами формулой оно не станет, а
+      // апостроф испортил бы номер (задание сайтов 2026-10-03, §4).
+      const isPhone = /^\+\d[\d\s()-]*$/.test(s)
+      if (!isPhone && /^[=+\-@\t\r]/.test(s)) s = `'${s}`
       return /[";\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
     }
     const csv = ['Имя;Компания;Телефон;Email;Мессенджер;Источник', ...rows.map((r) => [r.name, r.company, r.phone, r.email, r.messenger, r.source].map(esc).join(';'))].join('\r\n')
@@ -1648,6 +1652,10 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // разговора. PATCH .../anonymize блокирует исполнение, пока статус не переведён
   // дальше pending_unverified — это и есть шаг «человек проверил» (ADR-015).
   const PD_STATUSES = ['pending_unverified', 'new', 'done', 'rejected']
+  // Как подтверждена личность по запросу с сайта — всегда по контакту ИЗ КАРТОЧКИ:
+  // звонок или сообщение на номер, ответ с адреса почты. 'manual' — только для
+  // запроса, заведённого сотрудником вручную (разговор уже состоялся).
+  const PD_VERIFY_METHODS = { call: 'звонок', message: 'сообщение на номер', email: 'ответ с почты' }
 
   // parentTx — опционально: вызывающий код может уже быть внутри своей транзакции
   // (PATCH /api/crm/pd-requests ниже — status/contact_id/anonymize мутируются одним
@@ -1733,13 +1741,14 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     const where = PD_STATUSES.includes(status) ? 'WHERE r.status = ?' : ''
     const args = where ? [status] : []
     const items = await db
-      .prepare(`SELECT r.*, c.name contact_name, c.anonymized_at, p.display_name project_name
+      .prepare(`SELECT r.*, c.name contact_name, c.anonymized_at, p.display_name project_name, u.name verified_by_name
         FROM pd_requests r
         LEFT JOIN contacts c ON c.id = r.contact_id
         LEFT JOIN projects p ON p.id = r.project_id
+        LEFT JOIN users u ON u.id = r.verified_by
         ${where} ORDER BY r.status IN ('new', 'pending_unverified') DESC, r.due_date, r.id DESC LIMIT 500`)
       .all(...args)
-    return { items, kinds: PD_REQUEST_KINDS, today: mskToday() }
+    return { items, kinds: PD_REQUEST_KINDS, verifyMethods: PD_VERIFY_METHODS, today: mskToday() }
   })
 
   app.post('/api/crm/pd-requests', async (req, reply) => {
@@ -1773,9 +1782,9 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       }
       // verified_at сразу — ручной ввод сотрудником уже подтверждён самим фактом
       // разговора/переписки, вторично верифицировать в интерфейсе нечего.
-      const info = await tx.prepare(`INSERT INTO pd_requests (contact_id, kind, requester, note, source, project_id, due_date, verified_at, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`)
-        .run(contactId, kind, requester, trim(b.note, 1000), 'manual', projectId, dueDate, ts, ts, ts)
+      const info = await tx.prepare(`INSERT INTO pd_requests (contact_id, kind, requester, note, source, project_id, due_date, verified_at, verified_by, verified_method, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`)
+        .run(contactId, kind, requester, trim(b.note, 1000), 'manual', projectId, dueDate, ts, req.user.id, 'manual', ts, ts)
       await audit(req, 'create', 'pd_requests', info.lastInsertRowid, kind, tx)
       return info.lastInsertRowid
     })
@@ -1885,6 +1894,9 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       if (!contactId) fail(400, { error: 'no_contact' })
       if (!['delete', 'stop'].includes(row.kind)) fail(400, { error: 'kind_not_erasable' })
     }
+    // Подтверждение личности обязано сказать, КАК его получили — иначе отметка
+    // «подтверждено» ничем не отличается от нажатой по ошибке кнопки.
+    if (verifying && !Object.hasOwn(PD_VERIFY_METHODS, String(b.verify_method))) fail(400, { error: 'verify_method_required' })
     // Проект контакта перепроверяется ЗАНОВО и ПОД БЛОКИРОВКОЙ — на каждом опасном
     // действии, а не только при смене привязки. Независимая проверка нашла дыру:
     // раньше границу проекта стерегла единственная проверка на пути relink, а контакт
@@ -1906,7 +1918,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         // про СТАРЫЙ контакт, а не про нового. Первичная привязка (row.contact_id
         // был NULL) не аннулирует ничего — верифицировать было ещё нечего.
         if (contactChanged && row.verified_at) {
-          await tx.prepare("UPDATE pd_requests SET verified_at = NULL, status = 'pending_unverified' WHERE id = ?").run(id)
+          await tx.prepare("UPDATE pd_requests SET verified_at = NULL, verified_by = NULL, verified_method = '', status = 'pending_unverified' WHERE id = ?").run(id)
         }
       }
       if (b.note !== undefined) await tx.prepare('UPDATE pd_requests SET note = ?, updated_at = ? WHERE id = ?').run(trim(b.note, 1000), ts, id)
@@ -1914,8 +1926,8 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         const unresolved = b.status === 'new' || b.status === 'pending_unverified'
         await tx.prepare('UPDATE pd_requests SET status = ?, resolved_at = ?, resolved_by = ?, updated_at = ? WHERE id = ?')
           .run(b.status, unresolved ? null : ts, unresolved ? null : req.user.id, ts, id)
-        if (verifying) await tx.prepare('UPDATE pd_requests SET verified_at = ? WHERE id = ?').run(ts, id)
-        await audit(req, 'update', 'pd_requests', id, `статус: ${b.status}`, tx)
+        if (verifying) await tx.prepare('UPDATE pd_requests SET verified_at = ?, verified_by = ?, verified_method = ? WHERE id = ?').run(ts, req.user.id, b.verify_method, id)
+        await audit(req, 'update', 'pd_requests', id, verifying ? `статус: ${b.status} · личность подтверждена: ${PD_VERIFY_METHODS[b.verify_method]}` : `статус: ${b.status}`, tx)
       }
       // anonymizeContact получает tx (parentTx) — обезличивание и остальные мутации
       // этого PATCH обязаны быть одной атомарной операцией (см. комментарий выше о
@@ -2073,7 +2085,9 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   async function findExistingContact(contactInfo, projectId, runner = db) {
     const raw = trim(contactInfo, 300).toLowerCase()
     if (!raw) return null
-    const key = phoneKey(raw)
+    // phoneKeyIfPlausible, не phoneKey: email с 10 цифрами подряд иначе совпал бы
+    // с чужим телефоном (та же дыра, что закрыта в orphanedConsentIds, раунд 26).
+    const key = phoneKeyIfPlausible(raw)
     const rows = await runner
       .prepare('SELECT id, name, email, phone, messenger, archived FROM contacts WHERE project_id = ? AND anonymized_at IS NULL ORDER BY id DESC')
       .all(projectId)
@@ -2216,11 +2230,16 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       const existing = await findExistingContact(contactInfo, projectId, tx)
       let inner
       if (!existing) {
+        // Телефон — основной идентификатор (сайты присылают +7XXXXXXXXXX / E.164,
+        // задание 2026-10-03, §4): кладём его в phone, а не в messenger. В messenger —
+        // только то, что не почта и не похоже на номер (ник, старые клиенты сайтов).
         const isEmail = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(contactInfo)
+        const isPhone = !isEmail && Boolean(phoneKeyIfPlausible(contactInfo))
         const email = isEmail ? contactInfo : ''
-        const messenger = isEmail ? '' : contactInfo
-        const cid = (await tx.prepare('INSERT INTO contacts (name, email, messenger, note, source, suspicious, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id')
-          .run(name, email, messenger, '', isChat ? 'site-chat' : 'site-form', suspicious ? 1 : 0, projectId, ts, ts)).lastInsertRowid
+        const phone = isPhone ? contactInfo : ''
+        const messenger = isEmail || isPhone ? '' : contactInfo
+        const cid = (await tx.prepare('INSERT INTO contacts (name, email, phone, messenger, note, source, suspicious, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id')
+          .run(name, email, phone, messenger, '', isChat ? 'site-chat' : 'site-form', suspicious ? 1 : 0, projectId, ts, ts)).lastInsertRowid
         const did = (await tx.prepare('INSERT INTO deals (contact_id, title, stage, note, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id')
           .run(cid, title, 'Новый', note, projectId, ts, ts)).lastInsertRowid
         if (transcript) {
@@ -2457,9 +2476,9 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       // во время восстановления дампа запрос привязывался бы к контакту №N, каким тот
       // был ДО restore, а после restore под этим номером уже другой человек — и его
       // бы и стёрли по подтверждённому запросу.
-      const found = await tx
-        .prepare('SELECT id FROM contacts WHERE anonymized_at IS NULL AND project_id = ? AND (lower(email) = lower(?) OR lower(messenger) = lower(?) OR phone = ?) ORDER BY id DESC LIMIT 1')
-        .get(projectId, requester, requester, requester)
+      // Тем же сравнением, что дедуп заявок (findExistingContact): телефон — по
+      // phoneKey, иначе «+79215551488» из формы не находил карточку с «8 921 555-14-88».
+      const found = await findExistingContact(requester, projectId, tx)
       const info = await tx.prepare(`INSERT INTO pd_requests (contact_id, kind, status, requester, note, source, project_id, due_date, created_at, updated_at)
         VALUES (?, ?, 'pending_unverified', ?, ?, ?, ?, ?, ?, ?) RETURNING id`)
         .run(found?.id ?? null, kind, requester, note, 'site-form', projectId, dueDate, ts, ts)
