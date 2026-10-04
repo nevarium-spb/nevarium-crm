@@ -21,7 +21,7 @@ export function mskToday(offsetDays = 0, nowMs = Date.now()) {
 }
 
 const trim = (v, max = 500) => String(v ?? '').trim().slice(0, max)
-// Тот же экранировщик, что в telegram.js (leadMessage/leadMessageFull) — уведомления
+// Тот же экранировщик, что в telegram.js (leadMessage) — уведомления
 // идут с format: 'html', и непроверенный текст в них ломает разметку. Нужен здесь
 // отдельно: kind в /api/pd-requests теперь сохраняется как прислано (см. ниже), и
 // именно НЕРАСПОЗНАННЫЙ (то есть непроверенный, публикой присланный) kind попадает

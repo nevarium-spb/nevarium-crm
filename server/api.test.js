@@ -1347,7 +1347,7 @@ describe('outbox: лид не теряется при падении Telegram и
     expect(text).not.toContain('http')
   })
 
-  it('условный заказ клиента: в MAX уходит с ФИО и контактом, в Telegram — обезличено', async () => {
+  it('условный заказ клиента: и в Telegram, и в MAX уходит обезличенно (ADR-018)', async () => {
     await app.inject({
       method: 'POST',
       url: '/api/leads',
@@ -1366,11 +1366,10 @@ describe('outbox: лид не теряется при падении Telegram и
     worker.stop()
     await worker.tick()
 
+    expect(tgText).toContain('Новая заявка')
     expect(tgText).not.toMatch(/Марина|555-14-88|внедрение чат-бота|нужен запуск/)
-    expect(maxText).toContain('Марина Соколова')
-    expect(maxText).toContain('555-14-88')
-    expect(maxText).toContain('внедрение чат-бота')
-    expect(maxText).toContain('нужен запуск до конца месяца')
+    expect(maxText).not.toMatch(/Марина|555-14-88|внедрение чат-бота|нужен запуск/)
+    expect(maxText).toBe(tgText)
   })
 })
 
@@ -3383,7 +3382,7 @@ describe('восстановление из дампа: блокеры, найд
     // outbox намеренно обезличен: в нём только contactId, а имя и телефон достаются
     // из БД В МОМЕНТ ОТПРАВКИ (ADR-009). После восстановления контакты заменены
     // целиком, и пережившая импорт строка разрешила бы свой contactId в другого
-    // человека — его ПДн ушли бы в MAX под видом свежей заявки.
+    // человека (до ADR-018 — его ПДн ушли бы в MAX; теперь — ссылка на чужую карточку).
     await app.inject({ method: 'POST', url: '/api/leads', payload: { name: 'Марина', contact: 'm@x.ru' } })
     expect((await app.db.prepare('SELECT COUNT(*) c FROM outbox').get()).c).toBeGreaterThan(0)
 

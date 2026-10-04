@@ -42,10 +42,11 @@ export async function sendMax(text, env = process.env) {
 }
 
 /**
- * Уведомление в Telegram — БЕЗ персональных данных.
+ * Уведомление о заявке — БЕЗ персональных данных, одно и то же для Telegram и MAX.
  * Telegram — зарубежный сервис, а имя и телефон клиента по 152-ФЗ должны
- * оставаться в российском контуре. Поэтому здесь только проект, источник и
- * ссылка на карточку: сами данные открываются в CRM после входа.
+ * оставаться в российском контуре. MAX российский, но по решению владельца
+ * (ADR-018) и туда уходит то же обезличенное сообщение. Поэтому здесь только
+ * проект, источник и ссылка на карточку: сами данные открываются в CRM после входа.
  * Менять формат — только не возвращая сюда поля клиента.
  */
 export function leadMessage(lead, env = process.env) {
@@ -65,7 +66,7 @@ export function leadMessage(lead, env = process.env) {
  * Заголовок уведомления. Повторное обращение и возврат ушедшего клиента — разные
  * поводы: первое значит «не заводите вторую карточку, всё уже в одной», второе —
  * «человек вернулся сам, напоминания сняты». Персональных данных в заголовке нет,
- * поэтому он одинаков для Telegram и MAX.
+ * как и во всём сообщении.
  */
 function leadHeader(lead) {
   if (lead.returned) return '🟢 <b>Клиент вернулся сам</b>'
@@ -73,41 +74,13 @@ function leadHeader(lead) {
   return '🔵 <b>Новая заявка</b>'
 }
 
-/**
- * Уведомление в MAX — С персональными данными (имя, контакт, суть задачи).
- * В отличие от Telegram, MAX — российский сервис, трансграничной передачи ПДн
- * тут нет, поэтому можно не обезличивать. Контакт и последнюю сделку тянем из
- * БД по contactId в момент отправки — сам outbox.payload остаётся обезличенным
- * (см. enqueue в app.js), ПДн не дублируются в очередь на диске.
- */
-export async function leadMessageFull(lead, db, env = process.env) {
-  const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-  const contact = lead.contactId ? await db.prepare('SELECT name, phone, email, messenger FROM contacts WHERE id = ?').get(lead.contactId) : null
-  const deal = lead.contactId ? await db.prepare('SELECT title, note FROM deals WHERE contact_id = ? ORDER BY id DESC LIMIT 1').get(lead.contactId) : null
-  const base = String(env.CRM_BASE_URL || '').trim().replace(/\/+$/, '')
-  const link = base && lead.contactId ? `${base}/crm/contacts/${lead.contactId}` : null
-  const contactLine = contact ? [contact.phone, contact.email, contact.messenger].filter(Boolean).join(' · ') : ''
-  const lines = [
-    `${leadHeader(lead)}${lead.suspicious ? ' ⚠️ подозрительная' : ''}`,
-    lead.projectName ? `Проект: <b>${esc(lead.projectName)}</b>` : null,
-    lead.source ? `Источник: ${esc(lead.source)}` : null,
-    contact?.name ? `Клиент: <b>${esc(contact.name)}</b>` : null,
-    contactLine ? `Контакт: ${esc(contactLine)}` : null,
-    deal?.title ? `Задача: ${esc(deal.title)}` : null,
-    deal?.note ? `Заметка: ${esc(deal.note)}` : null,
-    link ? `Открыть: ${esc(link)}` : null,
-  ]
-  return lines.filter(Boolean).join('\n')
-}
-
 // Каждый канал — свои sent_at/attempts/last_error (миграция v7): падение MAX не
 // должно ни блокировать Telegram, ни повторно слать туда, куда уже доставлено.
-// leadText разный: Telegram — обезличенный leadMessage, MAX — полный leadMessageFull.
-// leadText — async у обоих ради единообразия вызова ниже (await channel.leadText(...)):
-// у tg он не трогает БД и просто резолвится немедленно, у max — реально читает БД.
+// Текст заявки у обоих одинаковый и обезличенный — leadMessage (ADR-018; до него MAX
+// получал имя и телефон через leadMessageFull, читавший БД в момент отправки).
 const CHANNELS = [
   { name: 'tg', sentCol: 'tg_sent_at', attemptsCol: 'tg_attempts', errorCol: 'tg_last_error', leadText: async (payload) => leadMessage(payload) },
-  { name: 'max', sentCol: 'max_sent_at', attemptsCol: 'max_attempts', errorCol: 'max_last_error', leadText: async (payload, db) => leadMessageFull(payload, db) },
+  { name: 'max', sentCol: 'max_sent_at', attemptsCol: 'max_attempts', errorCol: 'max_last_error', leadText: async (payload) => leadMessage(payload) },
 ]
 
 export function startOutboxWorker(db, { intervalMs = 30_000, senders = { tg: sendTelegram, max: sendMax }, log = console, autoStart = true } = {}) {
@@ -133,7 +106,9 @@ export function startOutboxWorker(db, { intervalMs = 30_000, senders = { tg: sen
           try {
             // Текст собирается В ТРАНЗАКЦИИ ПОД БАРЬЕРОМ и с перепроверкой строки
             // (найдено red team). Очередь намеренно обезличена: в ней только
-            // contactId, а имя и телефон достаются из БД ИМЕННО ЗДЕСЬ (ADR-009).
+            // contactId. До ADR-018 имя и телефон для MAX доставались из БД ИМЕННО
+            // ЗДЕСЬ; теперь ПДн не читаются вовсе, но перепроверка по-прежнему не даёт
+            // отправить ссылку на карточку, которую восстановление уже подменило.
             // Партия из 10 строк с таймаутом отправки 10 c растягивается на минуты,
             // и восстановление дампа успевало закоммититься посреди неё: строку
             // очереди импорт уже удалил, контакты заменены целиком — и следующая
