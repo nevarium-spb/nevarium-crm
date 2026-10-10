@@ -38,7 +38,7 @@ Edit/Write по путям основного чекаута («file is in the b
 
 ```bash
 cd G:\nevarium-crm
-npm test             # ожидается 251 зелёный + 7 намеренно it.skip, всего 258 (сверено 2026-10-04)
+npm test             # ожидается 287 зелёных + 7 намеренно it.skip, всего 294 (сверено 2026-10-10)
 npm run build        # ожидается успех, фронт не менялся
 ```
 Цифры разошлись — значит что-то менялось без этой записи; разбираться с этого.
@@ -58,6 +58,31 @@ npm run build        # ожидается успех, фронт не менял
 коде: тест, который не видели красным, ничего не доказывает.
 
 **Правило проекта: не коммитить и не пушить без явной команды владельца.**
+
+---
+
+## 🆕 Тарифы клиентов — в `main`, НЕ задеплоено (2026-10-10, ADR-019)
+
+Контракт — `G:\nevarium_vizor\docs\SUBSCRIPTIONS.md` (на 2026-10-10 незакоммичен, лежит в
+worktree сайта `recursing-jackson-47b52e`). Сделано по разделу 6 «CRM»: таблицы, правила
+(`evaluateCheck`, 13 кодов), API, блок «Тариф» в карточке, значки, напоминания. Подробно и
+список решений, которых в контракте нет, — ADR-019.
+
+- **NVizor:** `POST /api/nvizor/entitlements/evaluate`, `POST /api/nvizor/entitlements/usage`,
+  `POST /api/nvizor/client-link` — тот же `NVIZOR_APP_TOKEN`.
+- **Кабинет сайта:** `POST /api/client/summary` (публичный, CORS по `projects.origins`).
+- **CRM:** `GET /api/crm/contacts/:id/entitlements`, `GET /api/crm/entitlements/badges`,
+  `POST /api/crm/entitlements`, `PATCH /api/crm/entitlements/:id`, `POST …/:id/renew`,
+  `POST …/:id/cancel`, `POST /api/crm/contacts/:id/entitlements/convert`,
+  `POST /api/crm/contacts/:id/client-links`, `POST …/client-links/revoke-all`.
+- Новая переменная (необязательная): `CLIENT_CABINET_URL` — база личной ссылки, по
+  умолчанию `https://nevarium-vizor.ru`.
+- Тесты — `server/entitlements.test.js` (36). Экран проверен в браузере на локальной копии
+  (pg-mem): назначен «Ремонт под контролем», видно «осталось 5 из 5», значки в списке
+  контактов и на канбане.
+- **Ждёт:** деплоя CRM (пуш в `main` = автодеплой); подключения NVizor и кабинета сайта
+  (их сессии); сквозной проверки «назначили тариф → плашка в NVizor → отчёт со ссылкой →
+  кабинет»; согласования владельцем решений из ADR-019, которых нет в контракте.
 
 ---
 

@@ -5,6 +5,7 @@ import { EntityModal } from '../forms.jsx'
 import { STAGES, TERMINAL_STAGES as TERMINAL } from '../../shared/stages.js'
 import { ProjectBadge, ProjectFilter, useProjectFilter } from '../projects.jsx'
 import { Modal, apiErrorToast, fmtMoney, onRefresh, toast } from '../ui.jsx'
+import { TariffBadge, useTariffBadges } from '../tariffs.jsx'
 
 const LOST = 'Проиграно'
 
@@ -58,6 +59,7 @@ export default function Deals() {
   const [lostFor, setLostFor] = useState(null) // {deal, stage} — диалог причины отказа
   const dragId = useRef(null)
   const [project, setProject] = useProjectFilter()
+  const tariffs = useTariffBadges()
 
   // Считаем запросы: при быстром переключении проекта ответы могут прийти не по
   // порядку, и медленный старый затёр бы свежий — на доске оказался бы чужой проект.
@@ -172,6 +174,7 @@ export default function Deals() {
                     <span className="deal-amount">{fmtMoney(deal.amount)}</span>
                   </div>
                   <ProjectBadge id={deal.project_id} when={project === 'all'} />
+                  {tariffs[deal.contact_id] && <div style={{ marginTop: 6 }}><TariffBadge badge={tariffs[deal.contact_id]} /></div>}
                   <button
                     className="deal-move"
                     aria-label="Переместить или изменить"

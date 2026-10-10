@@ -4,12 +4,14 @@ import { repo } from '../api.js'
 import { EntityModal } from '../forms.jsx'
 import { ProjectBadge, ProjectFilter, useProjectFilter } from '../projects.jsx'
 import { SOURCE_LABEL, apiErrorToast, onRefresh, toast } from '../ui.jsx'
+import { TariffBadge, useTariffBadges } from '../tariffs.jsx'
 
 export default function Contacts() {
   const [data, setData] = useState(null)
   const [q, setQ] = useState('')
   const [modal, setModal] = useState(false)
   const [project, setProject] = useProjectFilter()
+  const tariffs = useTariffBadges()
 
   // Считаем запросы: при быстром переключении проекта ответы могут прийти не по
   // порядку, и медленный старый затёр бы свежий — на экране оказался бы чужой проект.
@@ -80,6 +82,7 @@ export default function Contacts() {
             </div>
             <span className="row-badges">
               <ProjectBadge id={c.project_id} when={project === 'all'} />
+              <TariffBadge badge={tariffs[c.id]} />
               {c.suspicious ? <span className="badge warn">подозрительный</span> : null}
               {c.archived ? <span className="badge gray">архив</span> : <span className="badge gray">{SOURCE_LABEL[c.source] || c.source}</span>}
               <button

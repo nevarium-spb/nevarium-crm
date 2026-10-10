@@ -2,7 +2,11 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { buildApp } from './app.js'
 import { bootstrapAdmin } from './bootstrap.js'
-import { startOutboxWorker } from './telegram.js'
+import { enqueue, startOutboxWorker } from './telegram.js'
+import { scheduleEntitlementReminders } from './entitlements.js'
+import { mskToday } from './app.js'
+import { now } from './db.js'
+import { withTransaction, maintenanceBarrier } from './db-adapter.js'
 
 const secret = process.env.JWT_SECRET
 if (!secret || secret.length < 16) {
@@ -27,6 +31,15 @@ const app = await buildApp({
 await bootstrapAdmin(app.db, { log: app.log })
 
 startOutboxWorker(app.db, { log: app.log })
+// Напоминания о конце срока тарифа (ADR-019): раз в час, каждое — один раз на срок.
+scheduleEntitlementReminders(app.db, {
+  log: app.log,
+  now,
+  mskToday: () => mskToday(),
+  enqueue,
+  baseUrl: process.env.CRM_BASE_URL,
+  withMutation: (fn) => withTransaction(app.db.pool, async (tx) => { await maintenanceBarrier(tx); return fn(tx) }),
+})
 
 const port = Number(process.env.PORT || 3001)
 app.listen({ port, host: '0.0.0.0' }).then(() => {

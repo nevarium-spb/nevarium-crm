@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, repo } from '../api.js'
 import { EntityModal } from '../forms.jsx'
 import { apiErrorToast, fmtMoney, onRefresh, relTime, toast } from '../ui.jsx'
+import { TariffBlock } from '../tariffs.jsx'
 
 export default function ContactCard({ user }) {
   const { id } = useParams()
@@ -137,6 +138,8 @@ export default function ContactCard({ user }) {
           <p style={{ color: 'var(--text-2)', fontSize: 14 }}>{contact.note || '—'}</p>
           <div className="crm-cap">Источник: {contact.source} · создан {relTime(contact.created_at)}</div>
         </section>
+
+        {!contact.anonymized_at && <TariffBlock contactId={contact.id} />}
 
         <section className="tile span2" aria-label="История">
           <div className="tile-title">

@@ -7,6 +7,7 @@ import { withTransaction, resyncIdentitySequence, lockTablesForRestore, maintena
 import { hashPassword, verifyPassword, fakeVerifyDelay, verifyOrFake, signToken, verifyToken, reserveVerify, loginSucceeded, sleep, admitLoginRequest, releaseLoginRequest, SESSION_TTL_DAYS, MIN_PASSWORD_LENGTH, MIN_ADMIN_PASSWORD_LENGTH } from './auth.js'
 import { enqueue } from './telegram.js'
 import { registerNvizorRoutes, registerNvizorAdminRoutes, deleteNvizorFreeReportsForPhone } from './nvizor.js'
+import { registerEntitlementRoutes, deleteEntitlementsForContact } from './entitlements.js'
 
 const COOKIE = 'nv_session'
 const MSK = 'Europe/Moscow'
@@ -43,10 +44,13 @@ const APP_ORIGIN = trim(process.env.APP_ORIGIN, 300) || null
 // эти эндпоинты отвечают 503. Задаётся в настройках деплоя, как APP_ORIGIN.
 const NVIZOR_APP_TOKEN = trim(process.env.NVIZOR_APP_TOKEN, 200) || null
 
+// База личной ссылки клиента в кабинет на сайте Визора (ADR-019): ссылка — «<база>/#/c/<ключ>».
+const CLIENT_CABINET_URL = (trim(process.env.CLIENT_CABINET_URL, 300) || 'https://nevarium-vizor.ru').replace(/\/+$/, '')
+
 // dbConfig (было dbFile — SQLite-путь; перевод на Postgres, план в nevarium-lab#3):
 // строка подключения (DATABASE_URL, прод) ИЛИ уже готовый Pool-совместимый объект
 // (тесты — pg-mem). Без аргумента openDb() сама берёт process.env.DATABASE_URL.
-export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true, logger = false, staticDir = null, trustProxy = TRUST_PROXY, appOrigin = APP_ORIGIN, nvizorToken = NVIZOR_APP_TOKEN } = {}) {
+export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true, logger = false, staticDir = null, trustProxy = TRUST_PROXY, appOrigin = APP_ORIGIN, nvizorToken = NVIZOR_APP_TOKEN, cabinetBaseUrl = CLIENT_CABINET_URL } = {}) {
   const db = await openDb(dbConfig)
   // trustProxy — число доверенных прокси-хопов, НЕ `true`. С `true` Fastify берёт
   // самый левый X-Forwarded-For как req.ip, а его подставляет клиент — тогда всё,
@@ -158,7 +162,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // теряется, если идемпотентность включена, см. ниже).
   const HARD_LIMIT_WINDOW_MS = 10 * 60_000
   const HARD_LIMIT_MAX = 30
-  const hardHits = { leads: new Map(), pd_requests: new Map() }
+  const hardHits = { leads: new Map(), pd_requests: new Map(), client_summary: new Map() }
   // Массив на IP держим ОГРАНИЧЕННЫМ: раз решили «уже сверх лимита», новые метки
   // времени больше не добавляем — независимая проверка нашла, что без этого сам
   // счётчик становится усилителем атаки: при затяжном флуде массив растёт на каждый
@@ -610,6 +614,27 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
 
   registerNvizorAdminRoutes(app, { db, withMutation, audit })
 
+  // Тарифы клиентов (ADR-019, контракт nevarium_vizor/docs/SUBSCRIPTIONS.md): /api/nvizor/
+  // entitlements/* под ключом приложения (хук nvizor.js), /api/crm/* под входом в CRM,
+  // /api/client/summary — публичный, с тем же CORS и лимитом по IP, что приём заявок.
+  registerEntitlementRoutes(app, {
+    db, withMutation, audit, now, mskToday, cabinetBaseUrl,
+    projectId: async () => (await resolveProjectId('nevarium-vizor')) || DEFAULT_PROJECT_ID,
+    hardRateLimited,
+    applyCors: (req, reply) => applyLeadCors(req, reply),
+    corsPreflight: async (req, reply) => {
+      if (!(await leadOriginAllowed(req.headers.origin))) return reply.header('vary', 'Origin').code(403).send()
+      return reply
+        .header('vary', 'Origin')
+        .header('access-control-allow-origin', req.headers.origin)
+        .header('access-control-allow-methods', 'POST, OPTIONS')
+        .header('access-control-allow-headers', 'content-type')
+        .header('access-control-max-age', '86400')
+        .code(204)
+        .send()
+    },
+  })
+
   // ---------- auth ----------
   // bodyLimit занижен до 4 КБ: логин принимает только email+пароль, а стандартный
   // потолок Fastify ~1 МБ — публичный неаутентифицированный роут, где параллельные
@@ -1060,6 +1085,8 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
           const c = await tx.prepare('SELECT phone, email, messenger, project_id FROM contacts WHERE id = ?').get(id)
           await tx.prepare('DELETE FROM tasks WHERE contact_id = ?').run(id)
           await tx.prepare('DELETE FROM interactions WHERE contact_id = ?').run(id)
+          // Тарифы, выданные проверки и личные ссылки уходят вместе с контактом (ADR-019).
+          await deleteEntitlementsForContact(tx, id, c ? [c.phone, c.messenger] : [])
           // Слепки согласия (независимая проверка, раунд 22): в отличие от анонимизации
           // (anonymizeContact сохраняет обезличенный след), обычное удаление контакта —
           // это «эту карточку не стоило заводить» (спам, ошибка), а не исполнение права
@@ -1302,6 +1329,11 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       audit_log: ['user_id', 'user_email', 'action', 'entity', 'entity_id', 'detail', 'created_at'],
       consents: ['contact_id', 'deal_id', 'project_id', 'requester', 'version', 'text', 'text_truncated', 'accepted_at', 'created_at'],
       nvizor_free_reports: ['record_id', 'object_ref', 'client_name', 'phone_key', 'devices', 'locations', 'photo_hashes', 'used_at', 'created_at'],
+      entitlements: ['contact_id', 'project_id', 'plan', 'starts_on', 'expires_on', 'period_days', 'checks_per_period', 'objects', 'stages', 'urgent', 'weekend',
+        'parent_report', 'paid_amount', 'credited_from', 'status', 'note', 'reminded_for', 'created_at', 'updated_at'],
+      entitlement_checks: ['entitlement_id', 'contact_id', 'phone_key', 'record_id', 'object_ref', 'stage_code', 'kind', 'photos', 'videos', 'report_number',
+        'parent_report_number', 'urgent', 'weekend', 'issued_at', 'created_at'],
+      client_links: ['contact_id', 'token_hash', 'created_at', 'revoked_at', 'last_used_at'],
     }
     const allowedCols = (n) =>
       PLAIN_COLS[n]
@@ -1379,9 +1411,20 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         // и существующие записи Free не стираются. Связей с контактами у неё нет, так что
         // рвать после восстановления нечего.
         const hasFreeReports = Array.isArray(data.nvizor_free_reports)
+        // Тарифы клиентов (v6, ADR-019) — в отличие от Free, ПРИВЯЗАНЫ к контактам внешним
+        // ключом. Дамп без них (снят до их появления) восстанавливает базу на момент, когда
+        // тарифов не было: оставить нынешние значило бы привязать чужие оплаты к другим
+        // людям под теми же id, да и DELETE FROM contacts упал бы на внешнем ключе.
+        // Поэтому чистим их явно перед циклом — дети раньше родителей.
+        const ENTITLEMENT_TABLES = ['entitlements', 'entitlement_checks', 'client_links']
+        const hasEntitlements = ENTITLEMENT_TABLES.every((n) => Array.isArray(data[n]))
         const tables = (hasCompliance ? DUMP_TABLES : ENTITY_NAMES)
           .filter((n) => n !== 'consents' || hasConsents)
           .filter((n) => n !== 'nvizor_free_reports' || hasFreeReports)
+          .filter((n) => !ENTITLEMENT_TABLES.includes(n) || hasEntitlements)
+        if (!tables.includes('entitlements')) {
+          for (const n of [...ENTITLEMENT_TABLES].reverse()) await tx.prepare(`DELETE FROM ${n}`).run()
+        }
         // удаляем детей раньше родителей (FK), вставляем в прямом порядке
         for (const n of [...tables].reverse()) {
           await tx.prepare(`DELETE FROM ${n}`).run()
@@ -1710,6 +1753,9 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       // 5c. Записи тарифа Free приложения NVizor с тем же телефоном — признаки того же
       //     человека (server/nvizor.js); значения телефона читаны ДО шага 1.
       await deleteNvizorFreeReportsForPhone(tx, contact.phone)
+      // 5d. Тарифы, выданные проверки и личные ссылки в кабинет — тоже (ADR-019): после
+      //     обезличивания по ним не должно остаться ни зацепки, ни работающей ссылки.
+      await deleteEntitlementsForContact(tx, contactId, [contact.phone, contact.messenger])
       // 5b. Осиротевшие legacy-восстановлением строки (contact_id обнулён импортом
       //     дампа без consents — ADR-015, раунд 17/18 — requester НАМЕРЕННО уцелел
       //     как единственная зацепка). Независимая проверка (раунд 21) поймала: такая

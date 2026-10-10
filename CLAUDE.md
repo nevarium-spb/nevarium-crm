@@ -16,9 +16,9 @@
   «заменено», план в `nevarium-lab#3`), фронт: React + react-router + Vite (`src/crm/`).
 - `node server/dev.js` — бэкенд :3001 (требует `DATABASE_URL` в окружении — SQLite-файла по
   умолчанию больше нет). `npm run dev` — фронт :5173 (прокси `/api`→:3001).
-- `npm test` — 258 тестов на `pg-mem` (`server/api.test.js`, `server/nvizor.test.js`,
-  `src/crm/neva/parser.test.js`): 251 зелёный + 7 намеренно пропущенных (все в
-  `api.test.js`; сверено 2026-10-04). Пропущенные проверяют то,
+- `npm test` — 294 теста на `pg-mem` (`server/api.test.js`, `server/nvizor.test.js`,
+  `server/entitlements.test.js`, `src/crm/neva/parser.test.js`): 287 зелёных + 7 намеренно
+  пропущенных (все в `api.test.js`; сверено 2026-10-10). Пропущенные проверяют то,
   чего `pg-mem` не эмулирует: реальный откат транзакции, принадлежность запроса
   соединению (его connect() отдаёт сам пул), SQLSTATE у ошибок и ожидание блокировок.
 - **`TEST_DATABASE_URL` — прогон того же набора на настоящем Postgres**, где эти семь
@@ -166,6 +166,15 @@
   `anonymized_at`). Таблицы вне дампа (`winback_sequences`) при импорте очищаются:
   их внешний ключ иначе блокирует `DELETE FROM deals`. Пользователей импорт намеренно
   не восстанавливает — чтобы чужой дамп не заменил админа и не запер вход.
+- **Тарифы клиентов** (`server/entitlements.js`, ADR-019; контракт —
+  `nevarium_vizor/docs/SUBSCRIPTIONS.md`): `entitlements`/`entitlement_checks`/`client_links`.
+  Правила считает ТОЛЬКО `evaluateCheck` (чистая функция, по тесту на каждый код) — ничего не
+  блокирует, только предупреждения. Клиент — по телефону (`nvizorPhoneKey`) в проекте
+  `nevarium-vizor`. Таблицы в дампе v6 и в `deleteEntitlementsForContact` (удаление И
+  обезличивание контакта); дамп без них их очищает (FK на contacts). Ключ личной ссылки CRM
+  не хранит — только SHA-256; `/api/client/summary` — один и тот же 404 на неверный и
+  отозванный ключ, без телефона/почты/id в ответе. Коды тарифов и этапов (`PLANS`/`STAGES`)
+  общие с сайтом и NVizor — меняются только вместе с контрактом. Free — отдельно, не трогать.
 - `src/main.jsx` — standalone-точка входа: монтирует `CrmApp`, корень `/` → `/crm`.
   `CrmApp` не изменялся при извлечении.
 - `server/index.js` — прод-вход: собирает `staticDir` (папка `dist/` рядом с `server/`) и
