@@ -1333,7 +1333,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         'parent_report', 'paid_amount', 'credited_from', 'status', 'note', 'reminded_for', 'created_at', 'updated_at'],
       entitlement_checks: ['entitlement_id', 'contact_id', 'phone_key', 'record_id', 'object_ref', 'stage_code', 'kind', 'photos', 'videos', 'report_number',
         'parent_report_number', 'urgent', 'weekend', 'issued_at', 'created_at'],
-      client_links: ['contact_id', 'token_hash', 'created_at', 'revoked_at', 'last_used_at'],
+      client_links: ['contact_id', 'token_hash', 'created_at', 'revoked_at', 'last_used_at', 'expires_on'],
     }
     const allowedCols = (n) =>
       PLAIN_COLS[n]

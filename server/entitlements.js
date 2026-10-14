@@ -335,9 +335,14 @@ export function computeOffer(entitlements, today, objectType = '') {
   const stages = live.filter((e) => e.plan === 'stage')
   if (!stages.length) return null
   if (live.some((e) => (PACKAGE_PLANS.includes(e.plan) || PERIOD_PLANS.includes(e.plan)) && isActiveOn(e, today))) return null
+  return packageOffer(objectType, stages.reduce((s, e) => s + (e.paidAmount ?? PLANS.stage.price), 0))
+}
+
+/** Пакет по типу объекта (дом ИЖС → «Дом под контролем», иначе «Ремонт») с зачётом уже оплаченного. */
+export function packageOffer(objectType = '', paid = 0) {
   const plan = /ИЖС|частный дом/i.test(objectType) ? 'house' : 'repair'
   const price = PLANS[plan].price
-  const credit = Math.min(price, stages.reduce((s, e) => s + (e.paidAmount ?? PLANS.stage.price), 0))
+  const credit = Math.min(price, paid)
   return { plan, title: PLANS[plan].title, price, credit, toPay: price - credit }
 }
 
@@ -369,6 +374,26 @@ async function objectTypeOf(runner, contactId) {
 
 export const hashToken = (token) => crypto.createHash('sha256').update(String(token)).digest('hex')
 export const newToken = () => crypto.randomBytes(32).toString('base64url')
+
+// Кабинет клиента Free живёт 7 календарных дней от выдачи ссылки (решение владельца
+// 2026-10-13): последний день включительно = сегодня + 6, по тому же правилу, что
+// «30 дней = оплата + 29». null — без срока (у клиента есть действующий тариф).
+export const FREE_LINK_DAYS = 7
+export async function linkExpiryFor(runner, contactIds, today) {
+  const { entitlements } = await loadClientState(runner, contactIds)
+  return entitlements.some((e) => isActiveOn(e, today)) ? null : addDays(today, FREE_LINK_DAYS - 1)
+}
+
+/**
+ * Переход на платный тариф в пределах срока Free: у живых ссылок контакта снимаем
+ * срок — QR в уже выданном PDF продолжает работать. Истёкшие (expires_on < сегодня,
+ * ещё не удалённые ночной уборкой) не продлеваем: та ссылка уже погашена.
+ */
+export async function liftLinkExpiry(tx, contactId, today) {
+  const res = await tx.prepare('UPDATE client_links SET expires_on = NULL WHERE contact_id = ? AND revoked_at IS NULL AND expires_on IS NOT NULL AND expires_on >= ?')
+    .run(contactId, today)
+  return res?.changes ?? 0
+}
 
 /** Удаление вместе с контактом (152-ФЗ): вызывается внутри транзакции удаления/обезличивания. */
 export async function deleteEntitlementsForContact(tx, contactId, phones = []) {
@@ -456,9 +481,11 @@ export function registerEntitlementRoutes(app, deps) {
     if (!nvizorPhoneKey(phone)) return reply.code(400).send({ error: 'bad_phone' })
     const token = newToken()
     const created = await withMutation(async (tx) => {
-      const { primary } = await resolveClient(tx, phone)
+      const { contacts, primary } = await resolveClient(tx, phone)
       if (!primary) return false
-      await tx.prepare('INSERT INTO client_links (contact_id, token_hash, created_at) VALUES (?, ?, ?)').run(primary.id, hashToken(token), now())
+      // Нет действующего тарифа на сегодня — это отчёт Free: кабинет на 7 дней.
+      const expiresOn = await linkExpiryFor(tx, contacts.map((c) => c.id), mskToday())
+      await tx.prepare('INSERT INTO client_links (contact_id, token_hash, created_at, expires_on) VALUES (?, ?, ?, ?)').run(primary.id, hashToken(token), now(), expiresOn)
       return true
     })
     // Ссылку привязать не к кому — клиента с таким телефоном в CRM нет. Не заводим
@@ -478,17 +505,25 @@ export function registerEntitlementRoutes(app, deps) {
     // существовал ли ключ (не оракул).
     const notFound = () => reply.code(404).send({ error: 'not_found' })
     if (!token || token.length > 200) return notFound()
-    const link = await db.prepare(`SELECT l.id, l.contact_id, c.name FROM client_links l JOIN contacts c ON c.id = l.contact_id
-      WHERE l.token_hash = ? AND l.revoked_at IS NULL AND c.anonymized_at IS NULL`).get(hashToken(token))
+    const today = mskToday()
+    // Истёкшая ссылка Free — тот же 404, что неверная и отозванная (не оракул), даже
+    // если ночная уборка её ещё не удалила.
+    const link = await db.prepare(`SELECT l.id, l.contact_id, l.expires_on, c.name FROM client_links l JOIN contacts c ON c.id = l.contact_id
+      WHERE l.token_hash = ? AND l.revoked_at IS NULL AND (l.expires_on IS NULL OR l.expires_on >= ?) AND c.anonymized_at IS NULL`).get(hashToken(token), today)
     if (!link) return notFound()
     await db.prepare('UPDATE client_links SET last_used_at = ? WHERE id = ?').run(now(), link.id)
-    const today = mskToday()
     const { entitlements, checks } = await loadClientState(db, [link.contact_id])
     const shown = entitlements.filter((e) => e.status === 'active')
+    const objectType = await objectTypeOf(db, link.contact_id)
+    let offer = computeOffer(entitlements, today, objectType)
+    // Клиент Free (ссылка со сроком, ни одного действующего тарифа): предлагаем пакет
+    // по типу объекта целиком — засчитывать нечего (дополнение к контракту, 2026-10-13).
+    if (!offer && link.expires_on && !entitlements.some((e) => isActiveOn(e, today))) offer = packageOffer(objectType, 0)
     return {
       client: { name: link.name },
       entitlements: shown.map((e) => describeEntitlement(e, checks, today)),
-      offer: computeOffer(entitlements, today, await objectTypeOf(db, link.contact_id)),
+      offer,
+      link: { expiresOn: link.expires_on || null },
     }
   })
 
@@ -499,7 +534,10 @@ export function registerEntitlementRoutes(app, deps) {
   async function contactState(runner, contactId) {
     const today = mskToday()
     const { entitlements, checks } = await loadClientState(runner, [contactId])
-    const links = await runner.prepare('SELECT COUNT(*) c, MAX(created_at) last FROM client_links WHERE contact_id = ? AND revoked_at IS NULL').get(contactId)
+    // Живые ссылки: не отозваны и не истекли (истёкшую Free ночная уборка ещё могла не удалить).
+    const live = await runner.prepare('SELECT created_at, expires_on, last_used_at FROM client_links WHERE contact_id = ? AND revoked_at IS NULL AND (expires_on IS NULL OR expires_on >= ?) ORDER BY id DESC')
+      .all(contactId, today)
+    const links = { c: live.length, last: live[0]?.created_at || null }
     return {
       today,
       entitlements: entitlements.map((e) => ({
@@ -509,7 +547,11 @@ export function registerEntitlementRoutes(app, deps) {
         warnings: e.status === 'active' ? statusWarnings(e, checks, today) : [],
       })),
       checks: checks.slice().reverse(),
-      links: { active: Number(links?.c || 0), lastCreatedAt: links?.last || null },
+      links: {
+        active: links.c,
+        lastCreatedAt: links.last,
+        items: live.map((l) => ({ createdAt: l.created_at, expiresOn: l.expires_on || null, lastUsedAt: l.last_used_at || null })),
+      },
       offer: computeOffer(entitlements, today, await objectTypeOf(runner, contactId)),
       plans: PLANS,
       stages: STAGES,
@@ -517,6 +559,12 @@ export function registerEntitlementRoutes(app, deps) {
   }
 
   const summaryOf = (e) => `${e.plan} ${e.starts_on}…${e.expires_on || '∞'} ${e.status}${e.paid_amount != null ? ` ${e.paid_amount}₽` : ''}`
+
+  // Клиент Free перешёл на платный тариф: живые ссылки кабинета становятся бессрочными.
+  async function liftExpiryAudited(req, tx, contactId) {
+    const n = await liftLinkExpiry(tx, contactId, mskToday())
+    if (n) await audit(req, 'update', 'client_links', contactId, `срок ссылок в кабинет снят (платный тариф): ${n} со сроком → без срока`, tx)
+  }
 
   app.get('/api/crm/contacts/:id/entitlements', async (req, reply) => {
     const id = Number(req.params.id)
@@ -595,6 +643,7 @@ export function registerEntitlementRoutes(app, deps) {
           row.urgent, row.weekend, row.parent_report, row.paid_amount, row.note, row.ts, row.ts)
       const created = await tx.prepare('SELECT * FROM entitlements WHERE id = ?').get(info.lastInsertRowid)
       await audit(req, 'create', 'entitlements', info.lastInsertRowid, `назначен: — → ${summaryOf(created)}`, tx)
+      await liftExpiryAudited(req, tx, contactId)
       return info.lastInsertRowid
     })
     if (!id) return reply.code(400).send({ error: 'bad_reference' })
@@ -678,6 +727,7 @@ export function registerEntitlementRoutes(app, deps) {
       await tx.prepare(`UPDATE entitlements SET status = 'credited', updated_at = ? WHERE id IN (${marks})`).run(ts, ...stages.map((e) => e.id))
       await audit(req, 'create', 'entitlements', info.lastInsertRowid,
         `переведён в пакет: stage #${stages.map((e) => e.id).join(', #')} → ${plan}, засчитано ${credit}₽, доплата ${PLANS[plan].price - credit}₽`, tx)
+      await liftExpiryAudited(req, tx, contactId)
       result = [200, { ok: true, id: info.lastInsertRowid, credit, toPay: PLANS[plan].price - credit }]
     })
     return reply.code(result[0]).send(result[1])
@@ -691,8 +741,11 @@ export function registerEntitlementRoutes(app, deps) {
     const ok = await withMutation(async (tx) => {
       const c = await tx.prepare('SELECT id FROM contacts WHERE id = ? AND anonymized_at IS NULL').get(contactId)
       if (!c) return false
-      const info = await tx.prepare('INSERT INTO client_links (contact_id, token_hash, created_at) VALUES (?, ?, ?) RETURNING id').run(contactId, hashToken(token), now())
-      await audit(req, 'create', 'client_links', info.lastInsertRowid, `ссылка в кабинет выпущена: — → контакт #${contactId}`, tx)
+      // То же правило, что у выдачи из приложения: без действующего тарифа — кабинет Free на 7 дней.
+      const expiresOn = await linkExpiryFor(tx, [contactId], mskToday())
+      const info = await tx.prepare('INSERT INTO client_links (contact_id, token_hash, created_at, expires_on) VALUES (?, ?, ?, ?) RETURNING id')
+        .run(contactId, hashToken(token), now(), expiresOn)
+      await audit(req, 'create', 'client_links', info.lastInsertRowid, `ссылка в кабинет выпущена: — → контакт #${contactId}, ${expiresOn ? `до ${expiresOn}` : 'без срока'}`, tx)
       return true
     })
     if (!ok) return reply.code(404).send({ error: 'not_found' })
@@ -750,10 +803,35 @@ export async function runEntitlementReminders(db, { withMutation, enqueue, now, 
   return created
 }
 
+/**
+ * Ночная уборка кабинетов Free: удаляет ссылки с expires_on < сегодня. Удаляется только
+ * доступ в кабинет — контакт, заявки и учёт Free живут по общим правилам ПДн. Журнал —
+ * без ключа (его CRM и не знает), только id ссылки и контакта.
+ */
+export async function purgeExpiredClientLinks(db, { withMutation, now, today }) {
+  return withMutation(async (tx) => {
+    const rows = await tx.prepare('SELECT id, contact_id, expires_on FROM client_links WHERE expires_on IS NOT NULL AND expires_on < ? FOR UPDATE').all(today)
+    if (!rows.length) return 0
+    const ts = now()
+    for (const r of rows) {
+      await tx.prepare('DELETE FROM client_links WHERE id = ?').run(r.id)
+      await tx.prepare('INSERT INTO audit_log (user_id, user_email, action, entity, entity_id, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(null, 'system', 'delete', 'client_links', r.id, `ссылка в кабинет Free удалена по сроку (до ${r.expires_on}), контакт #${r.contact_id}`, ts)
+    }
+    return rows.length
+  })
+}
+
 export function scheduleEntitlementReminders(db, opts) {
   const log = opts.log || console
+  let purgedOn = null
   const tick = async () => {
-    try { await runEntitlementReminders(db, { ...opts, today: opts.mskToday() }) } catch (err) { log.error?.(`entitlement reminders: ${err}`) }
+    const today = opts.mskToday()
+    try { await runEntitlementReminders(db, { ...opts, today }) } catch (err) { log.error?.(`entitlement reminders: ${err}`) }
+    // Раз в сутки: первый тик новой даты (МСК).
+    if (purgedOn !== today) {
+      try { await purgeExpiredClientLinks(db, { ...opts, today }); purgedOn = today } catch (err) { log.error?.(`client links purge: ${err}`) }
+    }
   }
   const timer = setInterval(tick, opts.intervalMs ?? 60 * 60_000)
   timer.unref?.()

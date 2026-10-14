@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { buildApp, mskToday } from './app.js'
 import { hashPassword, resetThrottle } from './auth.js'
 import { now } from './db.js'
-import { evaluateCheck, computeOffer, runEntitlementReminders, addYearInclusive, workdaysAfter } from './entitlements.js'
+import { evaluateCheck, computeOffer, runEntitlementReminders, purgeExpiredClientLinks, addDays, addYearInclusive, workdaysAfter } from './entitlements.js'
 import { withTransaction, maintenanceBarrier } from './db-adapter.js'
 
 const TOKEN = 'test-nvizor-token-0123456789abcdef0123456789'
@@ -327,6 +327,101 @@ describe('CRM: блок «Тариф»', () => {
     const log = await app.db.prepare("SELECT detail FROM audit_log WHERE entity = 'client_links'").all()
     expect(log).toHaveLength(1)
     expect(log[0].detail).not.toContain(key)
+  })
+})
+
+describe('кабинет Free — 7 дней (дополнение 2026-10-13)', () => {
+  const summary = (token) => app.inject({ method: 'POST', url: '/api/client/summary', payload: { token } })
+  const issue = async () => (await nv('/api/nvizor/client-link', { phone: PHONE })).json().url.split('/#/c/')[1]
+  const links = () => app.db.prepare('SELECT id, expires_on FROM client_links ORDER BY id').all()
+  const mutation = (fn) => withTransaction(app.db.pool, async (tx) => { await maintenanceBarrier(tx); return fn(tx) })
+  const today = () => mskToday()
+
+  it('срок при выдаче: с действующим тарифом — без срока', async () => {
+    const id = await vizorClient()
+    await crm('POST', '/api/crm/entitlements', { contact_id: id, plan: 'stage', starts_on: today() })
+    await issue()
+    expect((await links())[0].expires_on).toBeNull()
+  })
+
+  it('без тарифа ссылка получает срок «сегодня + 6», а summary отдаёт link.expiresOn и offer Free', async () => {
+    await vizorClient('Иван', 'Частный дом (ИЖС)')
+    const token = await issue()
+    expect((await links())[0].expires_on).toBe(addDays(today(), 6))
+    const body = (await summary(token)).json()
+    expect(body.link).toEqual({ expiresOn: addDays(today(), 6) })
+    expect(body.entitlements).toEqual([])
+    expect(body.offer).toEqual({ plan: 'house', title: 'Дом под контролем', price: 29900, credit: 0, toPay: 29900 })
+  })
+
+  it('платный клиент: link.expiresOn = null, offer Free не появляется', async () => {
+    const id = await vizorClient()
+    await crm('POST', '/api/crm/entitlements', { contact_id: id, plan: 'repair' })
+    const body = (await summary(await issue())).json()
+    expect(body.link).toEqual({ expiresOn: null })
+    expect(body.offer).toBeNull()
+  })
+
+  it('после срока — тот же 404, что у неверного ключа; последний день ещё открывается', async () => {
+    await vizorClient()
+    const token = await issue()
+    await app.db.prepare('UPDATE client_links SET expires_on = ?').run(addDays(today(), -1))
+    const expired = await summary(token)
+    const wrong = await summary('y'.repeat(43))
+    expect(expired.statusCode).toBe(404)
+    expect(expired.body).toBe(wrong.body)
+    await app.db.prepare('UPDATE client_links SET expires_on = ?').run(today())
+    expect((await summary(token)).statusCode).toBe(200)
+  })
+
+  it('ночная уборка удаляет только истёкшие ссылки и пишет в журнал без ключа', async () => {
+    const id = await vizorClient()
+    const keys = [await issue(), await issue(), await issue()]
+    const [a, b, c] = await links()
+    await app.db.prepare('UPDATE client_links SET expires_on = ? WHERE id = ?').run(addDays(today(), -1), a.id)
+    await app.db.prepare('UPDATE client_links SET expires_on = NULL WHERE id = ?').run(c.id)
+    expect(await purgeExpiredClientLinks(app.db, { withMutation: mutation, now, today: today() })).toBe(1)
+    expect((await links()).map((l) => l.id)).toEqual([b.id, c.id])
+    const log = await app.db.prepare("SELECT detail FROM audit_log WHERE entity = 'client_links' AND action = 'delete'").all()
+    expect(log).toHaveLength(1)
+    expect(log[0].detail).toContain('удалена по сроку')
+    expect(log[0].detail).toContain(`#${id}`)
+    expect(keys.some((k) => log[0].detail.includes(k))).toBe(false)
+    // удаляется только доступ в кабинет — контакт на месте
+    expect(Number((await app.db.prepare('SELECT COUNT(*) c FROM contacts').get()).c)).toBe(1)
+  })
+
+  it('«Назначить» снимает срок с живых ссылок, истёкшую не трогает; всё в журнал', async () => {
+    const id = await vizorClient()
+    await issue(); await issue()
+    const [old, live] = await links()
+    await app.db.prepare('UPDATE client_links SET expires_on = ? WHERE id = ?').run(addDays(today(), -1), old.id)
+    await crm('POST', '/api/crm/entitlements', { contact_id: id, plan: 'repair' })
+    const after = await links()
+    expect(after.find((l) => l.id === old.id).expires_on).toBe(addDays(today(), -1))
+    expect(after.find((l) => l.id === live.id).expires_on).toBeNull()
+    const log = await app.db.prepare("SELECT detail FROM audit_log WHERE entity = 'client_links' AND action = 'update'").all()
+    expect(log.map((l) => l.detail)).toEqual([expect.stringContaining('1 со сроком → без срока')])
+  })
+
+  it('«Перевести в пакет» тоже снимает срок', async () => {
+    const id = await vizorClient()
+    await crm('POST', '/api/crm/entitlements', { contact_id: id, plan: 'stage', starts_on: today() })
+    await issue()
+    // ссылка выдана как Free (оплату разовой внесли позже) — срок есть
+    await app.db.prepare('UPDATE client_links SET expires_on = ?').run(addDays(today(), 3))
+    await crm('POST', `/api/crm/contacts/${id}/entitlements/convert`, { plan: 'repair' })
+    expect((await links())[0].expires_on).toBeNull()
+  })
+
+  it('карточка клиента видит срок живой ссылки; экспорт → импорт его сохраняет', async () => {
+    const id = await vizorClient()
+    await issue()
+    const state = (await crm('GET', `/api/crm/contacts/${id}/entitlements`)).json()
+    expect(state.links.items).toEqual([expect.objectContaining({ expiresOn: addDays(today(), 6) })])
+    const dump = (await crm('GET', '/api/crm/export')).json()
+    expect((await crm('POST', '/api/crm/import', dump)).statusCode).toBe(200)
+    expect((await links())[0].expires_on).toBe(addDays(today(), 6))
   })
 })
 

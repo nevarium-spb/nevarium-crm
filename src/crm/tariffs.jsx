@@ -248,6 +248,12 @@ export function TariffBlock({ contactId }) {
       <div className="row-line">
         <div className="row-meta">
           Действующих: {state.links.active}{state.links.lastCreatedAt ? ` · последняя выпущена ${relTime(state.links.lastCreatedAt)}` : ''}
+          {(state.links.items || []).map((l, i) => (
+            <div key={i}>
+              выпущена {relTime(l.createdAt)} · {l.expiresOn ? `кабинет Free до ${ru(l.expiresOn)}` : 'без срока'}
+              {l.lastUsedAt ? ` · открывали ${relTime(l.lastUsedAt)}` : ' · ещё не открывали'}
+            </div>
+          ))}
         </div>
         <span style={{ display: 'flex', gap: 6 }}>
           <button className="btn" style={{ minHeight: 30, fontSize: 12 }} onClick={issueLink}>Выпустить</button>
