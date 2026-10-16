@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api.js'
 import { PASSWORD_REASONS } from '../AccountPages.jsx'
-import { apiErrorToast, relTime, toast } from '../ui.jsx'
+import { WRONG_ADDRESS, apiErrorToast, relTime, toast } from '../ui.jsx'
 
 const PLAN_TITLES = {
   stage: 'Проверка этапа',
@@ -76,7 +76,7 @@ function ProfileTile({ me, onChanged }) {
       setEmail({ newEmail: '', currentPassword: '' })
     } catch (err) {
       const code = err.data?.error
-      const text = code === 'wrong_password' ? 'Текущий пароль неверный.'
+      const text = code === 'forbidden' ? WRONG_ADDRESS : code === 'wrong_password' ? 'Текущий пароль неверный.'
         : code === 'mail_unavailable' ? 'Почта сервера не настроена — сменить email с подтверждением сейчас нельзя.'
         : code === 'mail_failed' ? 'Не удалось отправить письмо на новый адрес. Проверьте адрес и попробуйте позже.'
         : code === 'email_taken' ? 'Такой email уже используется.'
@@ -96,7 +96,7 @@ function ProfileTile({ me, onChanged }) {
       toast('Пароль изменён, остальные сессии завершены')
     } catch (err) {
       const code = err.data?.error
-      const text = code === 'wrong_password' ? 'Текущий пароль неверный.'
+      const text = code === 'forbidden' ? WRONG_ADDRESS : code === 'wrong_password' ? 'Текущий пароль неверный.'
         : code === 'weak_password' ? (PASSWORD_REASONS[err.data.reason] || 'Пароль не подходит.')
         : code === 'mismatch' ? 'Новые пароли не совпадают.'
         : err.kind === 'throttled' ? 'Слишком много попыток. Подождите немного.' : 'Не удалось сменить пароль.'

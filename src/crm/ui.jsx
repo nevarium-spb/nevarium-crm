@@ -16,9 +16,14 @@ export function toast(text, kind = 'info') {
   }, 4000)
 }
 
+export const WRONG_ADDRESS = 'Изменения принимаются только на основном адресе CRM — откройте crm-nevarium.ru (не служебный адрес Timeweb).'
+
 export function apiErrorToast(err) {
   if (err?.kind === 'network') toast('Нет связи с сервером', 'error')
   else if (err?.kind === 'conflict') toast('Запись изменена в другом окне — обновите', 'error')
+  // 403 forbidden — защита от подделки запросов: CRM принимает изменения только с основного адреса
+  // (APP_ORIGIN), а войти можно и со служебного адреса хостинга — тогда любое сохранение отклоняется.
+  else if (err?.data?.error === 'forbidden') toast(WRONG_ADDRESS, 'error')
   else if (err?.kind !== 'unauthorized') toast('Ошибка сервера', 'error')
 }
 
