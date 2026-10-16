@@ -12,9 +12,18 @@ import Privacy from './pages/Privacy.jsx'
 import NvizorFree from './pages/NvizorFree.jsx'
 import Settings from './pages/Settings.jsx'
 import { Toasts } from './ui.jsx'
+import { ConfirmEmailPage, ResetPasswordPage } from './AccountPages.jsx'
 import './crm.css'
 
+// Публичные страницы по ссылкам из писем (ADR-020) открываются БЕЗ входа — до проверки сессии.
 export default function CrmApp() {
+  const path = window.location.pathname.replace(/\/+$/, '')
+  if (path === '/crm/reset') return <ResetPasswordPage />
+  if (path === '/crm/confirm-email') return <ConfirmEmailPage />
+  return <CrmMain />
+}
+
+function CrmMain() {
   const [me, setMe] = useState(undefined) // undefined = проверяем, null = не вошли
 
   useEffect(() => {

@@ -15,37 +15,19 @@
 
 import crypto from 'node:crypto'
 import { nvizorPhoneKey } from './nvizor.js'
+import { PLANS, PACKAGE_PLANS, PERIOD_PLANS, STAGES, LIMITS } from './shared/plans.js'
+import { DEFAULTS, REMINDER_PLANS, loadSettings } from './settings.js'
 
 // ---------- справочники контракта (раздел 2) ----------
 
-export const PLANS = {
-  stage: { title: 'Проверка этапа', price: 4990 },
-  repair: { title: 'Ремонт под контролем', price: 19900 },
-  house: { title: 'Дом под контролем', price: 29900 },
-  monthly: { title: 'Объект помесячно', price: 14900 },
-  company: { title: 'Компания', price: 11900 },
-  recheck: { title: 'Повторная проверка', price: 1990 },
-}
-export const PACKAGE_PLANS = ['repair', 'house']
-export const PERIOD_PLANS = ['monthly', 'company']
-
-export const STAGES = {
-  repair: [
-    ['electrical', 'электрика'], ['plumbing', 'сантехника'], ['waterproofing', 'гидроизоляция'],
-    ['screed', 'стяжка'], ['plaster', 'штукатурка'],
-  ],
-  house: [
-    ['base', 'основание'], ['foundation_rebar', 'армирование фундамента'],
-    ['foundation', 'фундамент после распалубки'], ['walls', 'стены'], ['floors', 'перекрытия'],
-    ['roof', 'кровля'], ['windows', 'окна и утепление'], ['engineering', 'инженерные системы'],
-  ],
-}
+// Цены, коды тарифов и этапов, лимиты — ОДИН источник с сайтом: server/shared/plans.js
+// (копия src/shared/plans.js Визора; руками не править — `npm run shared:sync` в репозитории сайта).
+export { PLANS, PACKAGE_PLANS, PERIOD_PLANS, STAGES, LIMITS }
 const STAGE_TITLE = Object.fromEntries([...STAGES.repair, ...STAGES.house])
 const stageTitle = (code) => STAGE_TITLE[code] || code
-
-export const LIMITS = { photos: 30, recheckPhotos: 10, videos: 2, recheckWorkdays: 3, expiringSoonDays: 3, checksPerPeriod: 4, periodDays: 30 }
-// За сколько дней до конца срока CRM ставит задачу «продлить / связаться» (раздел 4).
-export const REMINDER_DAYS = { monthly: 7, company: 7, stage: 30, repair: 30, house: 30 }
+// За сколько дней до конца срока CRM ставит задачу «продлить / связаться» — УМОЛЧАНИЯ;
+// рабочие значения берутся из настроек (server/settings.js, ADR-020).
+export const REMINDER_DAYS = Object.fromEntries(REMINDER_PLANS.map((p) => [p, DEFAULTS[`reminder_days.${p}`]]))
 
 // ---------- даты: всё в МСК, строки YYYY-MM-DD ----------
 
@@ -378,10 +360,12 @@ export const newToken = () => crypto.randomBytes(32).toString('base64url')
 // Кабинет клиента Free живёт 7 календарных дней от выдачи ссылки (решение владельца
 // 2026-10-13): последний день включительно = сегодня + 6, по тому же правилу, что
 // «30 дней = оплата + 29». null — без срока (у клиента есть действующий тариф).
-export const FREE_LINK_DAYS = 7
+export const FREE_LINK_DAYS = DEFAULTS.free_link_days // умолчание; рабочее — в настройках
 export async function linkExpiryFor(runner, contactIds, today) {
   const { entitlements } = await loadClientState(runner, contactIds)
-  return entitlements.some((e) => isActiveOn(e, today)) ? null : addDays(today, FREE_LINK_DAYS - 1)
+  if (entitlements.some((e) => isActiveOn(e, today))) return null
+  const days = (await loadSettings(runner))['free_link_days']
+  return addDays(today, days - 1)
 }
 
 /**
@@ -432,6 +416,23 @@ function checkInput(b) {
  */
 export function registerEntitlementRoutes(app, deps) {
   const { db, withMutation, audit, now, mskToday, projectId, cabinetBaseUrl, hardRateLimited, applyCors, corsPreflight } = deps
+
+  // Действия с тарифами клиентов — ТОЛЬКО admin (решение владельца 2026-10-15, ADR-020; раньше —
+  // любой вошедший). Чтение (карточка, значки) остаётся у всех. Сверяем канонический шаблон роута,
+  // а не req.url (урок пентеста 2026-09-10: кодированный путь не должен обходить проверку).
+  const ADMIN_ONLY = new Set([
+    'POST /api/crm/entitlements',
+    'PATCH /api/crm/entitlements/:id',
+    'POST /api/crm/entitlements/:id/renew',
+    'POST /api/crm/entitlements/:id/cancel',
+    'POST /api/crm/contacts/:id/entitlements/convert',
+    'POST /api/crm/contacts/:id/client-links',
+    'POST /api/crm/contacts/:id/client-links/revoke-all',
+  ])
+  app.addHook('preHandler', async (req, reply) => {
+    if (!ADMIN_ONLY.has(`${req.method} ${req.routeOptions?.url}`)) return
+    if (req.user?.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
+  })
 
   async function resolveClient(runner, phone) {
     const pid = await projectId()
@@ -524,6 +525,17 @@ export function registerEntitlementRoutes(app, deps) {
       entitlements: shown.map((e) => describeEntitlement(e, checks, today)),
       offer,
       link: { expiresOn: link.expires_on || null },
+      // История выданных проверок (до 50, новые сверху): без фото, их числа, объекта и внутренних id.
+      checks: checks
+        .slice()
+        .sort((a, b) => String(b.issuedAt).localeCompare(String(a.issuedAt)) || b.id - a.id)
+        .slice(0, 50)
+        .map((c) => ({
+          issuedOn: mskDateOf(c.issuedAt),
+          stageTitle: c.stageCode ? stageTitle(c.stageCode) : '',
+          kind: c.kind,
+          reportNumber: c.reportNumber,
+        })),
     }
   })
 
@@ -774,11 +786,12 @@ export function registerEntitlementRoutes(app, deps) {
  */
 export async function runEntitlementReminders(db, { withMutation, enqueue, now, today, baseUrl = '' }) {
   const rows = await db.prepare("SELECT * FROM entitlements WHERE status = 'active' AND expires_on IS NOT NULL").all()
+  const settings = await loadSettings(db)
   let created = 0
   for (const r of rows) {
     if (r.reminded_for && r.reminded_for === r.expires_on) continue
     const ent = rowToEntitlement(r)
-    const days = REMINDER_DAYS[ent.plan]
+    const days = settings[`reminder_days.${ent.plan}`]
     const left = daysBetween(today, ent.expiresOn)
     if (days === undefined || left < 0 || left > days) continue
     const title = PLANS[ent.plan].title

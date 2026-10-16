@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { api } from './api.js'
+import { ForgotPasswordForm } from './AccountPages.jsx'
 import './crm.css'
 
 export default function Login({ onLogin }) {
@@ -8,6 +9,9 @@ export default function Login({ onLogin }) {
   const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [forgot, setForgot] = useState(false)
+
+  if (forgot) return <div className="crm-login"><ForgotPasswordForm onBack={() => setForgot(false)} /></div>
 
   const submit = async (e) => {
     e.preventDefault()
@@ -58,6 +62,7 @@ export default function Login({ onLogin }) {
         </label>
         {error && <p className="crm-login-error" role="alert">{error}</p>}
         <button type="submit" disabled={busy}>{busy ? 'Входим…' : 'Войти'}</button>
+        <button type="button" className="crm-login-link" onClick={() => setForgot(true)}>Забыли пароль?</button>
       </form>
     </div>
   )

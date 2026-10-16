@@ -12,7 +12,7 @@ export const SESSION_TTL_DAYS = 30
 // но короткий пароль всё равно перебирается за разумное время. Для участников
 // порог остаётся прежним — они не имеют доступа к экспорту и обезличиванию.
 export const MIN_PASSWORD_LENGTH = 8
-export const MIN_ADMIN_PASSWORD_LENGTH = 16
+export const MIN_ADMIN_PASSWORD_LENGTH = 12 // решение владельца 2026-10-15 (было 16); при смене пароля есть ещё и список частых (ADR-020)
 
 // Асинхронный bcrypt: pure-JS реализация с cost 12 при синхронном вызове
 // блокировала бы event loop на ~1 c на каждый логин.

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, repo } from '../api.js'
 import { Modal, apiErrorToast, toast } from '../ui.jsx'
+import AccountSettings from './AccountSettings.jsx'
 
 export default function Settings({ user }) {
   const isAdmin = user.role === 'admin'
@@ -82,6 +83,7 @@ export default function Settings({ user }) {
       <h1 className="crm-h1">Настройки</h1>
       <div className="crm-sub">Вы вошли как {user.name} ({user.role === 'admin' ? 'администратор' : 'участник'})</div>
       <div className="settings-grid">
+        <AccountSettings user={user} />
         <section className="tile" aria-label="Команда">
           <div className="tile-title"><span className="tile-num">01</span><h2>Команда</h2></div>
           {users.map((u) => (
@@ -115,7 +117,7 @@ export default function Settings({ user }) {
               <span className="crm-cap">Экспорт и импорт данных доступны администратору.</span>
             )}
           </div>
-          <div className="crm-cap">Ночной бэкап создаётся на сервере автоматически и отправляется копией в MAX. В Telegram он не уходит: в базе персональные данные клиентов, а Telegram зарубежный.</div>
+          <div className="crm-cap">Бэкап базы делает хостинг (Timeweb) каждый день; своего ночного бэкапа в CRM нет. «Экспорт JSON» — ручная копия и путь восстановления.</div>
           <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
             <button className="btn" onClick={demoSeed}>Добавить демо-данные</button>
             <button className="btn" onClick={demoClear}>Очистить демо</button>

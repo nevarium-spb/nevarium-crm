@@ -174,7 +174,9 @@ export const DEFAULT_PROJECT_ID = 1
  */
 export const DUMP_TABLES = ['contacts', 'deals', 'consents', 'tasks', 'interactions', 'pd_requests', 'audit_log', 'nvizor_free_reports',
   // Тарифы клиентов (v6, ADR-019): порядок важен — родители раньше детей (FK).
-  'entitlements', 'entitlement_checks', 'client_links']
+  'entitlements', 'entitlement_checks', 'client_links',
+  // Настройки CRM (v7, ADR-020).
+  'settings']
 
 /**
  * ДЕМО-СТРОКИ ТЕПЕРЬ ВХОДЯТ В ДАМП. Раньше они отсеивались (`WHERE demo = 0`), и в
@@ -201,7 +203,7 @@ const DEMO_FILTERED = new Set()
  * принимать все — старый бэкап должен восстанавливаться (см. app.js,
  * hasCompliance/hasConsents/hasFreeReports).
  */
-export const DUMP_VERSION = 6
+export const DUMP_VERSION = 7
 
 /**
  * Дамп — ОДИН согласованный снимок базы, не серия независимых чтений

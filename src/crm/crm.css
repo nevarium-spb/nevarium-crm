@@ -663,6 +663,12 @@
   font-size: 14px;
 }
 .crm-login-error { color: var(--warn); font-size: 13px; }
+/* «Забыли пароль?» / «Назад» — текстовая ссылка, а не главная кнопка карточки */
+.crm-login-card button.crm-login-link {
+  background: none; border: 0; box-shadow: none; min-height: 0; padding: 4px 0;
+  color: var(--text-3); font-size: 13px; text-decoration: underline; cursor: pointer;
+}
+.crm-login-card button.crm-login-link:hover { color: var(--text-2); }
 
 /* ---------- диагностика/настройки ---------- */
 .diag { display: grid; gap: 6px; font-size: 13.5px; color: var(--text-2); }

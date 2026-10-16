@@ -1916,24 +1916,24 @@ describe('bootstrapAdmin — первый админ без shell-доступа
     expect((await app.db.prepare('SELECT COUNT(*) c FROM users').get()).c).toBe(0)
   })
 
-  it('ровно 15 символов — отказ, ровно 16 — создаётся (граница MIN_ADMIN_PASSWORD_LENGTH)', async () => {
+  it('ровно 11 символов — отказ, ровно 12 — создаётся (граница MIN_ADMIN_PASSWORD_LENGTH)', async () => {
     await app.db.query('DELETE FROM users')
-    const pass15 = 'a'.repeat(15)
-    const pass16 = 'a'.repeat(16)
-    expect(pass15).toHaveLength(15)
-    expect(pass16).toHaveLength(16)
-    const rejected = await bootstrapAdmin(app.db, { log: silent, env: { BOOTSTRAP_ADMIN_EMAIL: 'x@x.ru', BOOTSTRAP_ADMIN_PASSWORD: pass15 } })
+    const pass11 = 'a'.repeat(11)
+    const pass12 = 'a'.repeat(12)
+    expect(pass11).toHaveLength(11)
+    expect(pass12).toHaveLength(12)
+    const rejected = await bootstrapAdmin(app.db, { log: silent, env: { BOOTSTRAP_ADMIN_EMAIL: 'x@x.ru', BOOTSTRAP_ADMIN_PASSWORD: pass11 } })
     expect(rejected).toBe(false)
-    const accepted = await bootstrapAdmin(app.db, { log: silent, env: { BOOTSTRAP_ADMIN_EMAIL: 'x@x.ru', BOOTSTRAP_ADMIN_PASSWORD: pass16 } })
+    const accepted = await bootstrapAdmin(app.db, { log: silent, env: { BOOTSTRAP_ADMIN_EMAIL: 'x@x.ru', BOOTSTRAP_ADMIN_PASSWORD: pass12 } })
     expect(accepted).toBe(true)
   })
 })
 
-describe('минимальная длина пароля по роли (MIN_ADMIN_PASSWORD_LENGTH = 16)', () => {
+describe('минимальная длина пароля по роли (MIN_ADMIN_PASSWORD_LENGTH = 12)', () => {
   // Порог у bootstrap — не единственная дверь для создания админа: /api/crm/users
   // с role=admin и смена пароля существующему админу обязаны требовать то же самое,
   // иначе минимум обходится через создание слабого админа в самом интерфейсе.
-  it('создание нового пользователя с role=admin требует 16 символов, participant — только 8', async () => {
+  it('создание нового пользователя с role=admin требует 12 символов, participant — только 8', async () => {
     const weakAdmin = await app.inject({ method: 'POST', url: '/api/crm/users', payload: { name: 'Х', email: 'weak-admin@x.ru', password: 'short123', role: 'admin' }, headers: { cookie } })
     expect(weakAdmin.statusCode).toBe(400)
     const okAdmin = await app.inject({ method: 'POST', url: '/api/crm/users', payload: { name: 'Х', email: 'ok-admin@x.ru', password: 'supersecret12345', role: 'admin' }, headers: { cookie } })
@@ -1942,7 +1942,7 @@ describe('минимальная длина пароля по роли (MIN_ADMI
     expect(okMember.statusCode).toBe(200)
   })
 
-  it('смена пароля существующему админу требует 16 символов — по роли ЦЕЛИ, не инициатора', async () => {
+  it('смена пароля существующему админу требует 12 символов — по роли ЦЕЛИ, не инициатора', async () => {
     // Пользователь 1 (из beforeEach) — admin
     const weak = await app.inject({ method: 'PATCH', url: '/api/crm/users/1', payload: { password: 'short123' }, headers: { cookie } })
     expect(weak.statusCode).toBe(400)
@@ -1991,12 +1991,12 @@ describe('минимальная длина пароля по роли (MIN_ADMI
     expect(res.statusCode).toBe(200)
   })
 
-  it('seed-admin.js (четвёртый путь создания админа) тоже требует 16 символов', () => {
+  it('seed-admin.js (четвёртый путь создания админа) тоже требует 12 символов', () => {
     // Независимый аудит поймал: этот путь остался на пороге 8, хотя bootstrap.js,
     // POST /api/crm/users (role=admin) и PATCH уже требовали 16 — единственный
     // интерактивный скрипт создания первого админа оставался лазейкой.
-    expect(validSeedInput('Админ', 'a@a.ru', 'a'.repeat(15))).toBe(false)
-    expect(validSeedInput('Админ', 'a@a.ru', 'a'.repeat(16))).toBe(true)
+    expect(validSeedInput('Админ', 'a@a.ru', 'a'.repeat(11))).toBe(false)
+    expect(validSeedInput('Админ', 'a@a.ru', 'a'.repeat(12))).toBe(true)
     expect(validSeedInput('', 'a@a.ru', 'a'.repeat(20))).toBe(false)
     expect(validSeedInput('Админ', 'не-email', 'a'.repeat(20))).toBe(false)
   })

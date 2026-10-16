@@ -1,5 +1,6 @@
 import { now } from './db.js'
 import { withTransaction, maintenanceBarrier } from './db-adapter.js'
+import { loadSettingsSafe, DEFAULTS } from './settings.js'
 
 const MAX_API = 'https://platform-api2.max.ru'
 
@@ -96,9 +97,20 @@ export function startOutboxWorker(db, { intervalMs = 30_000, senders = { tg: sen
       // промиса из колбэка setInterval, а это в Node по умолчанию валит весь процесс
       // CRM. Ловим и логируем: следующий тик через intervalMs попробует снова, очередь
       // в outbox никуда не девается.
+      // Переключатели каналов в настройках администратора (ADR-020). Читаются каждый тик: смена
+      // действует через ≤30 с. Недоступные настройки = всё включено (как до их появления).
+      const cfg = typeof db.prepare === 'function' ? await loadSettingsSafe(db) : DEFAULTS
       for (const channel of CHANNELS) {
         const send = senders[channel.name]
         if (!send) continue
+        if (cfg[`notify.${channel.name === 'tg' ? 'telegram' : 'max'}`] === false) {
+          // Канал выключен: НЕ копим очередь, иначе при включении на человека высыплется всё
+          // накопленное. Помечаем строки «закрытыми» с понятной причиной — в диагностике они
+          // не висят «в очереди», а в базе видно, что не отправлялись.
+          await db.prepare(`UPDATE outbox SET ${channel.sentCol} = ?, ${channel.errorCol} = ? WHERE ${channel.sentCol} IS NULL`)
+            .run(now(), 'канал отключён в настройках — не отправлялось')
+          continue
+        }
         const rows = await db
           .prepare(`SELECT * FROM outbox WHERE ${channel.sentCol} IS NULL AND ${channel.attemptsCol} < 20 ORDER BY id LIMIT 10`)
           .all()

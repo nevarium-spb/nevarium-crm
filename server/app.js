@@ -8,6 +8,8 @@ import { hashPassword, verifyPassword, fakeVerifyDelay, verifyOrFake, signToken,
 import { enqueue } from './telegram.js'
 import { registerNvizorRoutes, registerNvizorAdminRoutes, deleteNvizorFreeReportsForPhone } from './nvizor.js'
 import { registerEntitlementRoutes, deleteEntitlementsForContact } from './entitlements.js'
+import { createMailer } from './mailer.js'
+import { registerAccountRoutes, recordLogin } from './account.js'
 
 const COOKIE = 'nv_session'
 const MSK = 'Europe/Moscow'
@@ -50,7 +52,7 @@ const CLIENT_CABINET_URL = (trim(process.env.CLIENT_CABINET_URL, 300) || 'https:
 // dbConfig (было dbFile — SQLite-путь; перевод на Postgres, план в nevarium-lab#3):
 // строка подключения (DATABASE_URL, прод) ИЛИ уже готовый Pool-совместимый объект
 // (тесты — pg-mem). Без аргумента openDb() сама берёт process.env.DATABASE_URL.
-export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true, logger = false, staticDir = null, trustProxy = TRUST_PROXY, appOrigin = APP_ORIGIN, nvizorToken = NVIZOR_APP_TOKEN, cabinetBaseUrl = CLIENT_CABINET_URL } = {}) {
+export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true, logger = false, staticDir = null, trustProxy = TRUST_PROXY, appOrigin = APP_ORIGIN, nvizorToken = NVIZOR_APP_TOKEN, cabinetBaseUrl = CLIENT_CABINET_URL, mailer = createMailer(), forgotDelayMs = 700, crmBaseUrl = trim(process.env.CRM_BASE_URL, 300) || null } = {}) {
   const db = await openDb(dbConfig)
   // trustProxy — число доверенных прокси-хопов, НЕ `true`. С `true` Fastify берёт
   // самый левый X-Forwarded-For как req.ip, а его подставляет клиент — тогда всё,
@@ -162,7 +164,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // теряется, если идемпотентность включена, см. ниже).
   const HARD_LIMIT_WINDOW_MS = 10 * 60_000
   const HARD_LIMIT_MAX = 30
-  const hardHits = { leads: new Map(), pd_requests: new Map(), client_summary: new Map() }
+  const hardHits = { leads: new Map(), pd_requests: new Map(), client_summary: new Map(), auth_forgot: new Map(), auth_token: new Map() }
   // Массив на IP держим ОГРАНИЧЕННЫМ: раз решили «уже сверх лимита», новые метки
   // времени больше не добавляем — независимая проверка нашла, что без этого сам
   // счётчик становится усилителем атаки: при затяжном флуде массив растёт на каждый
@@ -514,6 +516,12 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     return user
   }
 
+  const setSession = (reply, user) => {
+    const token = signToken({ uid: user.id, tokenVersion: user.token_version }, secret)
+    reply.setCookie(COOKIE, token, { httpOnly: true, sameSite: 'lax', secure, path: '/', maxAge: SESSION_TTL_DAYS * 86400 })
+  }
+  const clearSession = (reply) => reply.clearCookie(COOKIE, { path: '/' })
+
   // Auth + Origin-проверка на мутациях для всего /api/crm/*. Async-хук вместо
   // (req, reply, done): getUser теперь сам асинхронный (await до БД) — Fastify
   // поддерживает async preHandler нативно, встроенный done() здесь просто не нужен.
@@ -613,6 +621,14 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   }
 
   registerNvizorAdminRoutes(app, { db, withMutation, audit })
+
+  // Учётная запись и настройки администратора (ADR-020): профиль, смена email/пароля,
+  // восстановление пароля по почте, «выйти везде», история входов, настройки CRM.
+  registerAccountRoutes(app, {
+    db, withMutation, audit, now, mailer, hardRateLimited, setSession, clearSession, forgotDelayMs,
+    baseUrl: crmBaseUrl || appOrigin,
+    log: app.log,
+  })
 
   // Тарифы клиентов (ADR-019, контракт nevarium_vizor/docs/SUBSCRIPTIONS.md): /api/nvizor/
   // entitlements/* под ключом приложения (хук nvizor.js), /api/crm/* под входом в CRM,
@@ -721,8 +737,8 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         return reply.code(401).send({ error: 'invalid_credentials' })
       }
       loginSucceeded(emailKey, { durable: true })
-      const token = signToken({ uid: user.id, tokenVersion: user.token_version }, secret)
-      reply.setCookie(COOKIE, token, { httpOnly: true, sameSite: 'lax', secure, path: '/', maxAge: SESSION_TTL_DAYS * 86400 })
+      setSession(reply, user)
+      await recordLogin(db, user, req, now)
       return { id: user.id, name: user.name, email: user.email, role: user.role }
     } finally {
       releaseLoginRequest()
@@ -1334,6 +1350,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       entitlement_checks: ['entitlement_id', 'contact_id', 'phone_key', 'record_id', 'object_ref', 'stage_code', 'kind', 'photos', 'videos', 'report_number',
         'parent_report_number', 'urgent', 'weekend', 'issued_at', 'created_at'],
       client_links: ['contact_id', 'token_hash', 'created_at', 'revoked_at', 'last_used_at', 'expires_on'],
+      settings: ['key', 'value', 'updated_at', 'updated_by'],
     }
     const allowedCols = (n) =>
       PLAIN_COLS[n]
@@ -1422,6 +1439,8 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
           .filter((n) => n !== 'consents' || hasConsents)
           .filter((n) => n !== 'nvizor_free_reports' || hasFreeReports)
           .filter((n) => !ENTITLEMENT_TABLES.includes(n) || hasEntitlements)
+          // Настройки (v7, ADR-020) — как Free: дамп до их появления их не несёт, и текущие не стираем.
+          .filter((n) => n !== 'settings' || Array.isArray(data.settings))
         if (!tables.includes('entitlements')) {
           for (const n of [...ENTITLEMENT_TABLES].reverse()) await tx.prepare(`DELETE FROM ${n}`).run()
         }
@@ -1628,6 +1647,9 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     // {ok:true}, ничего не удалив, — админ считает, что доступ отозван.
     if (!(await db.prepare('SELECT 1 FROM users WHERE id = ?').get(id))) return reply.code(404).send({ error: 'not_found' })
     await db.prepare('UPDATE users SET token_version = token_version + 1 WHERE id = ?').run(id)
+    // История входов и ссылки из писем привязаны к пользователю внешним ключом (ADR-020).
+    await db.prepare('DELETE FROM login_events WHERE user_id = ?').run(id)
+    await db.prepare('DELETE FROM auth_tokens WHERE user_id = ?').run(id)
     await db.prepare('DELETE FROM users WHERE id = ?').run(id)
     await audit(req, 'delete', 'users', id)
     return { ok: true }
