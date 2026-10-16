@@ -10,6 +10,7 @@ import { checkNewPassword, isCommonPassword } from './password-policy.js'
 import { purgeAuthHousekeeping } from './account.js'
 import { runEntitlementReminders, linkExpiryFor, addDays } from './entitlements.js'
 import { resetPasswordByEmail } from './reset-admin.js'
+import { describeMailConfig, sendTestMail, explainMailError } from './test-mail.js'
 import { withTransaction, maintenanceBarrier } from './db-adapter.js'
 
 const TOKEN = 'test-nvizor-token-0123456789abcdef0123456789'
@@ -393,5 +394,33 @@ describe('цены и лимиты — из общего файла server/share
     expect(mine.LIMITS).toBe(shared.LIMITS)
     expect(mine.STAGES).toBe(shared.STAGES)
     expect(shared.PLANS.repair.price).toBe(19900)
+  })
+})
+
+describe('test-mail (диагностика почты из консоли сервера)', () => {
+  it('показывает настройки БЕЗ пароля: только «задан» и длину; ловит пробелы в пароле приложения', () => {
+    const cfg = describeMailConfig({ SMTP_HOST: 'smtp.gmail.com', SMTP_USER: 'a@gmail.com', SMTP_PASS: 'abcd efgh ijkl mnop' })
+    expect(cfg).toMatchObject({ host: 'smtp.gmail.com', port: 465, user: 'a@gmail.com', from: 'a@gmail.com', passSet: true, passLength: 19, passHasSpaces: true })
+    expect(JSON.stringify(cfg)).not.toContain('abcd')
+    expect(describeMailConfig({}).passSet).toBe(false)
+  })
+
+  it('письмо уходит только сотруднику CRM; чужому адресу и без настроенной почты — отказ', async () => {
+    const mails = []
+    const ok = { configured: true, send: async (m) => { mails.push(m) } }
+    expect(await sendTestMail(app.db, ok, 'stranger@example.ru')).toEqual({ error: 'not_staff' })
+    expect(await sendTestMail(app.db, { configured: false, send: async () => {} }, 'owner@example.ru')).toEqual({ error: 'not_configured' })
+    expect(mails).toHaveLength(0)
+    expect(await sendTestMail(app.db, ok, ' Owner@Example.ru ')).toEqual({ ok: true })
+    expect(mails).toHaveLength(1)
+    expect(mails[0].to).toBe('owner@example.ru')
+  })
+
+  it('ошибка отправки возвращается как есть и объясняется по-человечески', async () => {
+    const err = Object.assign(new Error('Invalid login'), { code: 'EAUTH', response: '535-5.7.8 Username and Password not accepted' })
+    const res = await sendTestMail(app.db, { configured: true, send: async () => { throw err } }, 'owner@example.ru')
+    expect(res.error).toBe('send_failed')
+    expect(explainMailError(res.err, { ok: true })).toContain('пароль приложения')
+    expect(explainMailError(Object.assign(new Error('x'), { code: 'ETIMEDOUT' }), { ok: false, error: 'ETIMEDOUT' })).toContain('блокирует исходящую почту')
   })
 })

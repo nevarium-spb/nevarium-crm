@@ -12,7 +12,8 @@
     "dev-server": "node server/dev.js",
     "seed-admin": "node server/seed-admin.js",
     "test": "vitest run",
-    "reset-admin": "node server/reset-admin.js"
+    "reset-admin": "node server/reset-admin.js",
+    "test-mail": "node server/test-mail.js"
   },
   "dependencies": {
     "@fastify/cookie": "^11.1.1",
