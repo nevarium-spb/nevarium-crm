@@ -13,6 +13,7 @@
     "seed-admin": "node server/seed-admin.js",
     "test": "vitest run",
     "reset-admin": "node server/reset-admin.js",
+    "change-email": "node server/change-email.js",
     "test-mail": "node server/test-mail.js"
   },
   "dependencies": {

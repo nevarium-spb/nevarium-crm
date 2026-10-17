@@ -10,6 +10,8 @@ import { checkNewPassword, isCommonPassword } from './password-policy.js'
 import { purgeAuthHousekeeping } from './account.js'
 import { runEntitlementReminders, linkExpiryFor, addDays } from './entitlements.js'
 import { resetPasswordByEmail } from './reset-admin.js'
+import { changeEmail } from './change-email.js'
+import { createMailer, signV4 } from './mailer.js'
 import { describeMailConfig, sendTestMail, explainMailError } from './test-mail.js'
 import { withTransaction, maintenanceBarrier } from './db-adapter.js'
 
@@ -422,5 +424,89 @@ describe('test-mail (диагностика почты из консоли се�
     expect(res.error).toBe('send_failed')
     expect(explainMailError(res.err, { ok: true })).toContain('пароль приложения')
     expect(explainMailError(Object.assign(new Error('x'), { code: 'ETIMEDOUT' }), { ok: false, error: 'ETIMEDOUT' })).toContain('блокирует исходящую почту')
+  })
+
+  it('способ Postbox: ключи в вывод не попадают, ошибки сервиса объясняются', () => {
+    const cfg = describeMailConfig({ POSTBOX_KEY_ID: 'idid', POSTBOX_SECRET_KEY: 'secret-key-123', SMTP_FROM: 'crm@example.ru' })
+    expect(cfg).toMatchObject({ mode: 'postbox', keyIdSet: true, secretSet: true, secretLength: 14, from: 'crm@example.ru' })
+    expect(JSON.stringify(cfg)).not.toContain('secret-key')
+    expect(describeMailConfig({}).mode).toBe('smtp')
+    expect(explainMailError(Object.assign(new Error('x'), { code: 'HTTP_403' }), null)).toContain('postbox.sender')
+    expect(explainMailError(Object.assign(new Error('x'), { code: 'HTTP_400' }), null)).toContain('DKIM')
+    expect(explainMailError(Object.assign(new Error('x'), { code: 'ETIMEDOUT' }), null)).toContain('POSTBOX_ENDPOINT')
+  })
+})
+
+describe('отправка почты через Yandex Cloud Postbox (хостинг режет SMTP)', () => {
+  const env = { POSTBOX_KEY_ID: 'YCAJEkeyid', POSTBOX_SECRET_KEY: 'secret-key-123', SMTP_FROM: 'crm@example.ru' }
+  const fakeFetch = (reply, calls = []) => async (url, init) => {
+    calls.push({ url: String(url), init })
+    return { ok: reply.status < 400, status: reply.status, json: async () => reply.body }
+  }
+  const clock = () => new Date('2026-10-17T17:05:09.123Z')
+
+  it('подпись AWS SigV4 совпадает с опубликованным примером AWS (get-vanilla)', () => {
+    const auth = signV4({
+      method: 'GET', path: '/', headers: { Host: 'example.amazonaws.com', 'X-Amz-Date': '20150830T123600Z' },
+      region: 'us-east-1', service: 'service', keyId: 'AKIDEXAMPLE', secret: 'wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY',
+    })
+    expect(auth).toBe('AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-date, Signature=5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31')
+  })
+
+  it('нужны оба ключа и корректный адрес отправителя; без ключей — прежний SMTP', () => {
+    expect(createMailer(env)).toMatchObject({ configured: true, mode: 'postbox' })
+    expect(createMailer({ POSTBOX_KEY_ID: 'k', POSTBOX_SECRET_KEY: 's' }).configured).toBe(false)
+    expect(createMailer({ POSTBOX_KEY_ID: 'k', SMTP_FROM: 'crm@example.ru' }).configured).toBe(false)
+    expect(createMailer({ POSTBOX_KEY_ID: 'k', POSTBOX_SECRET_KEY: 's', SMTP_FROM: 'not-an-email' }).configured).toBe(false)
+    expect(createMailer({ SMTP_HOST: 'h', SMTP_USER: 'u@x.ru', SMTP_PASS: 'p' })).toMatchObject({ configured: true, mode: 'smtp' })
+  })
+
+  it('шлёт простой текст одному адресату, подписанный запрос; секретный ключ в запрос не попадает', async () => {
+    const calls = []
+    const mailer = createMailer(env, { fetchImpl: fakeFetch({ status: 200, body: { MessageId: 'x' } }, calls), clock })
+    await mailer.send({ to: 'a@example.ru', subject: 'Тема', text: 'Ссылка: https://crm.test/crm/reset#t=abc' })
+    expect(calls).toHaveLength(1)
+    expect(calls[0].url).toBe('https://postbox.cloud.yandex.net/v2/email/outbound-emails')
+    const h = calls[0].init.headers
+    expect(h['X-Amz-Date']).toBe('20261017T170509Z')
+    expect(h.Authorization).toMatch(/^AWS4-HMAC-SHA256 Credential=YCAJEkeyid\/20261017\/ru-central1\/ses\/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=[0-9a-f]{64}$/)
+    const body = JSON.parse(calls[0].init.body)
+    expect(body.FromEmailAddress).toBe('Невариум CRM <crm@example.ru>')
+    expect(body.Destination).toEqual({ ToAddresses: ['a@example.ru'] })
+    expect(body.Content.Simple.Subject.Data).toBe('Тема')
+    expect(body.Content.Simple.Body).toEqual({ Text: { Data: 'Ссылка: https://crm.test/crm/reset#t=abc', Charset: 'UTF-8' } })
+    expect(body.Content.Simple.Body.Html).toBeUndefined()
+    expect(JSON.stringify(calls[0])).not.toContain('secret-key')
+  })
+
+  it('отказ сервиса и сетевой сбой — ошибка без ключей в тексте; плохой адресат не уходит вообще', async () => {
+    const mk = (reply) => createMailer(env, { fetchImpl: fakeFetch(reply), clock })
+    const mail = { to: 'a@example.ru', subject: 's', text: 't' }
+    await expect(mk({ status: 403, body: { message: 'Forbidden' } }).send(mail)).rejects.toMatchObject({ code: 'HTTP_403', response: 'Forbidden' })
+    await expect(mk({ status: 400, body: { Message: 'Domain not verified' } }).send(mail)).rejects.toMatchObject({ code: 'HTTP_400' })
+    const down = createMailer(env, { fetchImpl: async () => { throw Object.assign(new Error('boom'), { name: 'TimeoutError' }) }, clock })
+    await expect(down.send(mail)).rejects.toMatchObject({ code: 'ETIMEDOUT' })
+    const never = createMailer(env, { fetchImpl: async () => { throw new Error('не должен вызываться') }, clock })
+    await expect(never.send({ ...mail, to: 'a@example.ru, b@example.ru' })).rejects.toThrow('bad_recipient')
+  })
+})
+
+describe('change-email (запасной путь из консоли сервера)', () => {
+  it('меняет email, завершает сессии, гасит ссылки из писем, пишет в журнал; чужой, занятый и кривой адреса — отказ', async () => {
+    await addMember()
+    await app.inject({ method: 'POST', url: '/api/auth/forgot', payload: { email: 'owner@example.ru' } }); await app.flushMail()
+    expect(await changeEmail(app.db, 'nobody@example.ru', 'new@example.ru')).toEqual({ error: 'not_found' })
+    expect(await changeEmail(app.db, 'owner@example.ru', 'staff@example.ru')).toEqual({ error: 'email_taken' })
+    expect(await changeEmail(app.db, 'owner@example.ru', 'не-адрес')).toEqual({ error: 'bad_input' })
+    expect(await changeEmail(app.db, 'owner@example.ru', 'owner@example.ru')).toEqual({ error: 'bad_input' })
+    const res = await changeEmail(app.db, ' Owner@Example.ru ', ' New@Example.ru ')
+    expect(res.newEmail).toBe('new@example.ru')
+    expect((await crm('GET', '/api/crm/me')).statusCode).toBe(401)
+    cookie = await loginAs('new@example.ru', 'password123')
+    expect((await crm('GET', '/api/crm/me')).statusCode).toBe(200)
+    expect(Number((await app.db.prepare('SELECT COUNT(*) c FROM auth_tokens WHERE used_at IS NULL').get()).c)).toBe(0)
+    const log = await app.db.prepare("SELECT detail FROM audit_log WHERE user_email = 'console'").all()
+    expect(log).toHaveLength(1)
+    expect(log[0].detail).toContain('new@example.ru')
   })
 })

@@ -12,7 +12,13 @@ import { createMailer } from './mailer.js'
 export function describeMailConfig(env = process.env) {
   const pass = String(env.SMTP_PASS || '')
   const user = String(env.SMTP_USER || '').trim()
+  const keyId = String(env.POSTBOX_KEY_ID || '').trim()
+  const secret = String(env.POSTBOX_SECRET_KEY || '').trim()
   return {
+    mode: keyId || secret ? 'postbox' : 'smtp',
+    keyIdSet: keyId.length > 0,
+    secretSet: secret.length > 0,
+    secretLength: secret.length,
     host: String(env.SMTP_HOST || '').trim(),
     port: Number(env.SMTP_PORT) || 465,
     user,
@@ -39,6 +45,9 @@ export function checkTcp(host, port, timeoutMs = 8000) {
 /** Подсказка по коду ошибки nodemailer — человеческим языком. */
 export function explainMailError(err, tcp) {
   const code = err?.code || ''
+  if (code === 'HTTP_401' || code === 'HTTP_403') return 'Postbox не принял ключ или у него нет прав. Проверьте POSTBOX_KEY_ID и POSTBOX_SECRET_KEY (скопированы целиком, без пробелов и кавычек) и что у сервисного аккаунта есть роль postbox.sender.'
+  if (code.startsWith('HTTP_')) return 'Postbox ответил ошибкой (см. ответ выше). Частая причина — адрес отправителя SMTP_FROM на домене, который не подтверждён в Postbox (запись DKIM в DNS), или адрес получателя отклонён.'
+  if (['ETIMEDOUT', 'ECONNECTION'].includes(code) && !tcp) return 'Не удалось связаться с Postbox (проверьте POSTBOX_ENDPOINT и доступ сервера в интернет по HTTPS).'
   if (code === 'EAUTH' || /535|Username and Password not accepted|Invalid login/i.test(err?.response || err?.message || '')) {
     return 'Gmail не принял логин/пароль. Проверьте SMTP_USER (ящик, для которого создан пароль приложения) и SMTP_PASS: это «пароль приложения» Google (16 букв, создаётся при включённой двухэтапной проверке), а не обычный пароль от почты. Лишних пробелов и кавычек быть не должно.'
   }
@@ -72,19 +81,32 @@ const isMain = import.meta.main ?? process.argv[1]?.endsWith('test-mail.js')
 
 if (isMain) {
   const cfg = describeMailConfig()
-  console.log('Настройки почты (пароль не показывается):')
-  console.log(`  SMTP_HOST: ${cfg.host || '— не задан'}`)
-  console.log(`  SMTP_PORT: ${cfg.port}`)
-  console.log(`  SMTP_USER: ${cfg.user || '— не задан'}`)
-  console.log(`  SMTP_FROM: ${cfg.from || '— не задан'}`)
-  console.log(`  SMTP_PASS: ${cfg.passSet ? `задан, ${cfg.passLength} симв.${cfg.passHasSpaces ? ' (ЕСТЬ ПРОБЕЛЫ — уберите)' : ''}` : '— не задан'}`)
+  console.log('Настройки почты (пароль и ключ не показываются):')
+  if (cfg.mode === 'postbox') {
+    console.log('  Способ: Yandex Cloud Postbox по HTTPS')
+    console.log(`  POSTBOX_KEY_ID: ${cfg.keyIdSet ? 'задан' : '— не задан'}`)
+    console.log(`  POSTBOX_SECRET_KEY: ${cfg.secretSet ? `задан, ${cfg.secretLength} симв.` : '— не задан'}`)
+    console.log(`  SMTP_FROM: ${cfg.from || '— не задан'}`)
+  } else {
+    console.log('  Способ: SMTP')
+    console.log(`  SMTP_HOST: ${cfg.host || '— не задан'}`)
+    console.log(`  SMTP_PORT: ${cfg.port}`)
+    console.log(`  SMTP_USER: ${cfg.user || '— не задан'}`)
+    console.log(`  SMTP_FROM: ${cfg.from || '— не задан'}`)
+    console.log(`  SMTP_PASS: ${cfg.passSet ? `задан, ${cfg.passLength} симв.${cfg.passHasSpaces ? ' (ЕСТЬ ПРОБЕЛЫ — уберите)' : ''}` : '— не задан'}`)
+  }
   const mailer = createMailer()
   if (!mailer.configured) {
-    console.error('\nПочта не настроена: нужны SMTP_HOST, SMTP_USER, SMTP_PASS (и SMTP_FROM либо он возьмётся из SMTP_USER).')
+    console.error(cfg.mode === 'postbox'
+      ? '\nПочта не настроена: для Postbox нужны POSTBOX_KEY_ID, POSTBOX_SECRET_KEY и SMTP_FROM — адрес отправителя на подтверждённом домене.'
+      : '\nПочта не настроена: нужны SMTP_HOST, SMTP_USER, SMTP_PASS (и SMTP_FROM либо он возьмётся из SMTP_USER) — либо POSTBOX_KEY_ID, POSTBOX_SECRET_KEY и SMTP_FROM.')
     process.exit(1)
   }
-  const tcp = await checkTcp(cfg.host, cfg.port)
-  console.log(`\nСоединение с ${cfg.host}:${cfg.port}: ${tcp.ok ? `есть (${tcp.ms} мс)` : `НЕТ — ${tcp.error}`}`)
+  let tcp = null
+  if (cfg.mode === 'smtp') {
+    tcp = await checkTcp(cfg.host, cfg.port)
+    console.log(`\nСоединение с ${cfg.host}:${cfg.port}: ${tcp.ok ? `есть (${tcp.ms} мс)` : `НЕТ — ${tcp.error}`}`)
+  }
 
   const db = await openDb(process.env.DATABASE_URL)
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
