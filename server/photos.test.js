@@ -1,6 +1,7 @@
 // @vitest-environment node
 // Фото объекта из формы заявки сайта Визора (задание сайта 2026-10-16, часть Б; ADR-022).
 // Хранилище подставное, в памяти: настоящий S3 в тестах не нужен — подпись запросов проверяется отдельно.
+import fs from 'node:fs'
 import { newDb } from 'pg-mem'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { buildApp } from './app.js'
@@ -53,6 +54,25 @@ const lead = (body = {}) => {
 }
 const photo = (request_id, buf, { idx = 0, type = 'image/jpeg', name = 'IMG 1.jpg', headers = {} } = {}) =>
   app.inject({ method: 'POST', url: `/api/leads/${request_id}/photos`, payload: buf, headers: { 'content-type': type, 'x-photo-index': String(idx), 'x-file-name': encodeURIComponent(name), 'idempotency-key': `${request_id}:${idx}`, ...headers } })
+
+// server/index.js (прод-вход) в тестах не запускается — ему нужен настоящий Postgres. Один раз это стоило сорвавшегося
+// деплоя: функцию вызвали, а импорт не добавили (ReferenceError при старте, платформа откатилась на прежнюю версию).
+// Страховка: каждая функция, вызываемая отдельной строкой в index.js, обязана быть там импортирована или объявлена.
+describe('server/index.js: все вызываемые функции импортированы', () => {
+  it('нет вызова без импорта и без объявления; запуск фоновых задач — ровно по одному разу', () => {
+    const src = fs.readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+    const imported = new Set([...src.matchAll(/import\s*\{([^}]+)\}/g)].flatMap((m) => m[1].split(',').map((s) => s.trim().split(/\s+as\s+/).pop())).filter(Boolean))
+    const declared = new Set([...src.matchAll(/\b(?:const|let|var|function)\s+([A-Za-z_]\w*)/g)].map((m) => m[1]))
+    const globals = new Set(['console', 'setInterval', 'setTimeout', 'clearInterval', 'clearTimeout', 'fetch'])
+    const called = [...src.matchAll(/^\s*(?:await\s+)?([A-Za-z_]\w*)\(/gm)].map((m) => m[1])
+    expect(called.length).toBeGreaterThan(3)
+    const unknown = called.filter((n) => !imported.has(n) && !declared.has(n) && !globals.has(n))
+    expect(unknown, `вызваны без импорта: ${unknown.join(', ')}`).toEqual([])
+    for (const starter of ['startOutboxWorker', 'scheduleAuthHousekeeping', 'schedulePhotoHousekeeping', 'scheduleEntitlementReminders']) {
+      expect(called.filter((n) => n === starter), `${starter} должен запускаться один раз`).toHaveLength(1)
+    }
+  })
+})
 
 describe('тип файла — по содержимому, а не по заголовку', () => {
   it('JPEG, PNG, WebP, HEIC/HEIF распознаются; текст и обрезок — нет', () => {

@@ -94,7 +94,7 @@ export function createS3(env = process.env, { fetchImpl = globalThis.fetch, cloc
  */
 export async function queuePhotoDeletion(tx, where, nowIso) {
   const [cond, args] = where.all ? ['1 = 1', []] : where.dealId !== undefined ? ['deal_id = ?', [where.dealId]] : ['contact_id = ?', [where.contactId]]
-  await tx.prepare(`INSERT INTO photo_deletions (storage_key, created_at) SELECT storage_key, ? FROM lead_photos WHERE ${cond}`).run(nowIso, ...args)
+  await tx.prepare(`INSERT INTO photo_deletions (storage_key, created_at) SELECT storage_key, CAST(? AS TEXT) FROM lead_photos WHERE ${cond}`).run(nowIso, ...args)
   await tx.prepare(`DELETE FROM lead_photos WHERE ${cond}`).run(...args)
 }
 

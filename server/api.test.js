@@ -3532,7 +3532,7 @@ describe('восстановление из дампа: блокеры, найд
     expect(tx, 'ожидали транзакцию приёма запроса').toBeTruthy()
     const at = (needle) => tx.findIndex((q) => q.includes(needle))
     expect(at('pg_advisory_xact_lock'), 'запрос не взял барьер').toBeGreaterThanOrEqual(0)
-    expect(at('SELECT id FROM contacts WHERE anonymized_at IS NULL'), 'поиск контакта мимо транзакции')
+    expect(at('archived FROM contacts'), 'поиск контакта мимо транзакции')
       .toBeGreaterThan(at('pg_advisory_xact_lock'))
   })
 
