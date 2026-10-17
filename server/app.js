@@ -10,6 +10,7 @@ import { registerNvizorRoutes, registerNvizorAdminRoutes, deleteNvizorFreeReport
 import { registerEntitlementRoutes, deleteEntitlementsForContact } from './entitlements.js'
 import { createMailer } from './mailer.js'
 import { registerAccountRoutes, recordLogin } from './account.js'
+import { createS3, registerPhotoRoutes, queuePhotoDeletion } from './photos.js'
 import { LEAD_PLANS, INVOICE_CHANNELS, INVOICE_CONTACT_MAX, normalizeLeadPlan, normalizeInvoice, invoiceMessengerValue, invoiceLabel, leadPlanTitle } from '../src/shared/lead-fields.js'
 
 const COOKIE = 'nv_session'
@@ -53,7 +54,7 @@ const CLIENT_CABINET_URL = (trim(process.env.CLIENT_CABINET_URL, 300) || 'https:
 // dbConfig (было dbFile — SQLite-путь; перевод на Postgres, план в nevarium-lab#3):
 // строка подключения (DATABASE_URL, прод) ИЛИ уже готовый Pool-совместимый объект
 // (тесты — pg-mem). Без аргумента openDb() сама берёт process.env.DATABASE_URL.
-export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true, logger = false, staticDir = null, trustProxy = TRUST_PROXY, appOrigin = APP_ORIGIN, nvizorToken = NVIZOR_APP_TOKEN, cabinetBaseUrl = CLIENT_CABINET_URL, mailer = createMailer(), forgotDelayMs = 700, crmBaseUrl = trim(process.env.CRM_BASE_URL, 300) || null } = {}) {
+export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true, logger = false, staticDir = null, trustProxy = TRUST_PROXY, appOrigin = APP_ORIGIN, nvizorToken = NVIZOR_APP_TOKEN, cabinetBaseUrl = CLIENT_CABINET_URL, mailer = createMailer(), s3 = createS3(), photoLimitBytes = (Number(process.env.PHOTO_STORAGE_LIMIT_MB) || 1024) * 1024 * 1024, forgotDelayMs = 700, crmBaseUrl = trim(process.env.CRM_BASE_URL, 300) || null } = {}) {
   const db = await openDb(dbConfig)
   // trustProxy — число доверенных прокси-хопов, НЕ `true`. С `true` Fastify берёт
   // самый левый X-Forwarded-For как req.ip, а его подставляет клиент — тогда всё,
@@ -165,7 +166,9 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // теряется, если идемпотентность включена, см. ниже).
   const HARD_LIMIT_WINDOW_MS = 10 * 60_000
   const HARD_LIMIT_MAX = 30
-  const hardHits = { leads: new Map(), pd_requests: new Map(), client_summary: new Map(), auth_forgot: new Map(), auth_token: new Map() }
+  const hardHits = { leads: new Map(), pd_requests: new Map(), client_summary: new Map(), auth_forgot: new Map(), auth_token: new Map(), lead_photos: new Map() }
+  // Фото: до 10 файлов на заявку, поэтому потолок на IP выше, чем у заявок (30), но тоже конечный.
+  const HARD_LIMIT_MAX_BY_SCOPE = { lead_photos: 120 }
   // Массив на IP держим ОГРАНИЧЕННЫМ: раз решили «уже сверх лимита», новые метки
   // времени больше не добавляем — независимая проверка нашла, что без этого сам
   // счётчик становится усилителем атаки: при затяжном флуде массив растёт на каждый
@@ -176,10 +179,11 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   function hardRateLimited(scope, ip) {
     const nowMs = Date.now()
     const store = hardHits[scope]
+    const max = HARD_LIMIT_MAX_BY_SCOPE[scope] ?? HARD_LIMIT_MAX
     const existing = store.get(ip)
-    if (!existing) capBuckets(store, (l) => l.length >= HARD_LIMIT_MAX)
+    if (!existing) capBuckets(store, (l) => l.length >= max)
     const list = (existing || []).filter((t) => nowMs - t < HARD_LIMIT_WINDOW_MS)
-    if (list.length >= HARD_LIMIT_MAX) {
+    if (list.length >= max) {
       store.set(ip, list)
       return true
     }
@@ -647,6 +651,25 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         .header('access-control-allow-origin', req.headers.origin)
         .header('access-control-allow-methods', 'POST, OPTIONS')
         .header('access-control-allow-headers', 'content-type')
+        .header('access-control-max-age', '86400')
+        .code(204)
+        .send()
+    },
+  })
+
+  // Фото объекта из формы заявки (ADR-022, задание сайта 2026-10-16, часть Б): приём по request_id
+  // заявки (окно 60 минут), хранение в приватном S3, просмотр — только вошедшим.
+  registerPhotoRoutes(app, {
+    db, s3, withMutation, audit, now, hardRateLimited, enqueue,
+    limitBytes: photoLimitBytes,
+    applyCors: (req, reply) => applyLeadCors(req, reply),
+    corsPreflight: async (req, reply) => {
+      if (!(await leadOriginAllowed(req.headers.origin))) return reply.header('vary', 'Origin').code(403).send()
+      return reply
+        .header('vary', 'Origin')
+        .header('access-control-allow-origin', req.headers.origin)
+        .header('access-control-allow-methods', 'POST, OPTIONS')
+        .header('access-control-allow-headers', 'content-type, x-photo-index, x-file-name, idempotency-key')
         .header('access-control-max-age', '86400')
         .code(204)
         .send()
@@ -1122,6 +1145,9 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
           const c = await tx.prepare('SELECT phone, email, messenger, project_id FROM contacts WHERE id = ?').get(id)
           await tx.prepare('DELETE FROM tasks WHERE contact_id = ?').run(id)
           await tx.prepare('DELETE FROM interactions WHERE contact_id = ?').run(id)
+          // Фото заявок (ADR-022): строки — сразу, объекты из бакета — очередью в этой же транзакции.
+          await queuePhotoDeletion(tx, { contactId: id }, now())
+          await tx.prepare('DELETE FROM lead_intake WHERE contact_id = ?').run(id)
           // Тарифы, выданные проверки и личные ссылки уходят вместе с контактом (ADR-019).
           await deleteEntitlementsForContact(tx, id, c ? [c.phone, c.messenger] : [])
           // Слепки согласия (независимая проверка, раунд 22): в отличие от анонимизации
@@ -1152,6 +1178,9 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
           // удаление сделки упало бы на FOREIGN KEY.
           await tx.prepare('DELETE FROM tasks WHERE winback_sequence_id IN (SELECT id FROM winback_sequences WHERE deal_id = ?)').run(id)
           await tx.prepare('DELETE FROM winback_sequences WHERE deal_id = ?').run(id)
+          // Фото этой заявки уходят вместе с ней (ADR-022: «удаляются вместе с заявкой»).
+          await queuePhotoDeletion(tx, { dealId: id }, now())
+          await tx.prepare('DELETE FROM lead_intake WHERE deal_id = ?').run(id)
           await tx.prepare('UPDATE tasks SET deal_id = NULL WHERE deal_id = ?').run(id)
           // Согласие живёт независимо от сделки (contact_id — основная связь) — только
           // рвём ставшую невалидной ссылку, тем же приёмом, что и у tasks.deal_id выше.
@@ -1465,6 +1494,10 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         if (!tables.includes('entitlements')) {
           for (const n of [...ENTITLEMENT_TABLES].reverse()) await tx.prepare(`DELETE FROM ${n}`).run()
         }
+        // Фото заявок (ADR-022) в дамп не входят, а id контактов после восстановления другие —
+        // оставить их значило бы привязать чужие фото к чужим людям. Удаляем все (объекты — очередью).
+        await queuePhotoDeletion(tx, { all: true }, now())
+        await tx.prepare('DELETE FROM lead_intake').run()
         // удаляем детей раньше родителей (FK), вставляем в прямом порядке
         for (const n of [...tables].reverse()) {
           await tx.prepare(`DELETE FROM ${n}`).run()
@@ -1794,6 +1827,9 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       //    contact_id/deal_id/project_id/created_at (ссылка на уже анонимизированный
       //    контакт ничего не раскрывает, дата фиксирует момент события).
       await tx.prepare("UPDATE consents SET requester = '', version = '', text = '', text_truncated = 0, accepted_at = NULL WHERE contact_id = ?").run(contactId)
+      // 5e. Фото заявок (ADR-022): EXIF с координатами — это адрес объекта; строки и объекты в бакете.
+      await queuePhotoDeletion(tx, { contactId }, ts)
+      await tx.prepare('DELETE FROM lead_intake WHERE contact_id = ?').run(contactId)
       // 5c. Записи тарифа Free приложения NVizor с тем же телефоном — признаки того же
       //     человека (server/nvizor.js); значения телефона читаны ДО шага 1.
       await deleteNvizorFreeReportsForPhone(tx, contact.phone)
@@ -2315,6 +2351,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       // заявку к существующей (ADR-014). Ошибочную склейку видно сразу и она поправима:
       // у сделки и у действия можно сменить контакт в обычной форме редактирования.
       const ts = now()
+      const vizorProjectId = await resolveProjectId('nevarium-vizor')
       // Ключ идемпотентности застолбляется ДО транзакции (claim-first, см.
       // idempotencyClaim), а вот его ЗАКРЫТИЕ — внутри неё, последним шагом. Так
       // владение перепроверяется, пока откат ещё возможен: перехваченный по аренде
@@ -2409,6 +2446,13 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
           await tx.prepare("UPDATE winback_sequences SET status = 'cancelled', finished_at = ? WHERE id = ?").run(ts, seq.id)
         }
         inner = { contactId: cid, dealId, repeat: true, returned: seqs.length > 0 }
+      }
+
+      // Окно прикрепления фото (ADR-022): только форма сайта Визора, не «подозрительная», с ключом
+      // идемпотентности (он же request_id в POST /api/leads/{request_id}/photos). Живёт 2 часа.
+      if (requestId && !isChat && !suspicious && vizorProjectId && projectId === vizorProjectId) {
+        await tx.prepare('INSERT INTO lead_intake (request_id, contact_id, deal_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT (request_id) DO NOTHING')
+          .run(requestId, inner.contactId, inner.dealId, ts)
       }
 
       // Слепок согласия — одна строка на КАЖДУЮ отправку (не только на новый контакт):

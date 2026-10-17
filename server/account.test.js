@@ -121,7 +121,7 @@ describe('профиль', () => {
     await app.db.prepare('UPDATE login_events SET created_at = ? WHERE id = 1').run(new Date(Date.now() - 91 * 864e5).toISOString())
     await purgeAuthHousekeeping(app.db, { now })
     expect(Number((await app.db.prepare('SELECT COUNT(*) c FROM login_events WHERE id = 1').get()).c)).toBe(0)
-  })
+  }, 30_000) // 22 входа с хешированием пароля: в одиночку ~5 с, при параллельном прогоне файлов — дольше
 })
 
 describe('смена email с подтверждением', () => {

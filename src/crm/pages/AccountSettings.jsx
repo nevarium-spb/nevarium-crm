@@ -164,6 +164,34 @@ function SecurityTile({ logins }) {
   )
 }
 
+/** «12,4 МБ», «1,2 ГБ» — размер файлов человеческим языком. */
+export function formatBytes(n) {
+  const v = Number(n) || 0
+  if (v < 1024 * 1024) return `${Math.max(0, Math.round(v / 1024))} КБ`
+  if (v < 1024 * 1024 * 1024) return `${(v / 1024 / 1024).toFixed(1).replace('.', ',')} МБ`
+  return `${(v / 1024 / 1024 / 1024).toFixed(2).replace('.', ',')} ГБ`
+}
+
+/** Занятое место под фото (ADR-022): предупреждение с 80% от лимита хранилища — пора поднять тариф в Timeweb. */
+function PhotoUsage({ photos }) {
+  if (!photos) return null
+  if (!photos.configured) return <div className="crm-cap">Хранилище фото не подключено (нет настроек S3) — сайт получает отказ и фото не шлёт.</div>
+  const { count, bytes, limitBytes } = photos
+  const share = limitBytes ? bytes / limitBytes : 0
+  return (
+    <>
+      <div className="crm-cap">
+        Фото: {count} шт., занято {formatBytes(bytes)}{limitBytes ? ` из ${formatBytes(limitBytes)} (лимит тарифа хранилища)` : ''}.
+      </div>
+      {share >= 0.8 && (
+        <div className="field-error" role="alert">
+          Хранилище заполнено на {Math.round(share * 100)}%. Когда оно кончится, заявки по-прежнему будут приниматься, но фото к ним прикрепляться не будут. Тариф хранилища в Timeweb (при включённом автоапгрейде он вырастет сам) нужно проверить, а новый объём — внести в переменную PHOTO_STORAGE_LIMIT_MB в настройках приложения.
+        </div>
+      )}
+    </>
+  )
+}
+
 function AdminSettingsTile({ mailAvailable }) {
   const [s, setS] = useState(null)
   const [busy, setBusy] = useState(false)
@@ -208,6 +236,8 @@ function AdminSettingsTile({ mailAvailable }) {
           <input type="number" min="1" max="90" value={s.freeLinkDays} required onChange={(e) => setS({ ...s, freeLinkDays: e.target.value === '' ? '' : Number(e.target.value) })} />
         </label>
         <div className="crm-cap">Действует для новых ссылок; уже выданные сохраняют свой срок.</div>
+        <h3 style={{ margin: '10px 0 2px', fontSize: 14 }}>Фото из заявок</h3>
+        <PhotoUsage photos={s.photos} />
         {mailAvailable === false && <div className="crm-cap">Почта сервера (SMTP) не настроена: восстановление пароля и смена email по письму недоступны.</div>}
         <div className="crm-form-actions"><button type="submit" className="btn primary" disabled={busy}>{busy ? 'Сохраняем…' : 'Сохранить'}</button></div>
       </form>

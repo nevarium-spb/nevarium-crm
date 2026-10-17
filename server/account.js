@@ -276,7 +276,8 @@ export function registerAccountRoutes(app, deps) {
 
   app.get('/api/crm/settings', async (req, reply) => {
     if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
-    return { ...settingsView(await loadSettings(db)), defaults: settingsView(DEFAULTS), mailAvailable: mailAvailable() }
+    // photos — занятое место под фото заявок (ADR-022), считается по таблице, без запросов к хранилищу.
+    return { ...settingsView(await loadSettings(db)), defaults: settingsView(DEFAULTS), mailAvailable: mailAvailable(), photos: app.photoUsage ? await app.photoUsage() : null }
   })
 
   app.patch('/api/crm/settings', { bodyLimit: 4096 }, async (req, reply) => {

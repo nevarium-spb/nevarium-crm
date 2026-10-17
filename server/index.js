@@ -34,6 +34,10 @@ await bootstrapAdmin(app.db, { log: app.log })
 startOutboxWorker(app.db, { log: app.log })
 // История входов старше 90 дней и просроченные ссылки из писем — убрать (ADR-020).
 scheduleAuthHousekeeping(app.db, { now, log: app.log })
+// Фото заявок (ADR-022): окно приёма, «📷 N фото» в мессенджеры, удаление объектов из бакета — раз в минуту.
+schedulePhotoHousekeeping(app, { log: app.log })
+// Фото заявок (ADR-022): окно приёма, «📷 N фото» в мессенджеры, удаление объектов из бакета — раз в минуту.
+schedulePhotoHousekeeping(app, { log: app.log })
 // Напоминания о конце срока тарифа (ADR-019): раз в час, каждое — один раз на срок.
 scheduleEntitlementReminders(app.db, {
   log: app.log,

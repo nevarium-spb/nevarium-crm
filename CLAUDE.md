@@ -16,8 +16,9 @@
   «заменено», план в `nevarium-lab#3`), фронт: React + react-router + Vite (`src/crm/`).
 - `node server/dev.js` — бэкенд :3001 (требует `DATABASE_URL` в окружении — SQLite-файла по
   умолчанию больше нет). `npm run dev` — фронт :5173 (прокси `/api`→:3001).
-- `npm test` — 349 тестов на `pg-mem` (`server/api.test.js`, `server/nvizor.test.js`,
-  `server/entitlements.test.js`, `server/account.test.js`, `server/lead-fields.test.js`, `src/crm/neva/parser.test.js`): 342 зелёный + 7
+- `npm test` — 378 тестов на `pg-mem` (`server/api.test.js`, `server/nvizor.test.js`,
+  `server/entitlements.test.js`, `server/account.test.js`, `server/lead-fields.test.js`, `server/photos.test.js`,
+  `src/crm/neva/parser.test.js`): 371 зелёный + 7
   намеренно пропущенных (все в `api.test.js`; сверено 2026-10-17). Пропущенные проверяют то,
   чего `pg-mem` не эмулирует: реальный откат транзакции, принадлежность запроса
   соединению (его connect() отдаёт сам пул), SQLSTATE у ошибок и ожидание блокировок.
@@ -182,8 +183,15 @@
   интерфейса). Хранятся в сделке (`deals.plan/invoice_channel/invoice_contact`, дамп v8); контакт для счёта ещё и в
   пустые `email`/`messenger` карточки («Telegram: @nick»). `invoice_contact` — ПДн: обезличивание его затирает, в
   уведомления (Telegram/MAX) — никогда; тариф — можно. Незнакомый тариф — `unknown`, кривой канал — поле отбрасывается,
-  заявка принимается всегда. Часть Б (фото) НЕ сделана: диск App Platform стирается при деплое — ждёт решения владельца
-  о хранилище (S3 Timeweb или Postgres).
+  заявка принимается всегда.
+- **Фото из заявок** (`server/photos.js`, ADR-022, задание сайта 2026-10-16, часть Б): `POST /api/leads/{request_id}/photos`
+  (сырые байты, тип по сигнатуре, ≤ 15 МБ, ≤ 10 на заявку, окно 60 минут — `lead_intake`). Файлы — в ПРИВАТНОМ бакете S3
+  Timeweb (диск App Platform стирается при деплое); в базе только описание (`lead_photos`). Фото КАК ЕСТЬ, с EXIF
+  (координаты = адрес объекта): отдаются только вошедшему сотруднику как вложение, каждое открытие — в журнал; в мессенджеры —
+  только число. Удаление: строки сразу, объекты — очередью `photo_deletions` в той же транзакции (сделка, контакт,
+  обезличивание, импорт дампа — он удаляет ВСЕ фото, id контактов после восстановления другие). Добавляя новый путь удаления
+  заявки/контакта — вызови `queuePhotoDeletion`. `S3_ENDPOINT/S3_BUCKET/S3_REGION/S3_ACCESS_KEY/S3_SECRET_KEY` — только в
+  окружении Timeweb; `PHOTO_STORAGE_LIMIT_MB` — для счётчика; проверка — `npm run test-s3`.
 - **Учётная запись и настройки** (`server/account.js`, `settings.js`, `password-policy.js`, `mailer.js`, `reset-admin.js`, ADR-020).
   Пароль — от 12 символов + локальный список частых (`server/common-passwords.txt`) при смене в профиле и по письму.
   Восстановление: ключ из письма — 32 байта, в базе SHA-256, 30 минут, одноразовый, лежит во фрагменте URL (`#t=`); ответ

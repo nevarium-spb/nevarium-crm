@@ -5,6 +5,7 @@ import { EntityModal } from '../forms.jsx'
 import { apiErrorToast, fmtMoney, onRefresh, relTime, toast } from '../ui.jsx'
 import { TariffBlock } from '../tariffs.jsx'
 import { invoiceLabel, leadPlanTitle } from '../../shared/lead-fields.js'
+import { formatBytes } from './AccountSettings.jsx'
 
 export default function ContactCard({ user }) {
   const { id } = useParams()
@@ -13,12 +14,15 @@ export default function ContactCard({ user }) {
   const [missing, setMissing] = useState(false)
   const [modal, setModal] = useState(null) // {entity, initial}
   const [tab, setTab] = useState('all')
+  const [photos, setPhotos] = useState([])
 
   const load = useCallback(() => {
     repo.contactCard(id).then(setCard).catch((err) => {
       if (err.status === 404) setMissing(true)
       else apiErrorToast(err)
     })
+    // Фото из заявок (ADR-022): список без ссылок на файлы — открывается только по кнопке, под входом.
+    api(`/crm/contacts/${id}/photos`).then((r) => setPhotos(r.items)).catch(() => setPhotos([]))
   }, [id])
   useEffect(load, [load])
   useEffect(() => onRefresh(load), [load])
@@ -146,6 +150,23 @@ export default function ContactCard({ user }) {
           <p style={{ color: 'var(--text-2)', fontSize: 14 }}>{contact.note || '—'}</p>
           <div className="crm-cap">Источник: {contact.source} · создан {relTime(contact.created_at)}</div>
         </section>
+
+        {photos.length > 0 && (
+          <section className="tile" aria-label="Фото из заявок">
+            <div className="tile-title"><span className="tile-num">▣</span><h2>Фото из заявок</h2></div>
+            {photos.map((p) => (
+              <div className="row-line" key={p.id}>
+                <div>
+                  <div className="row-name">{p.original_name || `Фото ${p.idx + 1}`}</div>
+                  <div className="row-meta">{formatBytes(p.size)} · {relTime(p.created_at)}</div>
+                </div>
+                {/* Файл отдаёт сервер только вошедшему сотруднику, как вложение; открытие пишется в журнал. */}
+                <a className="btn" href={`/api/crm/photos/${p.id}`} download>Скачать</a>
+              </div>
+            ))}
+            <div className="crm-cap">Исходные файлы без сжатия, в них могут быть координаты съёмки — это данные клиента, не пересылайте их в мессенджеры.</div>
+          </section>
+        )}
 
         {!contact.anonymized_at && <TariffBlock contactId={contact.id} />}
 
