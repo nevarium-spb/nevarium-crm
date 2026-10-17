@@ -10,6 +10,7 @@ import { registerNvizorRoutes, registerNvizorAdminRoutes, deleteNvizorFreeReport
 import { registerEntitlementRoutes, deleteEntitlementsForContact } from './entitlements.js'
 import { createMailer } from './mailer.js'
 import { registerAccountRoutes, recordLogin } from './account.js'
+import { LEAD_PLANS, INVOICE_CHANNELS, INVOICE_CONTACT_MAX, normalizeLeadPlan, normalizeInvoice, invoiceMessengerValue, invoiceLabel, leadPlanTitle } from '../src/shared/lead-fields.js'
 
 const COOKIE = 'nv_session'
 const MSK = 'Europe/Moscow'
@@ -290,7 +291,8 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // бы ВСЕ заявки разом, а не только вредные. Вместо отказа — предупреждение в лог:
   // видимость есть, приём не рвётся. Значения полей не логируем (свободный текст,
   // потенциально ПДн) — только имена ключей.
-  const LEAD_FIELDS = new Set(['name', 'contact', 'task', 'note', 'source', 'website', 'consent', 'project', 'request_id', 'scale', 'detail', 'transcript'])
+  const LEAD_FIELDS = new Set(['name', 'contact', 'task', 'note', 'source', 'website', 'consent', 'project', 'request_id', 'scale', 'detail', 'transcript',
+    'plan', 'invoice_channel', 'invoice_contact'])
   const PD_REQUEST_FIELDS = new Set(['contact', 'kind', 'note', 'website', 'project', 'request_id'])
   const CONSENT_FIELDS = new Set(['version', 'text', 'accepted_at'])
   // Ограничения на сам лог (независимая проверка, раунд 27): ключи JSON-объекта —
@@ -762,7 +764,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       fields: ['name', 'company', 'phone', 'email', 'messenger', 'note', 'source', 'suspicious', 'archived', 'project_id'],
       required: ['name'],
     },
-    deals: { fields: ['contact_id', 'title', 'stage', 'amount', 'note', 'project_id'], required: ['contact_id', 'title'] },
+    deals: { fields: ['contact_id', 'title', 'stage', 'amount', 'note', 'project_id', 'plan', 'invoice_channel', 'invoice_contact'], required: ['contact_id', 'title'] },
     tasks: { fields: ['title', 'contact_id', 'deal_id', 'due_date', 'done'], required: ['title'] },
     interactions: { fields: ['contact_id', 'deal_id', 'type', 'note', 'happened_at'], required: ['contact_id'] },
   }
@@ -900,6 +902,17 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     return out
   }
 
+  /** Тариф и счёт сделки при ручной правке: только коды из списка (src/shared/lead-fields.js). Мутирует data. */
+  function dealLeadFieldsError(data) {
+    if (data.plan !== undefined && data.plan !== null && data.plan !== '' && !LEAD_PLANS.includes(data.plan)) return 'bad_plan'
+    if (data.invoice_channel !== undefined && data.invoice_channel !== null && data.invoice_channel !== '' && !INVOICE_CHANNELS.includes(data.invoice_channel)) return 'bad_invoice_channel'
+    if (data.invoice_contact !== undefined) {
+      data.invoice_contact = trim(data.invoice_contact, INVOICE_CONTACT_MAX)
+      if (data.invoice_channel === 'email') data.invoice_contact = data.invoice_contact.toLowerCase()
+    }
+    return null
+  }
+
   for (const [name, spec] of Object.entries(ENTITIES)) {
     app.get(`/api/crm/${name}`, async (req, reply) => {
       const q = trim(req.query?.q, 100).toLowerCase()
@@ -920,6 +933,10 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       const data = pick(req.body ?? {}, spec)
       for (const f of spec.required) if (!data[f]) return reply.code(400).send({ error: `field_required`, field: f })
       if (name === 'deals' && data.stage && !STAGES.includes(data.stage)) return reply.code(400).send({ error: 'bad_stage' })
+      if (name === 'deals') {
+        const bad = dealLeadFieldsError(data)
+        if (bad) return reply.code(400).send({ error: bad })
+      }
       if (PROJECT_SCOPED.has(name) && data.project_id !== undefined) {
         const pid = await resolveProjectId(data.project_id)
         if (!pid) return reply.code(400).send({ error: 'bad_project' })
@@ -986,6 +1003,10 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       const expected = req.body?.expectedUpdatedAt
       const data = pick(req.body ?? {}, spec)
       if (name === 'deals' && data.stage && !STAGES.includes(data.stage)) return reply.code(400).send({ error: 'bad_stage' })
+      if (name === 'deals') {
+        const bad = dealLeadFieldsError(data)
+        if (bad) return reply.code(400).send({ error: bad })
+      }
       if (PROJECT_SCOPED.has(name) && data.project_id !== undefined) {
         const pid = await resolveProjectId(data.project_id)
         if (!pid) return reply.code(400).send({ error: 'bad_project' })
@@ -1214,7 +1235,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         .prepare(`SELECT stage, COUNT(*) n, SUM(COALESCE(amount,0)) sum FROM deals WHERE stage IN (${termMarks}) ${pf('AND project_id = ?')} GROUP BY stage`)
         .all(...TERMINAL_STAGES, ...arg),
       db
-        .prepare(`SELECT c.*, d.title deal_title, d.id deal_id FROM contacts c LEFT JOIN deals d ON d.contact_id = c.id AND d.stage = 'Новый' WHERE c.source IN ('site-form','site-chat') AND c.archived = 0 ${pf('AND c.project_id = ?')} ORDER BY c.created_at DESC LIMIT 8`)
+        .prepare(`SELECT c.*, d.title deal_title, d.id deal_id, d.plan deal_plan FROM contacts c LEFT JOIN deals d ON d.contact_id = c.id AND d.stage = 'Новый' WHERE c.source IN ('site-form','site-chat') AND c.archived = 0 ${pf('AND c.project_id = ?')} ORDER BY c.created_at DESC LIMIT 8`)
         .all(...arg),
       db
         // Без явного IS NOT NULL: `due_date <= ?` для NULL уже даёт NULL (не TRUE),
@@ -1752,8 +1773,9 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       // 2. Взаимодействия: текст затираем (там транскрипты переписок), но строки
       //    оставляем — по ним считается активность на дашборде
       await tx.prepare("UPDATE interactions SET note = '', updated_at = ? WHERE contact_id = ?").run(ts, contactId)
-      // 3. Сделки: заметки могут содержать ПДн, затираем; стадия и сумма остаются
-      await tx.prepare("UPDATE deals SET note = '', updated_at = ? WHERE contact_id = ?").run(ts, contactId)
+      // 3. Сделки: заметки и контакт для счёта (почта/ник/телефон — задание сайта 2026-10-16)
+      //    содержат ПДн, затираем; стадия, сумма и тариф остаются — по ним статистика
+      await tx.prepare("UPDATE deals SET note = '', invoice_channel = '', invoice_contact = '', updated_at = ? WHERE contact_id = ?").run(ts, contactId)
       // 4. Задачи удаляем целиком: во-первых, в заголовке может стоять имя, во-вторых,
       //    человек потребовал прекратить обработку — напоминание «позвонить ему» этому
       //    прямо противоречит. Вместе с ними закрываем воронку возврата.
@@ -2212,6 +2234,17 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       // сделки: так карточка сделки остаётся короткой сутью, а весь диалог всё равно
       // виден на карточке контакта. ПДн тут можно — CRM на РФ-сервере, доступ только у сотрудников.
       const transcript = isChat ? trim(b.transcript, 4000) : ''
+      // Тариф и куда прислать счёт (задание сайта Визора 2026-10-16, часть А). Незнакомый
+      // тариф — `unknown`, канал не из списка — поле отбрасывается; заявку принимаем всегда.
+      // В лог — только код тарифа/канала, не сам контакт (ПДн).
+      const leadPlan = normalizeLeadPlan(b.plan)
+      if (leadPlan.warn) app.log?.warn?.({ plan: leadPlan.warn }, 'lead: незнакомый тариф, сохраняю как unknown')
+      const invoice = normalizeInvoice(b.invoice_channel, b.invoice_contact)
+      if (invoice.warn) app.log?.warn?.({ channel: invoice.warn }, 'lead: контакт для счёта отброшен — канал не из списка или пустой контакт')
+      const invEmail = invoice.channel === 'email' ? invoice.contact : ''
+      const invMessenger = invoiceMessengerValue(invoice.channel, invoice.contact)
+      const invLine = invoice.channel ? `Счёт: ${invoiceLabel(invoice.channel, invoice.contact)}` : ''
+      const planLine = leadPlan.plan ? `Тариф: ${leadPlanTitle(leadPlan.plan)}` : ''
       // Слепок согласия (ТЗ сайта Визор, раздел «Про consent»; 152-ФЗ ст.9 в редакции
       // с 2026-09-01 требует, чтобы оператор МОГ ДОКАЗАТЬ согласие). Сайт шлёт
       // {version, text, accepted_at} в каждой заявке — сохраняем как прислано, без
@@ -2303,13 +2336,19 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         // только то, что не почта и не похоже на номер (ник, старые клиенты сайтов).
         const isEmail = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(contactInfo)
         const isPhone = !isEmail && Boolean(phoneKeyIfPlausible(contactInfo))
-        const email = isEmail ? contactInfo : ''
+        let email = isEmail ? contactInfo : ''
         const phone = isPhone ? contactInfo : ''
-        const messenger = isEmail || isPhone ? '' : contactInfo
+        let messenger = isEmail || isPhone ? '' : contactInfo
+        // Контакт для счёта — в карточку, если поле пустое; занято другим — не затираем,
+        // а дописываем в заметку заявки (задание сайта 2026-10-16, п. 2).
+        let invoiceOverflow = false
+        if (invEmail) { if (!email) email = invEmail; else if (email.toLowerCase() !== invEmail) invoiceOverflow = true }
+        if (invMessenger) { if (!messenger) messenger = invMessenger; else if (messenger !== invMessenger) invoiceOverflow = true }
+        const dealNote = invoiceOverflow ? [note, invLine].filter(Boolean).join('\n') : note
         const cid = (await tx.prepare('INSERT INTO contacts (name, email, phone, messenger, note, source, suspicious, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id')
           .run(name, email, phone, messenger, '', isChat ? 'site-chat' : 'site-form', suspicious ? 1 : 0, projectId, ts, ts)).lastInsertRowid
-        const did = (await tx.prepare('INSERT INTO deals (contact_id, title, stage, note, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id')
-          .run(cid, title, 'Новый', note, projectId, ts, ts)).lastInsertRowid
+        const did = (await tx.prepare('INSERT INTO deals (contact_id, title, stage, note, project_id, plan, invoice_channel, invoice_contact, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id')
+          .run(cid, title, 'Новый', dealNote, projectId, leadPlan.plan, invoice.channel, invoice.contact, ts, ts)).lastInsertRowid
         if (transcript) {
           await tx.prepare('INSERT INTO interactions (contact_id, type, note, happened_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(cid, 'сообщение', transcript, ts, ts, ts)
         }
@@ -2320,28 +2359,38 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         // то есть тихо потеряется — а терять заявки нам нельзя ни при каких условиях.
         if (existing.archived) await tx.prepare('UPDATE contacts SET archived = 0, updated_at = ? WHERE id = ?').run(ts, cid)
         else await tx.prepare('UPDATE contacts SET updated_at = ? WHERE id = ?').run(ts, cid)
+        // Контакт для счёта — в пустые поля карточки; занятые не трогаем (строка «Счёт:»
+        // всё равно попадает в историю ниже и в саму сделку).
+        if (invEmail && !existing.email) await tx.prepare("UPDATE contacts SET email = ? WHERE id = ? AND COALESCE(email, '') = ''").run(invEmail, cid)
+        if (invMessenger && !existing.messenger) await tx.prepare("UPDATE contacts SET messenger = ? WHERE id = ? AND COALESCE(messenger, '') = ''").run(invMessenger, cid)
 
         // Открытая сделка уже есть — значит это то же самое обращение, а не новое:
         // второй карточкой в воронке та же возможность считалась бы дважды.
         const termMarks = TERMINAL_STAGES.map(() => '?').join(',')
         const openDeal = await tx
-          .prepare(`SELECT id FROM deals WHERE contact_id = ? AND NOT (stage IN (${termMarks})) ORDER BY id DESC LIMIT 1`)
+          .prepare(`SELECT id, plan FROM deals WHERE contact_id = ? AND NOT (stage IN (${termMarks})) ORDER BY id DESC LIMIT 1`)
           .get(cid, ...TERMINAL_STAGES)
         let dealId
         if (openDeal) {
           dealId = openDeal.id
           await tx.prepare('UPDATE deals SET updated_at = ? WHERE id = ?').run(ts, dealId)
+          // Тариф и счёт в сделке — последние присланные; прежний тариф остаётся в истории.
+          if (leadPlan.plan) await tx.prepare('UPDATE deals SET plan = ? WHERE id = ?').run(leadPlan.plan, dealId)
+          if (invoice.channel) await tx.prepare('UPDATE deals SET invoice_channel = ?, invoice_contact = ? WHERE id = ?').run(invoice.channel, invoice.contact, dealId)
         } else {
           // Все сделки закрыты — человек вернулся с новой задачей, это новая сделка.
-          dealId = (await tx.prepare('INSERT INTO deals (contact_id, title, stage, note, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id')
-            .run(cid, title, 'Новый', note, projectId, ts, ts)).lastInsertRowid
+          dealId = (await tx.prepare('INSERT INTO deals (contact_id, title, stage, note, project_id, plan, invoice_channel, invoice_contact, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id')
+            .run(cid, title, 'Новый', note, projectId, leadPlan.plan, invoice.channel, invoice.contact, ts, ts)).lastInsertRowid
         }
+        const prevPlan = openDeal?.plan && leadPlan.plan && openDeal.plan !== leadPlan.plan ? `(в сделке был тариф: ${leadPlanTitle(openDeal.plan)})` : ''
 
         // Повторное обращение записываем в историю целиком: заголовок и заметка
         // новой заявки иначе потерялись бы, ведь сделку мы переиспользовали.
         const lines = [
           openDeal ? 'Повторная заявка (сделка уже в работе)' : 'Клиент вернулся с новой заявкой',
           title ? `Задача: ${title}` : '',
+          planLine ? `${planLine}${prevPlan ? ` ${prevPlan}` : ''}` : '',
+          invLine,
           note ? `Заметка: ${note}` : '',
           `Источник: ${isChat ? 'чат Невы' : 'форма на сайте'}`,
         ].filter(Boolean).join('\n')
@@ -2398,6 +2447,8 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
           // repeat/returned — не ПДн: это про историю обращения, а не про человека
           repeat: Boolean(inner.repeat),
           returned: Boolean(inner.returned),
+          // Код тарифа — не ПДн (задание сайта 2026-10-16, п. 4); контакт для счёта — НИКОГДА.
+          plan: leadPlan.plan,
         })
       }
       if (!(await idempotencyFinish(claim.id, 204, tx))) throw new IdempotencyLost()

@@ -1,6 +1,7 @@
 import { now } from './db.js'
 import { withTransaction, maintenanceBarrier } from './db-adapter.js'
 import { loadSettingsSafe, DEFAULTS } from './settings.js'
+import { leadPlanTitle } from '../src/shared/lead-fields.js'
 
 const MAX_API = 'https://platform-api2.max.ru'
 
@@ -58,6 +59,8 @@ export function leadMessage(lead, env = process.env) {
     `${leadHeader(lead)}${lead.suspicious ? ' ⚠️ подозрительная' : ''}`,
     lead.projectName ? `Проект: <b>${esc(lead.projectName)}</b>` : null,
     lead.source ? `Источник: ${esc(lead.source)}` : null,
+    // Тариф — не ПДн (задание сайта 2026-10-16); контакт для счёта сюда не попадает никогда.
+    lead.plan ? `Тариф: ${esc(leadPlanTitle(lead.plan))}` : null,
     link ? `Открыть: ${esc(link)}` : 'Детали — в CRM, карточка заявки',
   ]
   return lines.filter(Boolean).join('\n')

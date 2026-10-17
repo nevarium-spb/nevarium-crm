@@ -110,6 +110,14 @@ CREATE TABLE IF NOT EXISTS deals (
   created_by INTEGER
 );
 
+-- Тариф и куда прислать счёт — из заявки сайта Визора (задание сайта 2026-10-16, часть А;
+-- коды и нормализация — src/shared/lead-fields.js). Пустая строка — поле не приходило.
+-- invoice_contact — ПДн: затирается обезличиванием вместе с invoice_channel; plan остаётся,
+-- как стадия и сумма. Отдельными ALTER: на боевой базе таблица уже есть.
+ALTER TABLE deals ADD COLUMN IF NOT EXISTS plan TEXT DEFAULT '';
+ALTER TABLE deals ADD COLUMN IF NOT EXISTS invoice_channel TEXT DEFAULT '';
+ALTER TABLE deals ADD COLUMN IF NOT EXISTS invoice_contact TEXT DEFAULT '';
+
 CREATE TABLE IF NOT EXISTS winback_sequences (
   id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   deal_id INTEGER NOT NULL REFERENCES deals(id),

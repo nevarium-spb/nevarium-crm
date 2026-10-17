@@ -294,6 +294,20 @@
 .deal-title { font-weight: 600; margin-bottom: 2px; }
 .deal-meta { color: var(--text-3); font-size: 12px; display: flex; justify-content: space-between; gap: 8px; }
 .deal-amount { color: var(--text-2); font-variant-numeric: tabular-nums; }
+.deal-plan { color: var(--text-2); font-size: 12px; margin-top: 4px; }
+/* Фильтр по тарифу в шапке канбана — вровень с переключателем проекта (.proj-filter). */
+.crm-select {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  color: var(--text-1);
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 12px;
+  min-height: 44px;
+  max-width: 100%;
+}
+.crm-select:focus { border-color: rgba(47, 107, 255, 0.55); outline: none; }
 .deal-move {
   position: absolute;
   top: 7px;

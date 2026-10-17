@@ -455,7 +455,7 @@ describe('152-ФЗ, дамп, напоминания', () => {
   it('экспорт → импорт сохраняет тарифы; старый дамп без них их чистит и не падает на FK', async () => {
     await seeded()
     const dump = (await crm('GET', '/api/crm/export')).json()
-    expect(dump.version).toBe(7)
+    expect(dump.version).toBe(8)
     expect((await crm('POST', '/api/crm/import', dump)).statusCode).toBe(200)
     expect(await counts()).toEqual({ entitlements: 1, entitlement_checks: 1, client_links: 1 })
     const old = { ...dump, version: 5 }

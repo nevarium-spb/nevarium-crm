@@ -4,6 +4,7 @@ import { api, repo } from '../api.js'
 import { EntityModal } from '../forms.jsx'
 import { apiErrorToast, fmtMoney, onRefresh, relTime, toast } from '../ui.jsx'
 import { TariffBlock } from '../tariffs.jsx'
+import { invoiceLabel, leadPlanTitle } from '../../shared/lead-fields.js'
 
 export default function ContactCard({ user }) {
   const { id } = useParams()
@@ -63,8 +64,8 @@ export default function ContactCard({ user }) {
   const anonymize = async () => {
     if (!window.confirm(
       `Обезличить контакт «${contact.name}»?\n\n`
-      + 'Будут стёрты: имя, компания, телефон, почта, мессенджер, заметки, тексты действий и переписка с чатом.\n'
-      + 'Останутся: сделки со стадиями и суммами (для статистики), даты действий.\n'
+      + 'Будут стёрты: имя, компания, телефон, почта, мессенджер, контакт для счёта, заметки, тексты действий и переписка с чатом.\n'
+      + 'Останутся: сделки со стадиями, суммами и тарифом (для статистики), даты действий.\n'
       + 'Задачи по этому контакту будут удалены, напоминания воронки возврата отменены.\n\n'
       + 'Отменить это будет НЕЛЬЗЯ.'
     )) return
@@ -119,6 +120,13 @@ export default function ContactCard({ user }) {
               <div>
                 <div className="row-name">{d.title}</div>
                 <div className="row-meta">{d.stage}{d.note ? ` · ${d.note.slice(0, 80)}` : ''}</div>
+                {(d.plan || d.invoice_channel) && (
+                  <div className="row-meta">
+                    {d.plan ? `Тариф: ${leadPlanTitle(d.plan)}` : ''}
+                    {d.plan && d.invoice_channel ? ' · ' : ''}
+                    {d.invoice_channel ? `Счёт: ${invoiceLabel(d.invoice_channel, d.invoice_contact)}` : ''}
+                  </div>
+                )}
               </div>
               <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <span className="deal-amount">{fmtMoney(d.amount)}</span>

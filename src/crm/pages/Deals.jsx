@@ -6,6 +6,7 @@ import { STAGES, TERMINAL_STAGES as TERMINAL } from '../../shared/stages.js'
 import { ProjectBadge, ProjectFilter, useProjectFilter } from '../projects.jsx'
 import { Modal, apiErrorToast, fmtMoney, onRefresh, toast } from '../ui.jsx'
 import { TariffBadge, useTariffBadges } from '../tariffs.jsx'
+import { LEAD_PLANS, leadPlanTitle } from '../../shared/lead-fields.js'
 
 const LOST = 'Проиграно'
 
@@ -59,6 +60,7 @@ export default function Deals() {
   const [lostFor, setLostFor] = useState(null) // {deal, stage} — диалог причины отказа
   const dragId = useRef(null)
   const [project, setProject] = useProjectFilter()
+  const [planFilter, setPlanFilter] = useState('') // '' — все; 'none' — без тарифа; иначе код
   const tariffs = useTariffBadges()
 
   // Считаем запросы: при быстром переключении проекта ответы могут прийти не по
@@ -132,21 +134,29 @@ export default function Deals() {
       </>
     )
 
+  // Фильтр по тарифу из заявки (задание сайта 2026-10-16) — на клиенте: список сделок уже здесь.
+  const shown = planFilter ? deals.filter((d) => (planFilter === 'none' ? !d.plan : d.plan === planFilter)) : deals
+
   return (
     <>
       <div className="crm-head">
         <div>
           <h1 className="crm-h1">Сделки</h1>
-          <div className="crm-sub">{deals.filter((d) => !TERMINAL.includes(d.stage)).length} в работе · {fmtMoney(deals.filter((d) => !TERMINAL.includes(d.stage)).reduce((s, d) => s + (d.amount || 0), 0))}</div>
+          <div className="crm-sub">{shown.filter((d) => !TERMINAL.includes(d.stage)).length} в работе · {fmtMoney(shown.filter((d) => !TERMINAL.includes(d.stage)).reduce((s, d) => s + (d.amount || 0), 0))}</div>
         </div>
         <div className="crm-head-actions">
+          <select className="crm-select" value={planFilter} onChange={(e) => setPlanFilter(e.target.value)} aria-label="Фильтр по тарифу">
+            <option value="">Все тарифы</option>
+            {LEAD_PLANS.map((p) => <option key={p} value={p}>{leadPlanTitle(p)}</option>)}
+            <option value="none">Без тарифа</option>
+          </select>
           <ProjectFilter value={project} onChange={setProject} />
           <button className="btn primary" onClick={() => setModal({ initial: {} })}>+ Сделка</button>
         </div>
       </div>
       <div className="kanban">
         {STAGES.map((stage) => {
-          const col = deals.filter((d) => d.stage === stage)
+          const col = shown.filter((d) => d.stage === stage)
           const sum = col.reduce((s, d) => s + (d.amount || 0), 0)
           return (
             <div
@@ -174,6 +184,7 @@ export default function Deals() {
                     <span className="deal-amount">{fmtMoney(deal.amount)}</span>
                   </div>
                   <ProjectBadge id={deal.project_id} when={project === 'all'} />
+                  {deal.plan && <div className="deal-plan">Тариф: {leadPlanTitle(deal.plan)}</div>}
                   {tariffs[deal.contact_id] && <div style={{ marginTop: 6 }}><TariffBadge badge={tariffs[deal.contact_id]} /></div>}
                   <button
                     className="deal-move"

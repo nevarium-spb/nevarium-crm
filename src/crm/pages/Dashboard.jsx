@@ -4,6 +4,7 @@ import { repo } from '../api.js'
 import { EntityModal } from '../forms.jsx'
 import { ProjectBadge, ProjectFilter, shortProject, useProjectFilter } from '../projects.jsx'
 import { SOURCE_LABEL, apiErrorToast, fmtMoney, onRefresh, relTime } from '../ui.jsx'
+import { leadPlanTitle } from '../../shared/lead-fields.js'
 
 const GREETINGS = [
   [5, 'Доброе утро'],
@@ -94,7 +95,7 @@ export default function Dashboard() {
               <div>
                 <div className="row-name"><Link to={`/crm/contacts/${lead.id}`}>{lead.name}{lead.company ? ` · ${lead.company}` : ''}</Link></div>
                 <div className="row-meta">
-                  {lead.deal_title || 'без сделки'} · {lead.source === 'site-chat' ? 'из чата Невы' : 'с сайта'}, {relTime(lead.created_at)}
+                  {lead.deal_title || 'без сделки'}{lead.deal_plan ? ` · ${leadPlanTitle(lead.deal_plan)}` : ''} · {lead.source === 'site-chat' ? 'из чата Невы' : 'с сайта'}, {relTime(lead.created_at)}
                 </div>
               </div>
               <span className="row-badges">
