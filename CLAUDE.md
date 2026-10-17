@@ -16,9 +16,9 @@
   «заменено», план в `nevarium-lab#3`), фронт: React + react-router + Vite (`src/crm/`).
 - `node server/dev.js` — бэкенд :3001 (требует `DATABASE_URL` в окружении — SQLite-файла по
   умолчанию больше нет). `npm run dev` — фронт :5173 (прокси `/api`→:3001).
-- `npm test` — 378 тестов на `pg-mem` (`server/api.test.js`, `server/nvizor.test.js`,
+- `npm test` — 380 тестов на `pg-mem` (`server/api.test.js`, `server/nvizor.test.js`,
   `server/entitlements.test.js`, `server/account.test.js`, `server/lead-fields.test.js`, `server/photos.test.js`,
-  `src/crm/neva/parser.test.js`): 371 зелёный + 7
+  `src/crm/neva/parser.test.js`): 373 зелёный + 7
   намеренно пропущенных (все в `api.test.js`; сверено 2026-10-17). Пропущенные проверяют то,
   чего `pg-mem` не эмулирует: реальный откат транзакции, принадлежность запроса
   соединению (его connect() отдаёт сам пул), SQLSTATE у ошибок и ожидание блокировок.

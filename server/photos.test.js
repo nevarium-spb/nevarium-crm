@@ -334,6 +334,22 @@ describe('удаление: строка и объект не расходятс
     expect(await count('photo_deletions')).toBe(0)
   })
 
+  it('сделка с записью о повторной заявке удаляется: история по контакту остаётся, ссылка на сделку рвётся (раньше — 500 по FK)', async () => {
+    const phone = '+79990000000'
+    const first = await lead({ contact: phone, plan: 'stage' })
+    await photo(first.request_id, jpeg(64, 1), { idx: 0 })
+    await lead({ contact: phone, plan: 'house' }) // тот же человек → «Повторная заявка» → interactions.deal_id
+    const deal = await one('SELECT id, contact_id FROM deals')
+    const before = await all('SELECT id, deal_id FROM interactions WHERE deal_id IS NOT NULL')
+    expect(before.length).toBeGreaterThan(0)
+    expect((await crm('DELETE', `/api/crm/deals/${deal.id}`)).statusCode).toBe(200)
+    const after = await all('SELECT id, deal_id FROM interactions')
+    expect(after.length).toBe(before.length)
+    expect(after.every((r) => r.deal_id === null)).toBe(true)
+    expect(await count('lead_photos')).toBe(0)
+    expect((await crm('DELETE', `/api/crm/contacts/${deal.contact_id}`)).statusCode).toBe(200)
+  })
+
   it('хранилище недоступно при удалении — строка уже не видна, объект ждёт в очереди и удаляется позже', async () => {
     await leadWithPhotos(1)
     const deal = await one('SELECT id FROM deals')

@@ -1182,6 +1182,10 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
           await queuePhotoDeletion(tx, { dealId: id }, now())
           await tx.prepare('DELETE FROM lead_intake WHERE deal_id = ?').run(id)
           await tx.prepare('UPDATE tasks SET deal_id = NULL WHERE deal_id = ?').run(id)
+          // История по контакту сохраняется («Действия по контакту сохранятся» в окне подтверждения) — только
+          // рвём ссылку. Без этого сделка с записью о повторной заявке (interactions.deal_id) не удалялась: 500
+          // по внешнему ключу interactions_deal_id_fkey (найдено при проверке удаления фото на настоящем Postgres).
+          await tx.prepare('UPDATE interactions SET deal_id = NULL WHERE deal_id = ?').run(id)
           // Согласие живёт независимо от сделки (contact_id — основная связь) — только
           // рвём ставшую невалидной ссылку, тем же приёмом, что и у tasks.deal_id выше.
           await tx.prepare('UPDATE consents SET deal_id = NULL WHERE deal_id = ?').run(id)
