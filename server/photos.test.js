@@ -9,7 +9,7 @@ import { hashPassword, resetThrottle } from './auth.js'
 import { now } from './db.js'
 import { PHOTO_MAX_BYTES, createS3, sniffImage } from './photos.js'
 import { checkS3, describeS3Config, explainS3Error } from './test-s3.js'
-import { checkMax, checkTelegram, describeNotifyConfig } from './test-notify.js'
+import { checkMax, checkTelegram, describeNotifyConfig, discoverMaxChats } from './test-notify.js'
 import { channelError, sendMax, sendTelegram } from './telegram.js'
 
 const JPEG_HEAD = [0xff, 0xd8, 0xff, 0xe0]
@@ -210,6 +210,33 @@ describe('уведомления: понятные ошибки и test-notify',
     const never = async () => { throw new Error('в сеть ходить не должны') }
     expect((await checkMax({}, never))[0].error).toContain('MAX_BOT_TOKEN, MAX_CHAT_ID')
     expect((await checkMax({ MAX_BOT_TOKEN: 't', MAX_CHAT_ID: 'https://max.ru/join/abc' }, never))[0].error).toContain('числом')
+  })
+
+  it('MAX: поиск chat_id в событиях бота — из bot_started, message_created, bot_added; текст сообщений не читается', async () => {
+    const updates = {
+      updates: [
+        { update_type: 'bot_started', chat_id: 111222333, user: { user_id: 5, first_name: 'Секрет' } },
+        { update_type: 'message_created', message: { recipient: { chat_id: 111222333, chat_type: 'dialog' }, sender: { first_name: 'Секрет' }, body: { text: 'очень личный текст' } } },
+        { update_type: 'bot_added', chat_id: -71234567890, user: { user_id: 5 } },
+        { update_type: 'message_callback', callback: { message: { recipient: { chat_id: 999 } } } },
+        { update_type: 'bot_removed', chat_id: 'не число' },
+      ],
+    }
+    const calls = []
+    const res = await discoverMaxChats({ MAX_BOT_TOKEN: 'tok' }, async (url, init) => { calls.push([String(url), init.headers.Authorization]); return reply(200, updates) })
+    expect(res.chats.map((c) => c.chatId).sort()).toEqual(['-71234567890', '111222333', '999'])
+    expect(res.chats.find((c) => c.chatId === '111222333').via).toBe('bot_started, message_created')
+    expect(JSON.stringify(res)).not.toMatch(/Секрет|личный текст/)
+    expect(calls[0][0]).toContain('/updates?')
+    expect(calls[0][0]).not.toContain('tok')
+    expect(calls[0][1]).toBe('tok')
+  })
+
+  it('MAX: поиск chat_id — событий нет, токен не принят, токен не задан, обрыв связи', async () => {
+    expect((await discoverMaxChats({ MAX_BOT_TOKEN: 't' }, async () => reply(200, { updates: [] }))).chats).toEqual([])
+    expect((await discoverMaxChats({ MAX_BOT_TOKEN: 't' }, async () => reply(401, '{}'))).error).toContain('401')
+    expect((await discoverMaxChats({}, async () => { throw new Error('нельзя') })).error).toContain('MAX_BOT_TOKEN')
+    expect((await discoverMaxChats({ MAX_BOT_TOKEN: 't' }, async () => { throw new Error('обрыв') })).error).toContain('обрыв')
   })
 
   it('Telegram: полный путь и отказ по чату', async () => {

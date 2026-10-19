@@ -88,6 +88,40 @@ export async function checkMax(env = process.env, fetchImpl = fetch) {
   return steps
 }
 
+/**
+ * MAX: какие чаты видит бот. Список чатов у MAX отключён, поэтому идентификатор берём из событий бота (GET /updates):
+ * нажали «Начать» в боте, написали ему или добавили его в чат — в событии есть числовой chat_id. Текст сообщений
+ * НЕ читаем и не выводим — только идентификатор и тип события. Возвращает { chats: [{chatId, via}], error? }.
+ */
+export async function discoverMaxChats(env = process.env, fetchImpl = fetch) {
+  const token = String(env.MAX_BOT_TOKEN || '').trim()
+  if (!token) return { chats: [], error: 'MAX_BOT_TOKEN не задан' }
+  const url = new URL(`${MAX_API}/updates`)
+  url.searchParams.set('limit', '100')
+  url.searchParams.set('timeout', '5')
+  let res
+  try {
+    res = await fetchImpl(url, { headers: { Authorization: token }, signal: AbortSignal.timeout(20_000) })
+  } catch (err) {
+    return { chats: [], error: `не удалось связаться с MAX: ${err?.message || err}` }
+  }
+  if (res.status === 401) return { chats: [], error: 'MAX не принял токен (401): проверьте MAX_BOT_TOKEN' }
+  if (!res.ok) return { chats: [], error: String((await channelError('MAX', res)).message) }
+  const body = await jsonOrNull(res)
+  const seen = new Map()
+  for (const u of body?.updates || []) {
+    const via = String(u?.update_type || u?.type || 'событие')
+    const ids = [u?.chat_id, u?.message?.recipient?.chat_id, u?.callback?.message?.recipient?.chat_id]
+    for (const id of ids) {
+      if (id === undefined || id === null || !/^-?\d+$/.test(String(id))) continue
+      const key = String(id)
+      if (!seen.has(key)) seen.set(key, new Set())
+      seen.get(key).add(via)
+    }
+  }
+  return { chats: [...seen].map(([chatId, vias]) => ({ chatId, via: [...vias].join(', ') })) }
+}
+
 /** Telegram: токен → чат → тестовое сообщение. */
 export async function checkTelegram(env = process.env, fetchImpl = fetch) {
   const token = String(env.TG_BOT_TOKEN || '').trim()
@@ -150,6 +184,20 @@ if (isMain) {
     return code
   }
   let code = 0
+  // `npm run test-notify max ids` — найти chat_id: сначала нажмите «Начать» в боте и напишите ему слово (или добавьте бота в чат).
+  if (which === 'max' && String(process.argv[3] || '').toLowerCase() === 'ids') {
+    const found = await discoverMaxChats()
+    console.log('\n=== MAX: какие чаты видит бот ===')
+    if (found.error) { console.error(`  ${found.error}`); process.exit(1) }
+    if (!found.chats.length) {
+      console.log('  Событий нет. Откройте бота в MAX, нажмите «Начать» и напишите ему любое слово (либо добавьте бота в чат и напишите там),')
+      console.log('  затем сразу повторите эту команду — события хранятся недолго.')
+      process.exit(1)
+    }
+    for (const c of found.chats) console.log(`  chat_id: ${c.chatId}   (событие: ${c.via})`)
+    console.log('\n  Это значение — в MAX_CHAT_ID (настройки приложения Timeweb). Потом перезапустите приложение и выполните `npm run test-notify max`.')
+    process.exit(0)
+  }
   if (which === 'all' || which === 'max') code |= await run('MAX', cfg.max, () => checkMax())
   if (which === 'all' || which === 'tg' || which === 'telegram') code |= await run('Telegram', cfg.tg, () => checkTelegram())
   if (!['all', 'max', 'tg', 'telegram'].includes(which)) { console.error('Использование: npm run test-notify [max|tg]'); code = 1 }
