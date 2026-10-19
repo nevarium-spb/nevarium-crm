@@ -15,7 +15,8 @@
     "reset-admin": "node server/reset-admin.js",
     "change-email": "node server/change-email.js",
     "test-mail": "node server/test-mail.js",
-    "test-s3": "node server/test-s3.js"
+    "test-s3": "node server/test-s3.js",
+    "test-notify": "node server/test-notify.js"
   },
   "dependencies": {
     "@fastify/cookie": "^11.1.1",

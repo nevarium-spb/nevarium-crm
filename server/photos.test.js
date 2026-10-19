@@ -9,6 +9,8 @@ import { hashPassword, resetThrottle } from './auth.js'
 import { now } from './db.js'
 import { PHOTO_MAX_BYTES, createS3, sniffImage } from './photos.js'
 import { checkS3, describeS3Config, explainS3Error } from './test-s3.js'
+import { checkMax, checkTelegram, describeNotifyConfig } from './test-notify.js'
+import { channelError, sendMax, sendTelegram } from './telegram.js'
 
 const JPEG_HEAD = [0xff, 0xd8, 0xff, 0xe0]
 const jpeg = (n = 64, fill = 7) => Buffer.concat([Buffer.from(JPEG_HEAD), Buffer.alloc(n - 4, fill)])
@@ -122,6 +124,102 @@ describe('клиент S3: запросы подписаны, секрет не 
     const s3c = createS3({})
     expect(s3c.configured).toBe(false)
     await expect(s3c.put('k', jpeg(), 'image/jpeg')).rejects.toMatchObject({ code: 'S3_NOT_CONFIGURED' })
+  })
+})
+
+// Уведомления о заявках (MAX/Telegram): ошибка отправки обязана нести объяснение сервиса, а `npm run test-notify` —
+// говорить по шагам, что не так. Раньше в журнале было только «MAX HTTP 400» — без причины.
+describe('уведомления: понятные ошибки и test-notify', () => {
+  const reply = (status, body) => ({ ok: status < 400, status, text: async () => (typeof body === 'string' ? body : JSON.stringify(body)), json: async () => (typeof body === 'string' ? JSON.parse(body) : body) })
+  const env = { MAX_BOT_TOKEN: 'max-secret-token', MAX_CHAT_ID: '-71234567890', TG_BOT_TOKEN: '123:tg-secret', TG_CHAT_ID: '-100555' }
+  const route = (table) => async (url, init) => {
+    const u = String(url)
+    // По концу пути, а не по подстроке: «/me» входит в «/messages», и запрос попадал бы не в тот обработчик.
+    const path = new URL(u).pathname
+    const hit = Object.entries(table).find(([k]) => (k.endsWith('/') ? path.includes(k) : path.endsWith(k)))
+    if (!hit) throw new Error(`неожиданный запрос: ${u}`)
+    return typeof hit[1] === 'function' ? hit[1](u, init) : hit[1]
+  }
+
+  it('ошибка отправки: статус и текст ответа сервиса, без токена; длинный ответ обрезается', async () => {
+    const e = await channelError('MAX', reply(400, '{"code":"proto.payload","message":"chat.not.found"}'))
+    expect(e.message).toBe('MAX HTTP 400: {"code":"proto.payload","message":"chat.not.found"}')
+    expect(e.status).toBe(400)
+    expect((await channelError('MAX', reply(500, 'x'.repeat(5000)))).message.length).toBeLessThan(260)
+    expect((await channelError('MAX', { status: 502, text: async () => { throw new Error('обрыв') } })).message).toBe('MAX HTTP 502')
+    await expect(sendMax('текст', env, async () => reply(400, 'chat.not.found'))).rejects.toThrow('MAX HTTP 400: chat.not.found')
+    await expect(sendTelegram('текст', env, async () => reply(400, '{"description":"chat not found"}'))).rejects.toThrow('chat not found')
+    // токен в сообщение не попадает
+    const err = await sendMax('текст', env, async () => reply(400, 'chat.not.found')).catch((x) => x)
+    expect(err.message).not.toContain('max-secret-token')
+  })
+
+  it('настройки без секретов: только «задан» и длина', () => {
+    const cfg = describeNotifyConfig(env)
+    expect(cfg.max).toMatchObject({ tokenSet: true, tokenLength: 16, chatId: '-71234567890' })
+    expect(JSON.stringify(cfg)).not.toContain('secret')
+    expect(describeNotifyConfig({}).max.tokenSet).toBe(false)
+  })
+
+  it('MAX: всё в порядке — токен, чат, тестовое сообщение; в запросах токен только в заголовке', async () => {
+    const calls = []
+    const f = route({
+      '/me': (u, i) => { calls.push(['me', i.headers.Authorization]); return reply(200, { first_name: 'Невариум', username: 'nevarium_bot', is_bot: true }) },
+      '/chats/-71234567890': () => reply(200, { type: 'chat', status: 'active', title: 'Заявки', participants_count: 3 }),
+      '/messages': (u, i) => { calls.push(['msg', u, JSON.parse(i.body)]); return reply(200, { message: {} }) },
+    })
+    const steps = await checkMax(env, f)
+    expect(steps.map((s) => [s.name, s.ok])).toEqual([['настройки', true], ['токен бота', true], ['чат', true], ['тестовое сообщение', true]])
+    expect(steps[1].info).toContain('@nevarium_bot')
+    expect(steps[2].info).toContain('Заявки')
+    expect(calls[0][1]).toBe('max-secret-token')
+    expect(calls[1][1]).toContain('chat_id=-71234567890')
+    expect(calls[1][1]).not.toContain('max-secret-token')
+    expect(calls[1][2]).toMatchObject({ format: 'html' })
+    expect(calls[1][2].text).not.toMatch(/\+7|@|ФИО/)
+  })
+
+  it('MAX: токен не принят (401) — остановка на этом шаге с подсказкой', async () => {
+    const steps = await checkMax(env, route({ '/me': reply(401, '{"message":"Invalid access_token"}') }))
+    expect(steps.map((s) => [s.name, s.ok])).toEqual([['настройки', true], ['токен бота', false]])
+    expect(steps[1].hint).toContain('MAX_BOT_TOKEN')
+  })
+
+  it('MAX: чат не найден — понятная причина и подсказка про добавление бота; сообщение не отправляется', async () => {
+    let sent = false
+    const f = route({ '/me': reply(200, { first_name: 'Б' }), '/chats/': reply(400, '{"code":"chat.not.found"}'), '/messages': () => { sent = true; return reply(200, {}) } })
+    const steps = await checkMax(env, f)
+    expect(steps.at(-1)).toMatchObject({ name: 'чат', ok: false })
+    expect(steps.at(-1).error).toContain('chat.not.found')
+    expect(steps.at(-1).hint).toContain('добавьте бота')
+    expect(sent).toBe(false)
+  })
+
+  it('MAX: бота из чата убрали (status removed) — подсказка создать чат заново; чат активен, но сообщение отклонено — текст отказа', async () => {
+    const removed = route({ '/me': reply(200, { first_name: 'Б' }), '/chats/': reply(200, { type: 'chat', status: 'removed', title: 'Старый' }) })
+    const a = await checkMax(env, removed)
+    expect(a.at(-1)).toMatchObject({ name: 'чат', ok: false })
+    expect(a.at(-1).error).toContain('removed')
+    const rejected = route({ '/me': reply(200, { first_name: 'Б' }), '/chats/': reply(200, { type: 'chat', status: 'active' }), '/messages': reply(400, '{"message":"text.invalid"}') })
+    const b = await checkMax(env, rejected)
+    expect(b.at(-1)).toMatchObject({ name: 'тестовое сообщение', ok: false })
+    expect(b.at(-1).error).toContain('text.invalid')
+  })
+
+  it('MAX: не заданы настройки или chat_id не число — без единого запроса в сеть', async () => {
+    const never = async () => { throw new Error('в сеть ходить не должны') }
+    expect((await checkMax({}, never))[0].error).toContain('MAX_BOT_TOKEN, MAX_CHAT_ID')
+    expect((await checkMax({ MAX_BOT_TOKEN: 't', MAX_CHAT_ID: 'https://max.ru/join/abc' }, never))[0].error).toContain('числом')
+  })
+
+  it('Telegram: полный путь и отказ по чату', async () => {
+    const ok = route({ '/getMe': reply(200, { result: { username: 'nv_bot' } }), '/getChat': reply(200, { result: { type: 'group', title: 'Заявки' } }), '/sendMessage': reply(200, { ok: true }) })
+    expect((await checkTelegram(env, ok)).every((s) => s.ok)).toBe(true)
+    const bad = route({ '/getMe': reply(200, { result: { username: 'nv_bot' } }), '/getChat': reply(400, '{"description":"Bad Request: chat not found"}') })
+    const steps = await checkTelegram(env, bad)
+    expect(steps.at(-1)).toMatchObject({ name: 'чат', ok: false })
+    expect(steps.at(-1).error).toContain('chat not found')
+    expect((await checkTelegram({}, async () => { throw new Error('нельзя') }))[0].error).toContain('TG_BOT_TOKEN, TG_CHAT_ID')
   })
 })
 

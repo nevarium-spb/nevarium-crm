@@ -3,7 +3,7 @@ import { withTransaction, maintenanceBarrier } from './db-adapter.js'
 import { loadSettingsSafe, DEFAULTS } from './settings.js'
 import { leadPlanTitle } from '../src/shared/lead-fields.js'
 
-const MAX_API = 'https://platform-api2.max.ru'
+export const MAX_API = 'https://platform-api2.max.ru'
 
 // Outbox: уведомление переживает падение канала отправки — запись ретраится
 // каждые ~30 c, до 20 попыток (~10 минут) на каждый канал (Telegram, MAX) отдельно.
@@ -12,35 +12,48 @@ export async function enqueue(db, kind, payload) {
   await db.prepare('INSERT INTO outbox (kind, payload, created_at) VALUES (?, ?, ?)').run(kind, JSON.stringify(payload), now())
 }
 
-export async function sendTelegram(text, env = process.env) {
+/**
+ * Ошибка отправки с объяснением от самого сервиса: «HTTP 400» без текста не говорит, что не так (неверный чат,
+ * бот не в чате, битая разметка). Тело ответа — короткое описание ошибки, в нём нет ни токена, ни адреса запроса.
+ */
+export async function channelError(name, res) {
+  let detail = ''
+  try { detail = (await res.text()).replace(/\s+/g, ' ').trim().slice(0, 200) } catch { /* тело не прочиталось — обойдёмся статусом */ }
+  const err = new Error(`${name} HTTP ${res.status}${detail ? `: ${detail}` : ''}`)
+  err.status = res.status
+  err.detail = detail
+  return err
+}
+
+export async function sendTelegram(text, env = process.env, fetchImpl = fetch) {
   const token = env.TG_BOT_TOKEN
   const chatId = env.TG_CHAT_ID
   if (!token || !chatId) throw new Error('TG_BOT_TOKEN/TG_CHAT_ID не заданы')
-  const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+  const res = await fetchImpl(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' }),
     signal: AbortSignal.timeout(10_000),
   })
-  if (!res.ok) throw new Error(`Telegram HTTP ${res.status}`)
+  if (!res.ok) throw await channelError('Telegram', res)
 }
 
 // MAX Bot API: platform-api2.max.ru, POST /messages?chat_id=…, токен — в заголовке
 // Authorization (без "Bearer"), format: 'html' поддерживает те же теги, что мы уже
 // экранируем в leadMessage(). Источник — исходники клиента max-messenger/max-bot-api-client-ts.
-export async function sendMax(text, env = process.env) {
+export async function sendMax(text, env = process.env, fetchImpl = fetch) {
   const token = env.MAX_BOT_TOKEN
   const chatId = env.MAX_CHAT_ID
   if (!token || !chatId) throw new Error('MAX_BOT_TOKEN/MAX_CHAT_ID не заданы')
   const url = new URL(`${MAX_API}/messages`)
   url.searchParams.set('chat_id', chatId)
-  const res = await fetch(url, {
+  const res = await fetchImpl(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json', Authorization: token },
     body: JSON.stringify({ text, format: 'html' }),
     signal: AbortSignal.timeout(10_000),
   })
-  if (!res.ok) throw new Error(`MAX HTTP ${res.status}`)
+  if (!res.ok) throw await channelError('MAX', res)
 }
 
 /**
