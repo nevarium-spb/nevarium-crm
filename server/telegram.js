@@ -123,8 +123,10 @@ export function startOutboxWorker(db, { intervalMs = 30_000, senders = { tg: sen
           // Канал выключен: НЕ копим очередь, иначе при включении на человека высыплется всё
           // накопленное. Помечаем строки «закрытыми» с понятной причиной — в диагностике они
           // не висят «в очереди», а в базе видно, что не отправлялись.
-          await db.prepare(`UPDATE outbox SET ${channel.sentCol} = ?, ${channel.errorCol} = ? WHERE ${channel.sentCol} IS NULL`)
+          const closed = await db.prepare(`UPDATE outbox SET ${channel.sentCol} = ?, ${channel.errorCol} = ? WHERE ${channel.sentCol} IS NULL`)
             .run(now(), 'канал отключён в настройках — не отправлялось')
+          // Видно в «Логах приложения»: иначе «уведомление не пришло» неотличимо от «канал выключен».
+          if (closed?.changes) log.info?.(`outbox[${channel.name}]: канал отключён в «Настройках» — закрыто без отправки: ${closed.changes}`)
           continue
         }
         const rows = await db
@@ -166,6 +168,8 @@ export function startOutboxWorker(db, { intervalMs = 30_000, senders = { tg: sen
             if (text === null || text === undefined) continue
             await send(text)
             await db.prepare(`UPDATE outbox SET ${channel.sentCol} = ? WHERE id = ?`).run(now(), row.id)
+            // Успех тоже пишем (раньше молчали): по журналу видно, что сервис принял сообщение, а не «ничего не было».
+            log.info?.(`outbox[${channel.name}]: #${row.id} отправлено`)
           } catch (err) {
             await db.prepare(`UPDATE outbox SET ${channel.attemptsCol} = ${channel.attemptsCol} + 1, ${channel.errorCol} = ? WHERE id = ?`).run(String(err), row.id)
             log.warn?.(`outbox[${channel.name}]: попытка ${row[channel.attemptsCol] + 1} для #${row.id} не удалась: ${err}`)
