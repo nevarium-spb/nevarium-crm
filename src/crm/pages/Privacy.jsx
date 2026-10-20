@@ -273,6 +273,7 @@ const ACTION_LABEL = {
   update: 'изменено',
   delete: 'удалено',
   anonymize: 'обезличено',
+  merge: 'карточки объединены',
   import: 'импорт данных',
   'demo-clear': 'очистка демо',
 }

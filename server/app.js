@@ -2084,6 +2084,103 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     return { ok: true, contact: result }
   })
 
+  // ---------- слияние дублей контактов ----------
+  // Таблицы, где человек держится за contact_id: при слиянии всё это переезжает к основной карточке.
+  // Добавил таблицу со ссылкой на контакт — допиши её сюда (иначе удаление лишней карточки упадёт на внешнем ключе
+  // либо, у таблиц без FK, запись останется висеть на несуществующем id).
+  const MERGE_TABLES = ['deals', 'tasks', 'interactions', 'winback_sequences', 'pd_requests', 'consents',
+    'entitlements', 'entitlement_checks', 'client_links', 'lead_intake', 'lead_photos']
+
+  // Кандидаты в дубли для карточки — теми же правилами, что дедуп при приёме заявки (findExistingContact):
+  // точное совпадение телефона (нормализованного), почты или ника, внутри проекта, мимо обезличенных. Только чтение.
+  app.get('/api/crm/contacts/:id/duplicates', async (req, reply) => {
+    if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
+    const id = Number(req.params.id)
+    if (!Number.isInteger(id)) return reply.code(400).send({ error: 'bad_id' })
+    const me = await db.prepare('SELECT id, project_id, phone, email, messenger, anonymized_at FROM contacts WHERE id = ?').get(id)
+    if (!me) return reply.code(404).send({ error: 'not_found' })
+    if (me.anonymized_at) return { items: [] }
+    const myPhones = new Set([me.phone, me.messenger].map(phoneKeyIfPlausible).filter(Boolean))
+    const myTexts = new Set([me.email, me.messenger].map((v) => String(v || '').trim().toLowerCase()).filter(Boolean))
+    const rows = await db.prepare(`SELECT id, name, phone, email, messenger, archived, created_at
+      FROM contacts WHERE project_id = ? AND anonymized_at IS NULL AND id <> ? ORDER BY id DESC`).all(me.project_id, id)
+    const items = []
+    for (const c of rows) {
+      const reasons = []
+      if ([c.phone, c.messenger].map(phoneKeyIfPlausible).some((k) => k && myPhones.has(k))) reasons.push('телефон')
+      if ([c.email, c.messenger].some((v) => String(v || '').trim() && myTexts.has(String(v).trim().toLowerCase()))) reasons.push('почта или ник')
+      if (reasons.length) items.push({ ...c, reasons })
+    }
+    // Число сделок — отдельным запросом по найденным (коррелированный подзапрос на pg-mem не выполняется).
+    if (items.length) {
+      const marks = items.map(() => '?').join(',')
+      const dealCounts = await db.prepare(`SELECT contact_id, COUNT(*) c FROM deals WHERE contact_id IN (${marks}) GROUP BY contact_id`).all(...items.map((c) => c.id))
+      const byContact = new Map(dealCounts.map((r) => [r.contact_id, Number(r.c)]))
+      for (const c of items) c.deals = byContact.get(c.id) ?? 0
+    }
+    return { items }
+  })
+
+  // Слить карточку `from_id` в карточку :id (остаётся :id). Необратимо — поэтому только admin и одна транзакция с блокировкой
+  // обеих строк. Сделки, задачи, история, согласия, запросы ПДн, тарифы, ссылки и фото переезжают, лишняя карточка удаляется.
+  app.post('/api/crm/contacts/:id/merge', async (req, reply) => {
+    if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
+    const keepId = Number(req.params.id)
+    const dropId = Number(req.body?.from_id)
+    if (!Number.isInteger(keepId) || !Number.isInteger(dropId)) return reply.code(400).send({ error: 'bad_input' })
+    if (keepId === dropId) return reply.code(400).send({ error: 'same_contact' })
+    let refusal = null
+    const moved = {}
+    await withMutation(async (tx) => {
+      // Обе строки под блокировкой, в порядке id (два одновременных слияния навстречу не зависнут).
+      const rows = await tx.prepare('SELECT * FROM contacts WHERE id IN (?, ?) ORDER BY id FOR UPDATE').all(keepId, dropId)
+      const keep = rows.find((r) => r.id === keepId)
+      const drop = rows.find((r) => r.id === dropId)
+      if (!keep || !drop) { refusal = [404, 'not_found']; return }
+      if (keep.project_id !== drop.project_id) { refusal = [409, 'different_project']; return }
+      if (keep.anonymized_at || drop.anonymized_at) { refusal = [409, 'anonymized']; return }
+      // Телефон — единственное, что связывает человека с записями тарифа Free приложения NVizor (по номеру, без contact_id):
+      // после слияния обезличивание знало бы только номер основной карточки. Разные номера — пусть админ уберёт лишний сам.
+      const keepPhone = phoneKey(keep.phone)
+      const dropPhone = phoneKey(drop.phone)
+      if (keepPhone && dropPhone && keepPhone !== dropPhone) { refusal = [409, 'phones_differ']; return }
+
+      // Поля: пустое у основной — заполняем из присоединяемой; разное непустое — остаётся основное, чужое значение
+      // дописываем в заметку (ничего не теряем молча).
+      const same = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase()
+      const patch = {}
+      const kept = []
+      for (const [f, label] of [['company', 'компания'], ['phone', 'телефон'], ['email', 'почта'], ['messenger', 'мессенджер']]) {
+        const a = String(keep[f] || '').trim()
+        const b = String(drop[f] || '').trim()
+        if (!b) continue
+        if (!a) patch[f] = b
+        else if (!same(a, b) && !(f === 'phone' && phoneKey(a) === phoneKey(b))) kept.push(`${label}: ${b}`)
+      }
+      if (!same(keep.name, drop.name)) kept.push(`имя: ${drop.name}`)
+      const noteParts = [String(keep.note || '').trim()]
+      if (String(drop.note || '').trim()) noteParts.push(`Из объединённой карточки #${dropId}: ${String(drop.note).trim()}`)
+      if (kept.length) noteParts.push(`Другие данные объединённой карточки #${dropId} — ${kept.join('; ')}`)
+      const ts = now()
+      await tx.prepare(`UPDATE contacts SET company = ?, phone = ?, email = ?, messenger = ?, note = ?,
+        archived = ?, suspicious = ?, updated_at = ? WHERE id = ?`)
+        .run(patch.company ?? keep.company ?? '', patch.phone ?? keep.phone ?? '', patch.email ?? keep.email ?? '',
+          patch.messenger ?? keep.messenger ?? '', noteParts.filter(Boolean).join('\n'),
+          // в архиве остаётся, только если в архиве были обе; «подозрительный» — только если были обе
+          keep.archived && drop.archived ? 1 : 0, keep.suspicious && drop.suspicious ? 1 : 0, ts, keepId)
+
+      for (const table of MERGE_TABLES) {
+        const res = await tx.prepare(`UPDATE ${table} SET contact_id = ? WHERE contact_id = ?`).run(keepId, dropId)
+        if (res?.changes) moved[table] = res.changes
+      }
+      await tx.prepare('DELETE FROM contacts WHERE id = ?').run(dropId)
+      // В журнале — только номера и счётчики, без персональных данных.
+      await audit(req, 'merge', 'contacts', keepId, `слита карточка #${dropId}: ${Object.entries(moved).map(([t, n]) => `${t} ${n}`).join(', ') || 'без связанных записей'}`, tx)
+    })
+    if (refusal) return reply.code(refusal[0]).send({ error: refusal[1] })
+    return { ok: true, contact: await db.prepare('SELECT * FROM contacts WHERE id = ?').get(keepId), moved }
+  })
+
   app.get('/api/crm/audit', async (req, reply) => {
     if (req.user.role !== 'admin') return reply.code(403).send({ error: 'admin_only' })
     const items = await db

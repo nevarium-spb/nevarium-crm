@@ -16,9 +16,9 @@
   «заменено», план в `nevarium-lab#3`), фронт: React + react-router + Vite (`src/crm/`).
 - `node server/dev.js` — бэкенд :3001 (требует `DATABASE_URL` в окружении — SQLite-файла по
   умолчанию больше нет). `npm run dev` — фронт :5173 (прокси `/api`→:3001).
-- `npm test` — 390 тестов на `pg-mem` (`server/api.test.js`, `server/nvizor.test.js`,
+- `npm test` — 398 тестов на `pg-mem` (`server/api.test.js`, `server/nvizor.test.js`, `server/merge.test.js`,
   `server/entitlements.test.js`, `server/account.test.js`, `server/lead-fields.test.js`, `server/photos.test.js`,
-  `src/crm/neva/parser.test.js`): 383 зелёный + 7
+  `src/crm/neva/parser.test.js`): 391 зелёный + 7
   намеренно пропущенных (все в `api.test.js`; сверено 2026-10-17). Пропущенные проверяют то,
   чего `pg-mem` не эмулирует: реальный откат транзакции, принадлежность запроса
   соединению (его connect() отдаёт сам пул), SQLSTATE у ошибок и ожидание блокировок.
@@ -192,6 +192,10 @@
   обезличивание, импорт дампа — он удаляет ВСЕ фото, id контактов после восстановления другие). Добавляя новый путь удаления
   заявки/контакта — вызови `queuePhotoDeletion`. `S3_ENDPOINT/S3_BUCKET/S3_REGION/S3_ACCESS_KEY/S3_SECRET_KEY` — только в
   окружении Timeweb; `PHOTO_STORAGE_LIMIT_MB` — для счётчика; проверка — `npm run test-s3`.
+- **Слияние дублей контактов** (ADR-023, только admin): `POST /api/crm/contacts/:id/merge {from_id}`, кандидаты —
+  `GET …/duplicates`. Всё, что держится за `contact_id`, переезжает по списку `MERGE_TABLES` в `server/app.js` —
+  **заводишь новую таблицу со ссылкой на контакт — допиши её туда** (и в удаление/обезличивание, как раньше). Отказы:
+  разные проекты, обезличенная, разные телефоны (NVizor Free привязан к номеру). Журнал — без персональных данных.
 - **Учётная запись и настройки** (`server/account.js`, `settings.js`, `password-policy.js`, `mailer.js`, `reset-admin.js`, ADR-020).
   Пароль — от 12 символов + локальный список частых (`server/common-passwords.txt`) при смене в профиле и по письму.
   Восстановление: ключ из письма — 32 байта, в базе SHA-256, 30 минут, одноразовый, лежит во фрагменте URL (`#t=`); ответ

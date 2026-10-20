@@ -4,6 +4,7 @@ import { api, repo } from '../api.js'
 import { EntityModal } from '../forms.jsx'
 import { apiErrorToast, fmtMoney, onRefresh, relTime, toast } from '../ui.jsx'
 import { TariffBlock } from '../tariffs.jsx'
+import { MergeModal } from '../merge.jsx'
 import { invoiceLabel, leadPlanTitle } from '../../shared/lead-fields.js'
 import { formatBytes } from './AccountSettings.jsx'
 
@@ -15,6 +16,9 @@ export default function ContactCard({ user }) {
   const [modal, setModal] = useState(null) // {entity, initial}
   const [tab, setTab] = useState('all')
   const [photos, setPhotos] = useState([])
+  const [mergeOpen, setMergeOpen] = useState(false)
+  const [dupCount, setDupCount] = useState(0)
+  const isAdmin = user?.role === 'admin'
 
   const load = useCallback(() => {
     repo.contactCard(id).then(setCard).catch((err) => {
@@ -23,7 +27,10 @@ export default function ContactCard({ user }) {
     })
     // Фото из заявок (ADR-022): список без ссылок на файлы — открывается только по кнопке, под входом.
     api(`/crm/contacts/${id}/photos`).then((r) => setPhotos(r.items)).catch(() => setPhotos([]))
-  }, [id])
+    // Возможные дубли (слияние — только администратор): считаем, чтобы подсказать прямо на карточке.
+    if (isAdmin) api(`/crm/contacts/${id}/duplicates`).then((r) => setDupCount(r.items.length)).catch(() => setDupCount(0))
+    else setDupCount(0)
+  }, [id, isAdmin])
   useEffect(load, [load])
   useEffect(() => onRefresh(load), [load])
 
@@ -106,7 +113,12 @@ export default function ContactCard({ user }) {
           <button className="btn" onClick={() => setModal({ entity: 'tasks', initial: { contact_id: contact.id } })}>+ Задача</button>
           <button className="btn" onClick={() => setModal({ entity: 'deals', initial: { contact_id: contact.id } })}>+ Сделка</button>
           <button className="btn" onClick={archive}>{contact.archived ? 'Из архива' : 'В архив'}</button>
-          {user?.role === 'admin' && !contact.anonymized_at && (
+          {isAdmin && !contact.anonymized_at && (
+            <button className="btn" onClick={() => setMergeOpen(true)} title="Присоединить к этой карточке дубль того же человека">
+              Объединить…{dupCount > 0 ? ` (${dupCount})` : ''}
+            </button>
+          )}
+          {isAdmin && !contact.anonymized_at && (
             <button className="btn danger" onClick={anonymize} title="Исполнить требование клиента об удалении данных (152-ФЗ)">
               Обезличить
             </button>
@@ -168,6 +180,16 @@ export default function ContactCard({ user }) {
           </section>
         )}
 
+        {isAdmin && dupCount > 0 && !contact.anonymized_at && (
+          <section className="tile" aria-label="Возможные дубли">
+            <div className="tile-title"><span className="tile-num">⚠</span><h2>Возможные дубли</h2></div>
+            <p style={{ color: 'var(--text-2)', fontSize: 14 }}>
+              Найдено карточек с тем же телефоном, почтой или ником: {dupCount}. Если это один человек — объедините карточки, чтобы история и сделки были в одном месте.
+            </p>
+            <button className="btn" onClick={() => setMergeOpen(true)}>Посмотреть и объединить</button>
+          </section>
+        )}
+
         {!contact.anonymized_at && <TariffBlock contactId={contact.id} />}
 
         <section className="tile span2" aria-label="История">
@@ -197,6 +219,7 @@ export default function ContactCard({ user }) {
         </section>
       </div>
       {modal && <EntityModal entity={modal.entity} initial={modal.initial} onSaved={load} onClose={() => setModal(null)} />}
+      {mergeOpen && <MergeModal contact={contact} onClose={() => setMergeOpen(false)} onDone={() => { setMergeOpen(false); load() }} />}
     </>
   )
 }
