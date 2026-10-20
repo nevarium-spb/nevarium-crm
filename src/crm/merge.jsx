@@ -75,7 +75,10 @@ export function MergeModal({ contact, onClose, onDone }) {
       {candidates?.length === 0 && <div className="empty">CRM не нашла карточек с тем же телефоном, почтой или ником.</div>}
       {candidates?.map((c) => row(c, c.reasons.join(', ')))}
       <h3 style={{ fontSize: 14, margin: '16px 0 4px' }}>Найти вручную</h3>
-      <input placeholder="Имя, телефон или почта (от 2 символов)" value={q} onChange={(e) => setQ(e.target.value)} />
+      {/* .crm-form задаёт вид полей CRM (тёмный фон, светлый текст); вне него поле выходило белым с белым текстом */}
+      <div className="crm-form">
+        <input placeholder="Имя, телефон или почта (от 2 символов)" value={q} onChange={(e) => setQ(e.target.value)} />
+      </div>
       {found.map((c) => row(c))}
       {q.trim().length >= 2 && found.length === 0 && <div className="crm-cap">Ничего не найдено в этом проекте.</div>}
       <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 16 }}>
