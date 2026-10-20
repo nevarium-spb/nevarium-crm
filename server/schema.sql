@@ -225,6 +225,10 @@ CREATE TABLE IF NOT EXISTS entitlements (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_entitlements_contact ON entitlements(contact_id);
+-- Доплаты «срочно» и «в выходной» — за КАЖДУЮ такую проверку (решение владельца 2026-10-20, ADR-024): сколько проверок оплачено.
+-- NULL — запись из времён галочки urgent/weekend (тогда оплачена одна). Отдельными ALTER: на боевой базе таблица уже есть.
+ALTER TABLE entitlements ADD COLUMN IF NOT EXISTS urgent_paid INTEGER;
+ALTER TABLE entitlements ADD COLUMN IF NOT EXISTS weekend_paid INTEGER;
 
 -- Выданные проверки (присылает NVizor). entitlement_id NULL — «вне тарифа»; contact_id
 -- NULL — клиента с этим телефоном в CRM ещё нет (тогда держится только phone_key).

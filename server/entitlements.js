@@ -15,14 +15,14 @@
 
 import crypto from 'node:crypto'
 import { nvizorPhoneKey } from './nvizor.js'
-import { PLANS, PACKAGE_PLANS, PERIOD_PLANS, STAGES, LIMITS } from './shared/plans.js'
+import { PLANS, PACKAGE_PLANS, PERIOD_PLANS, STAGES, LIMITS, EXTRAS, rub } from './shared/plans.js'
 import { DEFAULTS, REMINDER_PLANS, loadSettings } from './settings.js'
 
 // ---------- справочники контракта (раздел 2) ----------
 
 // Цены, коды тарифов и этапов, лимиты — ОДИН источник с сайтом: server/shared/plans.js
 // (копия src/shared/plans.js Визора; руками не править — `npm run shared:sync` в репозитории сайта).
-export { PLANS, PACKAGE_PLANS, PERIOD_PLANS, STAGES, LIMITS }
+export { PLANS, PACKAGE_PLANS, PERIOD_PLANS, STAGES, LIMITS, EXTRAS }
 const STAGE_TITLE = Object.fromEntries([...STAGES.repair, ...STAGES.house])
 const stageTitle = (code) => STAGE_TITLE[code] || code
 // За сколько дней до конца срока CRM ставит задачу «продлить / связаться» — УМОЛЧАНИЯ;
@@ -83,7 +83,10 @@ export function rowToEntitlement(r) {
     startsOn: r.starts_on, expiresOn: r.expires_on || null,
     periodDays: r.period_days ?? null, checksPerPeriod: r.checks_per_period ?? null,
     objects: parseList(r.objects).map(String), stages: parseList(r.stages).map(String),
-    urgent: Boolean(r.urgent), weekend: Boolean(r.weekend), parentReport: r.parent_report || '',
+    // Доплаты — за КАЖДУЮ срочную/выходную проверку (решение владельца 2026-10-20): urgentPaid/weekendPaid — сколько таких
+    // проверок оплачено. Пустая колонка — запись из времён галочки: «оплачено» = одна. urgent/weekend (bool) — «оплачена хотя бы одна».
+    urgentPaid: r.urgent_paid ?? (r.urgent ? 1 : 0), weekendPaid: r.weekend_paid ?? (r.weekend ? 1 : 0),
+    urgent: (r.urgent_paid ?? (r.urgent ? 1 : 0)) > 0, weekend: (r.weekend_paid ?? (r.weekend ? 1 : 0)) > 0, parentReport: r.parent_report || '',
     paidAmount: r.paid_amount ?? null, creditedFrom: parseList(r.credited_from).map(Number),
     status: r.status, note: r.note || '', createdAt: r.created_at,
   }
@@ -200,8 +203,13 @@ function warn(code, ent, x = {}) {
     recheck_window: () => `С отчёта ${x.report} прошло ${x.days} ${plural(x.days, 'рабочий день', 'рабочих дня', 'рабочих дней')} (лимит ${LIMITS.recheckWorkdays})`,
     photo_limit: () => `${x.count} фото при лимите ${x.limit}`,
     video_limit: () => `${x.count} видео при лимите ${x.limit}`,
-    urgent_not_paid: () => 'Срочность не оплачена (+2 000 ₽)',
-    weekend_not_paid: () => 'Проверка в выходной не оплачена (+2 000 ₽)',
+    // Доплата — за каждую такую проверку (2026-10-20): цена из общего файла цен, текст зависит от того, оплачено ли что-то вовсе.
+    urgent_not_paid: () => (x.paid > 0
+      ? `Оплаченные срочные проверки использованы (${x.paid} из ${x.paid}) — следующая +${rub(EXTRAS.urgent)}`
+      : `Срочность не оплачена (+${rub(EXTRAS.urgent)})`),
+    weekend_not_paid: () => (x.paid > 0
+      ? `Оплаченные проверки в выходной использованы (${x.paid} из ${x.paid}) — следующая +${rub(EXTRAS.weekend)}`
+      : `Проверка в выходной не оплачена (+${rub(EXTRAS.weekend)})`),
   }
   return { code, text: texts[code]() }
 }
@@ -281,8 +289,10 @@ export function evaluateCheck({ entitlements, checks, input, today }) {
       if (done) warnings.push(warn('stage_already_checked', ent, { stage: done.stageCode, date: mskDateOf(done.issuedAt) }))
     }
     if (ent.plan === 'recheck' && own.length) warnings.push(warn('recheck_used', ent))
-    if (input.urgent && !ent.urgent) warnings.push(warn('urgent_not_paid', ent))
-    if (input.weekend && !ent.weekend) warnings.push(warn('weekend_not_paid', ent))
+    // Доплата за каждую срочную/выходную проверку: выданных такого рода меньше, чем оплачено, — ок; иначе предупреждение.
+    if (input.urgent && own.filter((c) => c.urgent).length >= ent.urgentPaid) warnings.push(warn('urgent_not_paid', ent, { paid: ent.urgentPaid }))
+    // Выходная не считается у срочной проверки (checkInput обнуляет её, но evaluateCheck — чистая функция и защищается сама).
+    if (input.weekend && !input.urgent && own.filter((c) => c.weekend).length >= ent.weekendPaid) warnings.push(warn('weekend_not_paid', ent, { paid: ent.weekendPaid }))
   }
 
   // Окно повторной и лимиты вложений не зависят от права — считаются всегда.
@@ -403,7 +413,8 @@ function checkInput(b) {
     videos: int(b.videos),
     parentReportNumber: str(b.parentReportNumber, 60),
     urgent: b.urgent === true,
-    weekend: b.weekend === true,
+    // Срочная и «в выходной» не складываются (решение владельца 2026-10-20): у срочной проверки выходная недоступна.
+    weekend: b.weekend === true && b.urgent !== true,
   }
 }
 
@@ -554,6 +565,9 @@ export function registerEntitlementRoutes(app, deps) {
       today,
       entitlements: entitlements.map((e) => ({
         id: e.id, note: e.note, paidAmount: e.paidAmount, objects: e.objects, urgent: e.urgent, weekend: e.weekend,
+        // оплачено / уже выдано срочных и выходных проверок (доплата — за каждую)
+        urgentPaid: e.urgentPaid, weekendPaid: e.weekendPaid,
+        urgentUsed: checksOf(e, checks).filter((c) => c.urgent).length, weekendUsed: checksOf(e, checks).filter((c) => c.weekend).length,
         parentReport: e.parentReport, creditedFrom: e.creditedFrom, createdAt: e.createdAt,
         ...describeEntitlement(e, checks, today),
         warnings: e.status === 'active' ? statusWarnings(e, checks, today) : [],
@@ -566,6 +580,7 @@ export function registerEntitlementRoutes(app, deps) {
       },
       offer: computeOffer(entitlements, today, await objectTypeOf(runner, contactId)),
       plans: PLANS,
+      extras: EXTRAS,
       stages: STAGES,
     }
   }
@@ -615,8 +630,15 @@ export function registerEntitlementRoutes(app, deps) {
       const list = (Array.isArray(b.stages) ? b.stages : []).map((s) => str(s, 60)).filter((s) => allowed.has(s))
       f.stages = JSON.stringify([...new Set(list)])
     }
-    if (b.urgent !== undefined) f.urgent = b.urgent ? 1 : 0
-    if (b.weekend !== undefined) f.weekend = b.weekend ? 1 : 0
+    // Сколько срочных/выходных проверок оплачено (число). Старая галочка (true/false) принимается как 1/0 — открытая вкладка
+    // со старой сборкой не должна ломаться. bool-колонки urgent/weekend держим в согласии: «оплачена хотя бы одна».
+    for (const k of ['urgent', 'weekend']) {
+      const raw = b[`${k}_paid`] !== undefined ? b[`${k}_paid`] : b[k]
+      if (raw === undefined) continue
+      const n = typeof raw === 'boolean' ? (raw ? 1 : 0) : Math.min(999, Math.max(0, int(raw)))
+      f[`${k}_paid`] = n
+      f[k] = n > 0 ? 1 : 0
+    }
     if (b.parent_report !== undefined) f.parent_report = str(b.parent_report, 60)
     if (b.paid_amount !== undefined) f.paid_amount = b.paid_amount === null || b.paid_amount === '' ? null : int(b.paid_amount)
     if (b.note !== undefined) f.note = str(b.note, 1000)
@@ -641,7 +663,7 @@ export function registerEntitlementRoutes(app, deps) {
       checks_per_period: PERIOD_PLANS.includes(plan) ? f.checks_per_period ?? LIMITS.checksPerPeriod : null,
       objects: f.objects ?? '[]',
       stages: f.stages ?? JSON.stringify(PACKAGE_PLANS.includes(plan) ? STAGES[plan].map(([c]) => c) : []),
-      urgent: f.urgent ?? 0, weekend: f.weekend ?? 0, parent_report: f.parent_report ?? '',
+      urgent: f.urgent ?? 0, weekend: f.weekend ?? 0, urgent_paid: f.urgent_paid ?? 0, weekend_paid: f.weekend_paid ?? 0, parent_report: f.parent_report ?? '',
       paid_amount: b.paid_amount !== undefined ? f.paid_amount : PLANS[plan].price,
       note: f.note ?? '', ts: now(),
     }
@@ -649,10 +671,10 @@ export function registerEntitlementRoutes(app, deps) {
       const c = await tx.prepare('SELECT project_id FROM contacts WHERE id = ? FOR UPDATE').get(contactId)
       if (!c) return null
       const info = await tx.prepare(`INSERT INTO entitlements (contact_id, project_id, plan, starts_on, expires_on, period_days, checks_per_period,
-          objects, stages, urgent, weekend, parent_report, paid_amount, credited_from, status, note, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', 'active', ?, ?, ?) RETURNING id`)
+          objects, stages, urgent, weekend, urgent_paid, weekend_paid, parent_report, paid_amount, credited_from, status, note, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', 'active', ?, ?, ?) RETURNING id`)
         .run(contactId, c.project_id, plan, row.starts_on, row.expires_on, row.period_days, row.checks_per_period, row.objects, row.stages,
-          row.urgent, row.weekend, row.parent_report, row.paid_amount, row.note, row.ts, row.ts)
+          row.urgent, row.weekend, row.urgent_paid, row.weekend_paid, row.parent_report, row.paid_amount, row.note, row.ts, row.ts)
       const created = await tx.prepare('SELECT * FROM entitlements WHERE id = ?').get(info.lastInsertRowid)
       await audit(req, 'create', 'entitlements', info.lastInsertRowid, `назначен: — → ${summaryOf(created)}`, tx)
       await liftExpiryAudited(req, tx, contactId)
@@ -731,8 +753,8 @@ export function registerEntitlementRoutes(app, deps) {
       const credit = Math.min(PLANS[plan].price, stages.reduce((s, e) => s + (e.paidAmount ?? PLANS.stage.price), 0))
       const ts = now()
       const info = await tx.prepare(`INSERT INTO entitlements (contact_id, project_id, plan, starts_on, expires_on, period_days, checks_per_period,
-          objects, stages, urgent, weekend, parent_report, paid_amount, credited_from, status, note, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, NULL, NULL, '[]', ?, 0, 0, '', ?, ?, 'active', ?, ?, ?) RETURNING id`)
+          objects, stages, urgent, weekend, urgent_paid, weekend_paid, parent_report, paid_amount, credited_from, status, note, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, NULL, NULL, '[]', ?, 0, 0, 0, 0, '', ?, ?, 'active', ?, ?, ?) RETURNING id`)
         .run(contactId, c.project_id, plan, startsOn, addYearInclusive(startsOn), JSON.stringify(STAGES[plan].map(([s]) => s)),
           PLANS[plan].price - credit, JSON.stringify(stages.map((e) => e.id)), str(req.body?.note, 1000), ts, ts)
       const marks = stages.map(() => '?').join(',')

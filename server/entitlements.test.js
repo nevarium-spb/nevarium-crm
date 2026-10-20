@@ -7,6 +7,7 @@ import { hashPassword, resetThrottle } from './auth.js'
 import { now } from './db.js'
 import { evaluateCheck, computeOffer, runEntitlementReminders, purgeExpiredClientLinks, addDays, addYearInclusive, workdaysAfter } from './entitlements.js'
 import { withTransaction, maintenanceBarrier } from './db-adapter.js'
+import { EXTRAS, rub } from './shared/plans.js'
 
 const TOKEN = 'test-nvizor-token-0123456789abcdef0123456789'
 const auth = { authorization: `Bearer ${TOKEN}` }
@@ -18,7 +19,7 @@ let nextId = 1
 const ent = (over = {}) => ({
   id: nextId++, contactId: 1, projectId: 2, plan: 'repair', startsOn: '2026-10-10', expiresOn: '2027-10-09',
   periodDays: null, checksPerPeriod: null, objects: [], stages: ['electrical', 'plumbing', 'waterproofing', 'screed', 'plaster'],
-  urgent: false, weekend: false, parentReport: '', paidAmount: 19900, creditedFrom: [], status: 'active', note: '', ...over,
+  urgent: false, weekend: false, urgentPaid: 0, weekendPaid: 0, parentReport: '', paidAmount: 19900, creditedFrom: [], status: 'active', note: '', ...over,
 })
 const chk = (over = {}) => ({
   id: nextId++, entitlementId: null, contactId: 1, recordId: `r${nextId}`, objectRef: 'obj-1', stageCode: 'screed', kind: 'primary',
@@ -117,12 +118,47 @@ describe('правила (раздел 4 контракта) — по тесту
     expect(run([ent()], [], { videos: 3 }).warnings).toContainEqual({ code: 'video_limit', text: '3 видео при лимите 2' })
   })
 
-  it('urgent_not_paid / weekend_not_paid: опция не оплачена; оплаченная — без предупреждения', () => {
+  it('urgent_not_paid / weekend_not_paid: опция не оплачена; оплаченная — без предупреждения; цена — из общего файла цен', () => {
     const s = ent({ plan: 'stage', stages: [] })
-    const r = run([s], [], { urgent: true, weekend: true })
-    expect(r.warnings).toContainEqual({ code: 'urgent_not_paid', text: 'Срочность не оплачена (+2 000 ₽)' })
-    expect(codes(r)).toContain('weekend_not_paid')
-    expect(codes(run([ent({ plan: 'stage', stages: [], urgent: true, weekend: true })], [], { urgent: true, weekend: true }))).toEqual([])
+    expect(run([s], [], { urgent: true }).warnings).toContainEqual({ code: 'urgent_not_paid', text: `Срочность не оплачена (+${rub(EXTRAS.urgent)})` })
+    expect(run([s], [], { weekend: true }).warnings).toContainEqual({ code: 'weekend_not_paid', text: `Проверка в выходной не оплачена (+${rub(EXTRAS.weekend)})` })
+    expect(codes(run([ent({ plan: 'stage', stages: [], urgent: true, urgentPaid: 1, weekend: true, weekendPaid: 1 })], [], { urgent: true }))).toEqual([])
+    expect(codes(run([ent({ plan: 'stage', stages: [], urgent: true, urgentPaid: 1, weekend: true, weekendPaid: 1 })], [], { weekend: true }))).toEqual([])
+  })
+
+  it('срочная и выходная не складываются: у срочной проверки выходная не учитывается', () => {
+    const s = ent({ plan: 'stage', stages: [] })
+    // срочная в выходной: только срочная доплата, предупреждения про выходную нет
+    expect(codes(run([s], [], { urgent: true, weekend: true }))).toEqual(['urgent_not_paid'])
+    // и если срочность оплачена — предупреждений нет вовсе, выходная не требует оплаты
+    expect(codes(run([ent({ plan: 'stage', stages: [], urgent: true, urgentPaid: 1 })], [], { urgent: true, weekend: true }))).toEqual([])
+  })
+
+  it('доплата — за каждую срочную/выходную проверку: оплачено N — N проверок без предупреждения, следующая с ценой', () => {
+    // Пакет, оплачена одна срочная и две выходных; электрика срочно уже выдана.
+    const pack = ent({ urgentPaid: 1, weekendPaid: 2 })
+    const done = chk({ entitlementId: pack.id, stageCode: 'electrical', urgent: true })
+    // вторая срочная — оплачена только одна, и она уже использована
+    const second = run([pack], [done], { stageCode: 'plumbing', urgent: true })
+    expect(second.warnings).toEqual([{ code: 'urgent_not_paid', text: `Оплаченные срочные проверки использованы (1 из 1) — следующая +${rub(EXTRAS.urgent)}` }])
+    // выходная — две оплачены, ни одной не выдано: можно, и срочность на неё не влияет
+    expect(codes(run([pack], [done], { stageCode: 'plumbing', weekend: true }))).toEqual([])
+    // обычная проверка после срочной — без предупреждений, а «срочная + выходная» сразу считается по каждой доплате отдельно
+    expect(codes(run([pack], [done], { stageCode: 'plumbing' }))).toEqual([])
+    // срочная в выходной — только срочная доплата (выходная у срочной не учитывается), оплаченные выходные не тратятся
+    expect(codes(run([pack], [done], { stageCode: 'plumbing', urgent: true, weekend: true }))).toEqual(['urgent_not_paid'])
+    // две срочные оплачены — вторая проходит без предупреждения
+    const two = ent({ urgentPaid: 2 })
+    expect(codes(run([two], [chk({ entitlementId: two.id, stageCode: 'electrical', urgent: true })], { stageCode: 'plumbing', urgent: true }))).toEqual([])
+  })
+
+  it('старая запись с галочкой (urgent_paid пусто) считается как «оплачена одна»; плата и использование — по своим проверкам', async () => {
+    // rowToEntitlement — тот же разбор, что у строк из базы
+    const { rowToEntitlement } = await import('./entitlements.js')
+    const legacy = rowToEntitlement({ id: 1, contact_id: 1, project_id: 2, plan: 'repair', starts_on: '2026-10-10', expires_on: '2027-10-09', urgent: 1, weekend: 0, urgent_paid: null, weekend_paid: null, status: 'active' })
+    expect(legacy).toMatchObject({ urgent: true, weekend: false, urgentPaid: 1, weekendPaid: 0 })
+    const fresh = rowToEntitlement({ id: 2, contact_id: 1, project_id: 2, plan: 'repair', starts_on: '2026-10-10', urgent: 0, weekend: 0, urgent_paid: 3, weekend_paid: 0, status: 'active' })
+    expect(fresh).toMatchObject({ urgent: true, urgentPaid: 3 })
   })
 
   it('сопоставление: подходящее действующее право раньше неподходящего', () => {
@@ -211,6 +247,35 @@ describe('NVizor → CRM (5.1)', () => {
     expect(ev.warnings.map((w) => w.code)).toContain('stage_already_checked')
     const state = (await crm('GET', `/api/crm/contacts/${id}/entitlements`)).json()
     expect(state.checks.map((c) => c.entitlementId)).toEqual(expect.arrayContaining([entId, null]))
+  })
+
+  it('доплаты за каждую срочную/выходную проверку: назначили с оплаченной одной срочной → выдали срочную → следующая срочная с предупреждением', async () => {
+    const id = await vizorClient()
+    // число оплаченных проверок; в карточке — оплачено и использовано
+    const entId = (await crm('POST', '/api/crm/entitlements', { contact_id: id, plan: 'repair', urgent_paid: 1, weekend_paid: 2 })).json().id
+    let state = (await crm('GET', `/api/crm/contacts/${id}/entitlements`)).json()
+    expect(state.extras).toEqual(EXTRAS)
+    expect(state.entitlements[0]).toMatchObject({ urgentPaid: 1, weekendPaid: 2, urgentUsed: 0, weekendUsed: 0, urgent: true, weekend: true })
+    const evalUrgent = async (stageCode) => (await nv('/api/nvizor/entitlements/evaluate', { phone: PHONE, stageCode, urgent: true })).json()
+    expect((await evalUrgent('electrical')).warnings).toEqual([])
+    // выдана срочная проверка по электрике (приложение присылает urgent: true)
+    expect((await nv('/api/nvizor/entitlements/usage', { recordId: 'u-1', entitlementId: entId, phone: PHONE, stageCode: 'electrical', kind: 'primary', urgent: true, issuedAt: '2026-10-11T10:00:00Z' })).statusCode).toBe(201)
+    state = (await crm('GET', `/api/crm/contacts/${id}/entitlements`)).json()
+    expect(state.entitlements[0]).toMatchObject({ urgentUsed: 1, weekendUsed: 0 })
+    // вторая срочная по сантехнике — оплаченная одна уже использована
+    expect((await evalUrgent('plumbing')).warnings.map((w) => w.code)).toEqual(['urgent_not_paid'])
+    // срочная и выходная вместе: при выдаче сохраняется только срочная, выходная не записывается и не тратится
+    expect((await nv('/api/nvizor/entitlements/usage', { recordId: 'u-2', entitlementId: entId, phone: PHONE, stageCode: 'plumbing', kind: 'primary', urgent: true, weekend: true, issuedAt: '2026-10-12T10:00:00Z' })).statusCode).toBe(201)
+    expect(await app.db.prepare('SELECT urgent, weekend FROM entitlement_checks WHERE record_id = ?').get('u-2')).toMatchObject({ urgent: 1, weekend: 0 })
+    await app.db.prepare('DELETE FROM entitlement_checks WHERE record_id = ?').run('u-2')
+    // доплатили ещё за одну: число правится в карточке, и предупреждение исчезает
+    expect((await crm('PATCH', `/api/crm/entitlements/${entId}`, { urgent_paid: 2 })).statusCode).toBe(200)
+    expect((await evalUrgent('plumbing')).warnings).toEqual([])
+    // старая галочка от открытой вкладки со старой сборкой — как 1 / 0; отрицательное — в ноль, огромное — не больше 999
+    await crm('PATCH', `/api/crm/entitlements/${entId}`, { urgent: true, weekend: false })
+    expect(await app.db.prepare('SELECT urgent_paid, weekend_paid, urgent, weekend FROM entitlements WHERE id = ?').get(entId)).toMatchObject({ urgent_paid: 1, weekend_paid: 0, urgent: 1, weekend: 0 })
+    await crm('PATCH', `/api/crm/entitlements/${entId}`, { urgent_paid: -5, weekend_paid: 100000 })
+    expect(await app.db.prepare('SELECT urgent_paid, weekend_paid FROM entitlements WHERE id = ?').get(entId)).toMatchObject({ urgent_paid: 0, weekend_paid: 999 })
   })
 
   it('client-link: новая ссылка на каждый вызов; неизвестный телефон — 404', async () => {
@@ -455,7 +520,7 @@ describe('152-ФЗ, дамп, напоминания', () => {
   it('экспорт → импорт сохраняет тарифы; старый дамп без них их чистит и не падает на FK', async () => {
     await seeded()
     const dump = (await crm('GET', '/api/crm/export')).json()
-    expect(dump.version).toBe(8)
+    expect(dump.version).toBe(9)
     expect((await crm('POST', '/api/crm/import', dump)).statusCode).toBe(200)
     expect(await counts()).toEqual({ entitlements: 1, entitlement_checks: 1, client_links: 1 })
     const old = { ...dump, version: 5 }

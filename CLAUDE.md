@@ -16,9 +16,9 @@
   «заменено», план в `nevarium-lab#3`), фронт: React + react-router + Vite (`src/crm/`).
 - `node server/dev.js` — бэкенд :3001 (требует `DATABASE_URL` в окружении — SQLite-файла по
   умолчанию больше нет). `npm run dev` — фронт :5173 (прокси `/api`→:3001).
-- `npm test` — 398 тестов на `pg-mem` (`server/api.test.js`, `server/nvizor.test.js`, `server/merge.test.js`,
+- `npm test` — 402 теста на `pg-mem` (`server/api.test.js`, `server/nvizor.test.js`, `server/merge.test.js`,
   `server/entitlements.test.js`, `server/account.test.js`, `server/lead-fields.test.js`, `server/photos.test.js`,
-  `src/crm/neva/parser.test.js`): 391 зелёный + 7
+  `src/crm/neva/parser.test.js`): 395 зелёный + 7
   намеренно пропущенных (все в `api.test.js`; сверено 2026-10-17). Пропущенные проверяют то,
   чего `pg-mem` не эмулирует: реальный откат транзакции, принадлежность запроса
   соединению (его connect() отдаёт сам пул), SQLSTATE у ошибок и ожидание блокировок.
@@ -177,7 +177,9 @@
   отозванный ключ, без телефона/почты/id в ответе. Кабинет Free (нет действующего права на
   день выдачи) — ссылка с `expires_on = сегодня + 6`, истёкшая = тот же 404, ночью удаляется;
   «Назначить»/«Перевести в пакет» снимают срок с живых ссылок. Коды тарифов и этапов (`PLANS`/`STAGES`)
-  общие с сайтом и NVizor — меняются только вместе с контрактом. Free — отдельно, не трогать.
+  общие с сайтом и NVizor — меняются только вместе с контрактом. Free — отдельно, не трогать. Доплаты «срочно»/«в выходной»
+  (ADR-024) — за КАЖДУЮ проверку: у тарифа `urgent_paid`/`weekend_paid` (сколько оплачено), цены — `EXTRAS` из общего файла
+  цен; в тексте предупреждения цену не прописывай.
 - **Тариф и счёт в заявке** (ADR-021, задание сайта Визора 2026-10-16, часть А): `POST /api/leads` принимает `plan`,
   `invoice_channel`, `invoice_contact`; коды и нормализация — ТОЛЬКО `src/shared/lead-fields.js` (общий для сервера и
   интерфейса). Хранятся в сделке (`deals.plan/invoice_channel/invoice_contact`, дамп v8); контакт для счёта ещё и в

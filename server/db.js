@@ -204,7 +204,7 @@ const DEMO_FILTERED = new Set()
  * hasCompliance/hasConsents/hasFreeReports).
  */
 // v8 (2026-10-17): у deals колонки plan/invoice_channel/invoice_contact (заявка сайта Визора).
-export const DUMP_VERSION = 8
+export const DUMP_VERSION = 9
 
 /**
  * Дамп — ОДИН согласованный снимок базы, не серия независимых чтений

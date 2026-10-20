@@ -29,7 +29,7 @@ export function TariffBadge({ badge }) {
   )
 }
 
-function EntitlementForm({ initial, plans, stages, onSave, onClose }) {
+function EntitlementForm({ initial, plans, stages, extras, onSave, onClose }) {
   const editing = Boolean(initial.id)
   const [f, setF] = useState({
     plan: initial.plan || 'repair',
@@ -38,8 +38,9 @@ function EntitlementForm({ initial, plans, stages, onSave, onClose }) {
     paid_amount: initial.paidAmount ?? '',
     objects: (initial.objects || []).join('\n'),
     stages: initial.stages?.map((s) => s.code) || null,
-    urgent: Boolean(initial.urgent),
-    weekend: Boolean(initial.weekend),
+    // Доплата — за каждую срочную/выходную проверку: здесь число оплаченных (0 — не оплачено).
+    urgent_paid: String(initial.urgentPaid ?? 0),
+    weekend_paid: String(initial.weekendPaid ?? 0),
     parent_report: initial.parentReport || '',
     note: initial.note || '',
   })
@@ -55,7 +56,7 @@ function EntitlementForm({ initial, plans, stages, onSave, onClose }) {
     const body = {
       expires_on: f.expires_on || null,
       paid_amount: f.paid_amount === '' ? null : Number(f.paid_amount),
-      urgent: f.urgent, weekend: f.weekend, note: f.note,
+      urgent_paid: Math.max(0, Math.floor(Number(f.urgent_paid) || 0)), weekend_paid: Math.max(0, Math.floor(Number(f.weekend_paid) || 0)), note: f.note,
       objects: f.objects.split('\n').map((s) => s.trim()).filter(Boolean),
       parent_report: f.parent_report,
     }
@@ -117,8 +118,17 @@ function EntitlementForm({ initial, plans, stages, onSave, onClose }) {
             <input value={f.parent_report} onChange={set('parent_report')} placeholder="NV-2026-…" />
           </label>
         )}
-        <label className="tariff-check"><input type="checkbox" checked={f.urgent} onChange={set('urgent')} /> Срочность оплачена (+2 000 ₽)</label>
-        <label className="tariff-check"><input type="checkbox" checked={f.weekend} onChange={set('weekend')} /> Выходной день оплачен (+2 000 ₽)</label>
+        <div className="crm-form-row">
+          <label>
+            Оплачено срочных проверок{extras ? ` (+${fmtMoney(extras.urgent)} за каждую)` : ''}
+            <input type="number" min="0" max="999" value={f.urgent_paid} onChange={set('urgent_paid')} />
+          </label>
+          <label>
+            Оплачено проверок в выходной{extras ? ` (+${fmtMoney(extras.weekend)} за каждую)` : ''}
+            <input type="number" min="0" max="999" value={f.weekend_paid} onChange={set('weekend_paid')} />
+          </label>
+        </div>
+        <span className="crm-cap">Доплата берётся за каждую такую проверку. Сумма в поле «Оплачено, ₽» сама не пересчитывается — впишите итог.</span>
         <label>
           Комментарий
           <input value={f.note} onChange={set('note')} maxLength={1000} />
@@ -203,7 +213,7 @@ export function TariffBlock({ contactId }) {
               с {ru(e.startsOn)} до {e.expiresOn ? ru(e.expiresOn) : 'без срока'}
               {e.daysLeft !== null && e.status === 'active' ? ` · ${e.daysLeft >= 0 ? `осталось ${e.daysLeft} дн.` : 'истёк'}` : ''}
               {e.paidAmount != null ? ` · оплачено ${fmtMoney(e.paidAmount)}` : ''}
-              {e.urgent ? ' · срочность' : ''}{e.weekend ? ' · выходные' : ''}
+              {e.urgentPaid > 0 ? ` · срочных: ${e.urgentUsed} из ${e.urgentPaid}` : ''}{e.weekendPaid > 0 ? ` · в выходной: ${e.weekendUsed} из ${e.weekendPaid}` : ''}
               {e.objects?.length ? ` · объекты: ${e.objects.join(', ')}` : ''}
               {e.note ? ` · ${e.note}` : ''}
             </div>
@@ -267,7 +277,7 @@ export function TariffBlock({ contactId }) {
         </div>
       )}
 
-      {form && <EntitlementForm initial={form} plans={state.plans} stages={state.stages} onSave={save} onClose={() => setForm(null)} />}
+      {form && <EntitlementForm initial={form} plans={state.plans} stages={state.stages} extras={state.extras} onSave={save} onClose={() => setForm(null)} />}
     </section>
   )
 }
