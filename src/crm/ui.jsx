@@ -1,4 +1,5 @@
 import { useEffect, useSyncExternalStore } from 'react'
+import { createPortal } from 'react-dom'
 
 // ---------- тосты (модульный стор, доступен из любого места) ----------
 let toasts = []
@@ -48,13 +49,17 @@ export function Modal({ title, onClose, children }) {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
-  return (
+  // В document.body, а не по месту: у плиток (.tile) стеклянный фон (backdrop-filter), и внутри такого блока
+  // `position: fixed` считается от самой плитки, а не от экрана — окно «Назначить тариф» обрезалось нижней плиткой
+  // «История», кнопки оказывались недоступны. Цвета берутся из :root, поэтому вне CRM-обёртки вид не меняется.
+  return createPortal(
     <div className="crm-modal-back" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div className="crm-modal" role="dialog" aria-modal="true" aria-label={title}>
         <h2>{title}</h2>
         {children}
       </div>
-    </div>
+    </div>,
+    document.body
   )
 }
 
