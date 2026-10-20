@@ -9,7 +9,7 @@ import { hashPassword, resetThrottle } from './auth.js'
 import { now } from './db.js'
 import { PHOTO_MAX_BYTES, createS3, sniffImage } from './photos.js'
 import { checkS3, describeS3Config, explainS3Error } from './test-s3.js'
-import { checkMax, checkTelegram, describeNotifyConfig, discoverMaxChats } from './test-notify.js'
+import { checkMax, checkTelegram, describeNotifyConfig, discoverMaxChats, discoverTelegramChats } from './test-notify.js'
 import { channelError, sendMax, sendTelegram } from './telegram.js'
 
 const JPEG_HEAD = [0xff, 0xd8, 0xff, 0xe0]
@@ -237,6 +237,27 @@ describe('уведомления: понятные ошибки и test-notify',
     expect((await discoverMaxChats({ MAX_BOT_TOKEN: 't' }, async () => reply(401, '{}'))).error).toContain('401')
     expect((await discoverMaxChats({}, async () => { throw new Error('нельзя') })).error).toContain('MAX_BOT_TOKEN')
     expect((await discoverMaxChats({ MAX_BOT_TOKEN: 't' }, async () => { throw new Error('обрыв') })).error).toContain('обрыв')
+  })
+
+  it('Telegram: поиск chat_id в событиях бота — личные имена и текст не попадают в вывод', async () => {
+    const updates = {
+      ok: true,
+      result: [
+        { update_id: 1, message: { chat: { id: 555111, type: 'private', first_name: 'Секрет' }, text: 'очень личный текст' } },
+        { update_id: 2, my_chat_member: { chat: { id: -1009876, type: 'supergroup', title: 'Заявки' } } },
+        { update_id: 3, message: { chat: { id: 555111, type: 'private', first_name: 'Секрет' }, text: 'ещё' } },
+        { update_id: 4, message: { chat: { id: 'не число', type: 'private' } } },
+      ],
+    }
+    const calls = []
+    const res = await discoverTelegramChats({ TG_BOT_TOKEN: 'tok' }, async (url) => { calls.push(String(url)); return reply(200, updates) })
+    expect(res.chats).toEqual([{ chatId: '555111', type: 'private', title: '' }, { chatId: '-1009876', type: 'supergroup', title: 'Заявки' }])
+    expect(JSON.stringify(res)).not.toMatch(/Секрет|личный текст/)
+    expect(calls[0]).toContain('/getUpdates')
+    expect((await discoverTelegramChats({ TG_BOT_TOKEN: 't' }, async () => reply(200, { ok: true, result: [] }))).chats).toEqual([])
+    expect((await discoverTelegramChats({ TG_BOT_TOKEN: 't' }, async () => reply(401, '{}'))).error).toContain('токен')
+    expect((await discoverTelegramChats({}, async () => { throw new Error('нельзя') })).error).toContain('TG_BOT_TOKEN')
+    expect((await discoverTelegramChats({ TG_BOT_TOKEN: 't' }, async () => { throw new Error('обрыв') })).error).toContain('обрыв')
   })
 
   it('Telegram: полный путь и отказ по чату', async () => {

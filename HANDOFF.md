@@ -534,8 +534,8 @@ https://github.com/nevarium-spb/nevarium-crm/pull/2 — ветка
    (`server/backup.js`, `sendMaxDocument`) удалён — ADR-017. Бэкап базы один:
    автобэкап Timeweb. Независимой от аккаунта Timeweb копии нет — осознанный выбор.
 3. **Telegram-бот** — токен и chat_id НЕ заданы (в логах `TG_BOT_TOKEN/TG_CHAT_ID не заданы`); проверка — `npm run test-notify tg`
-   (написана, вживую не запускалась; режима поиска chat_id по событиям, как `max ids`, у Telegram пока нет). Решение владельца
-   «настраивать ли Telegram» — ждёт (MAX уже работает, ниже).
+   (написана, вживую не запускалась); chat_id находит `npm run test-notify tg ids` (по событиям бота, как `max ids`). Владелец
+   2026-10-20 решил настраивать Telegram — шаги в `deploy/README.md`; ждёт токен от @BotFather и запуск проверки на проде.
 4. ~~Баланс Timeweb~~ — пополнен, App Platform работает.
 5. ~~Снять `BOOTSTRAP_ADMIN_*` из настроек деплоя~~ — готово (2026-09-07). Первый админ
    создан, вошёл, переименован в «Александр» через `/crm/settings`.

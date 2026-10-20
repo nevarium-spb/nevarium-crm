@@ -122,6 +122,40 @@ export async function discoverMaxChats(env = process.env, fetchImpl = fetch) {
   return { chats: [...seen].map(([chatId, vias]) => ({ chatId, via: [...vias].join(', ') })) }
 }
 
+/**
+ * Telegram: какие чаты видит бот. Идентификатор берём из событий (getUpdates): написали боту /start или добавили его в
+ * группу. Текст сообщений и имена людей НЕ читаем и не выводим — только числовой chat_id, тип чата и название группы
+ * или канала. Возвращает { chats: [{chatId, type, title}], error? }.
+ */
+export async function discoverTelegramChats(env = process.env, fetchImpl = fetch) {
+  const token = String(env.TG_BOT_TOKEN || '').trim()
+  if (!token) return { chats: [], error: 'TG_BOT_TOKEN не задан' }
+  let res
+  try {
+    res = await fetchImpl(`https://api.telegram.org/bot${token}/getUpdates`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ limit: 100, timeout: 0 }),
+      signal: AbortSignal.timeout(20_000),
+    })
+  } catch (err) {
+    return { chats: [], error: `не удалось связаться с Telegram: ${err?.message || err}` }
+  }
+  if (res.status === 401 || res.status === 404) return { chats: [], error: 'Telegram не принял токен: проверьте TG_BOT_TOKEN (токен от @BotFather, целиком)' }
+  if (!res.ok) return { chats: [], error: String((await channelError('Telegram', res)).message) }
+  const body = await jsonOrNull(res)
+  const seen = new Map()
+  for (const u of body?.result || []) {
+    const chat = u?.message?.chat || u?.my_chat_member?.chat || u?.channel_post?.chat || u?.edited_message?.chat
+    if (chat?.id === undefined || chat?.id === null || !/^-?\d+$/.test(String(chat.id))) continue
+    const type = String(chat.type || 'chat')
+    // Название — только у групп и каналов; у личного чата это имя человека, его не показываем.
+    const title = type === 'private' ? '' : String(chat.title || '')
+    seen.set(String(chat.id), { chatId: String(chat.id), type, title })
+  }
+  return { chats: [...seen.values()] }
+}
+
 /** Telegram: токен → чат → тестовое сообщение. */
 export async function checkTelegram(env = process.env, fetchImpl = fetch) {
   const token = String(env.TG_BOT_TOKEN || '').trim()
@@ -196,6 +230,20 @@ if (isMain) {
     }
     for (const c of found.chats) console.log(`  chat_id: ${c.chatId}   (событие: ${c.via})`)
     console.log('\n  Это значение — в MAX_CHAT_ID (настройки приложения Timeweb). Потом перезапустите приложение и выполните `npm run test-notify max`.')
+    process.exit(0)
+  }
+  // `npm run test-notify tg ids` — найти chat_id: сначала напишите боту /start (или добавьте его в группу и напишите там).
+  if ((which === 'tg' || which === 'telegram') && String(process.argv[3] || '').toLowerCase() === 'ids') {
+    const found = await discoverTelegramChats()
+    console.log('\n=== Telegram: какие чаты видит бот ===')
+    if (found.error) { console.error(`  ${found.error}`); process.exit(1) }
+    if (!found.chats.length) {
+      console.log('  Событий нет. Откройте бота в Telegram, нажмите «Start» и напишите ему любое слово (либо добавьте бота в группу и напишите там),')
+      console.log('  затем сразу повторите эту команду. Если бот когда-то был подключён к вебхуку, Telegram событий не отдаёт.')
+      process.exit(1)
+    }
+    for (const c of found.chats) console.log(`  chat_id: ${c.chatId}   (${c.type}${c.title ? ` «${c.title}»` : ''})`)
+    console.log('\n  Это значение — в TG_CHAT_ID (настройки приложения Timeweb). Потом перезапустите приложение и выполните `npm run test-notify tg`.')
     process.exit(0)
   }
   if (which === 'all' || which === 'max') code |= await run('MAX', cfg.max, () => checkMax())
