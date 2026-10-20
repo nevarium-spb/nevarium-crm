@@ -375,6 +375,11 @@
   min-height: 44px;
 }
 .crm-form textarea { min-height: 70px; resize: vertical; }
+/* Раскрытый список у select рисует сам браузер: без явных цветов фон белый, а текст светлый — виден только выделенный пункт. */
+.crm-form select,
+.crm-select { color-scheme: dark; }
+.crm-form select option,
+.crm-select option { background: var(--bg-0); color: var(--text-1); }
 .crm-form input:focus,
 .crm-form select:focus,
 .crm-form textarea:focus { border-color: rgba(47, 107, 255, 0.55); outline: none; }
