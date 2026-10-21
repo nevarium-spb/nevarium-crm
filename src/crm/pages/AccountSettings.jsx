@@ -203,7 +203,7 @@ function AdminSettingsTile({ mailAvailable }) {
     e.preventDefault()
     setBusy(true)
     try {
-      const res = await api('/crm/settings', { method: 'PATCH', body: { notify: s.notify, reminderDays: s.reminderDays, freeLinkDays: s.freeLinkDays } })
+      const res = await api('/crm/settings', { method: 'PATCH', body: { notify: s.notify, clientMail: s.clientMail, reminderDays: s.reminderDays, freeLinkDays: s.freeLinkDays } })
       setS((x) => ({ ...x, ...res }))
       toast('Настройки сохранены')
     } catch (err) {
@@ -220,6 +220,17 @@ function AdminSettingsTile({ mailAvailable }) {
         <label className="tariff-check"><input type="checkbox" checked={s.notify.telegram} onChange={(e) => setS({ ...s, notify: { ...s.notify, telegram: e.target.checked } })} /> Telegram</label>
         <label className="tariff-check"><input type="checkbox" checked={s.notify.max} onChange={(e) => setS({ ...s, notify: { ...s.notify, max: e.target.checked } })} /> MAX</label>
         <div className="crm-cap">Выключенный канал ничего не получает и не копит очередь — при включении старые уведомления не придут. Тексты по-прежнему без персональных данных.</div>
+
+        <h3 style={{ margin: '10px 0 2px', fontSize: 14 }}>Письма клиентам</h3>
+        <label className="tariff-check">
+          <input type="checkbox" checked={Boolean(s.clientMail?.enabled)} onChange={(e) => setS({ ...s, clientMail: { ...s.clientMail, enabled: e.target.checked } })} />
+          Писать клиентам на почту: «Отчёт готов» и «Пришлите фото этапа»
+        </label>
+        <div className="crm-cap">
+          Включайте только после того, как сайт подтвердит, что новая редакция политики персональных данных выложена. В письме — только имя
+          и личная ссылка в кабинет; уходит на почту, которую клиент указал сам, если есть его согласие и он не просил не писать.
+          Пока выключено — письма не копятся и потом не придут.
+        </div>
 
         <h3 style={{ margin: '10px 0 2px', fontSize: 14 }}>За сколько дней напоминать о конце тарифа</h3>
         {Object.entries(PLAN_TITLES).map(([plan, title]) => (

@@ -1,9 +1,9 @@
-// Отправка СЛУЖЕБНЫХ писем сотрудникам CRM (ADR-020): восстановление пароля, смена email,
-// уведомление о смене пароля. Это единственное, для чего почта используется.
-//
-// ОГРАНИЧЕНИЕ (152-ФЗ, политика ПДн): никаких писем клиентам и никаких данных клиентов:
-// в тексты шаблонов (server/account.js) они не попадают, а получатель проверяется там же
-// (только адрес существующего сотрудника или подтверждаемый им новый).
+// Отправка писем. Два и только два назначения:
+//  1) СЛУЖЕБНЫЕ письма сотрудникам CRM (ADR-020): восстановление пароля, смена email, уведомление о смене пароля —
+//     шаблоны в server/account.js, получатель — только адрес существующего сотрудника или подтверждаемый им новый.
+//  2) Письма КЛИЕНТУ (ADR-025): закрытый набор из двух шаблонов («Отчёт готов», «Пришлите фото этапа») в server/client-mail.js —
+//     только имя и личная ссылка в кабинет, на адрес, который клиент указал сам, при наличии согласия; выключены настройкой,
+//     пока сайт не выложит новую редакцию политики ПДн. Других писем клиентам и других данных клиентов в письмах нет.
 //
 // Два способа отправки, настройки — только из переменных окружения (не в репозитории и не в логах):
 //  1) Yandex Cloud Postbox по HTTPS (AWS-совместимый API SES v2): POSTBOX_KEY_ID + POSTBOX_SECRET_KEY
@@ -30,12 +30,13 @@ const hmac = (key, data) => crypto.createHmac('sha256', key).update(data).digest
  * тестом на опубликованном AWS примере. headers — только те, что подписываем (host и x-amz-date обязательны).
  * Возвращает значение заголовка Authorization.
  */
-export function signV4({ method, path, headers, body = '', region, service, keyId, secret }) {
+// query — канонический query string (уже закодированный и отсортированный, например 'cors=' для настройки CORS бакета); обычно пусто.
+export function signV4({ method, path, query = '', headers, body = '', region, service, keyId, secret }) {
   const lower = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), String(v).trim()]))
   const names = Object.keys(lower).sort()
   const canonicalHeaders = names.map((n) => `${n}:${lower[n]}\n`).join('')
   const signedHeaders = names.join(';')
-  const canonical = [method, path, '', canonicalHeaders, signedHeaders, sha256hex(body)].join('\n')
+  const canonical = [method, path, query, canonicalHeaders, signedHeaders, sha256hex(body)].join('\n')
   const amzDate = lower['x-amz-date']
   const day = amzDate.slice(0, 8)
   const scope = `${day}/${region}/${service}/aws4_request`
@@ -67,11 +68,12 @@ export function createMailer(env = process.env, { fetchImpl = globalThis.fetch, 
   const configured = mode === 'postbox' ? Boolean(keyId && secret && RECIPIENT_RE.test(from)) : Boolean(host && user && pass && from)
   let transport = null
 
-  async function sendViaPostbox({ to, subject, text }) {
+  async function sendViaPostbox({ to, subject, text, fromName: nameOverride, replyTo }) {
     const url = new URL(`${endpoint}/v2/email/outbound-emails`)
     const body = JSON.stringify({
-      FromEmailAddress: `${fromName.replace(/[<>"\r\n]/g, '')} <${from}>`,
+      FromEmailAddress: `${String(nameOverride || fromName).replace(/[<>"\r\n]/g, '')} <${from}>`,
       Destination: { ToAddresses: [to] },
+      ...(replyTo ? { ReplyToAddresses: [replyTo] } : {}),
       Content: { Simple: { Subject: { Data: subject, Charset: 'UTF-8' }, Body: { Text: { Data: text, Charset: 'UTF-8' } } } },
     })
     const amzDate = clock().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '')
@@ -97,16 +99,22 @@ export function createMailer(env = process.env, { fetchImpl = globalThis.fetch, 
   return {
     configured,
     mode,
-    /** Только простой текст; адресат — одна почта. Ошибки наружу без ключей/пароля и адреса. */
-    async send({ to, subject, text }) {
+    /**
+     * Только простой текст; адресат — одна почта. Ошибки наружу без ключей/пароля и адреса.
+     * fromName / replyTo — необязательные: письма клиенту уходят от имени «Невариум Визор» с ответом на почту проекта (ADR-025);
+     * служебные письма сотрудникам их не передают и остаются как были.
+     */
+    async send({ to, subject, text, fromName: nameOverride, replyTo }) {
       if (!configured) throw new Error('smtp_not_configured')
       if (typeof to !== 'string' || !RECIPIENT_RE.test(to)) throw new Error('bad_recipient')
-      if (mode === 'postbox') return sendViaPostbox({ to, subject, text })
+      if (replyTo !== undefined && !RECIPIENT_RE.test(String(replyTo))) throw new Error('bad_reply_to')
+      if (mode === 'postbox') return sendViaPostbox({ to, subject, text, fromName: nameOverride, replyTo })
       transport ??= nodemailer.createTransport({
         host, port, secure: port === 465, auth: { user, pass },
         connectionTimeout: 10_000, greetingTimeout: 10_000, socketTimeout: 20_000,
       })
-      await transport.sendMail({ from, to, subject, text })
+      const name = String(nameOverride || '').replace(/[<>"\r\n]/g, '')
+      await transport.sendMail({ from: name ? `${name} <${from}>` : from, to, subject, text, ...(replyTo ? { replyTo } : {}) })
     },
   }
 }

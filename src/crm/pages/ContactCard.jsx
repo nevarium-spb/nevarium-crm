@@ -5,6 +5,7 @@ import { EntityModal } from '../forms.jsx'
 import { apiErrorToast, fmtMoney, onRefresh, relTime, toast } from '../ui.jsx'
 import { TariffBlock } from '../tariffs.jsx'
 import { MergeModal } from '../merge.jsx'
+import { UploadsBlock } from '../uploads.jsx'
 import { invoiceLabel, leadPlanTitle } from '../../shared/lead-fields.js'
 import { formatBytes } from './AccountSettings.jsx'
 
@@ -105,6 +106,7 @@ export default function ContactCard({ user }) {
             {[contact.company, contact.phone, contact.email, contact.messenger].filter(Boolean).join(' · ') || 'нет данных'}
             {contact.suspicious ? ' · ⚠ подозрительный' : ''}{contact.archived ? ' · в архиве' : ''}
             {contact.anonymized_at ? ' · 🔒 обезличен по запросу клиента' : ''}
+            {Number(contact.email_opt_out) ? ' · ✉ не писать на почту' : ''}
           </div>
         </div>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -179,6 +181,8 @@ export default function ContactCard({ user }) {
             <div className="crm-cap">Исходные файлы без сжатия, в них могут быть координаты съёмки — это данные клиента, не пересылайте их в мессенджеры.</div>
           </section>
         )}
+
+        <UploadsBlock contactId={contact.id} anonymized={Boolean(contact.anonymized_at)} />
 
         {isAdmin && dupCount > 0 && !contact.anonymized_at && (
           <section className="tile" aria-label="Возможные дубли">

@@ -426,7 +426,8 @@ function checkInput(b) {
  * @param deps.cabinetBaseUrl — база ссылки кабинета (без «/#/c/…»)
  */
 export function registerEntitlementRoutes(app, deps) {
-  const { db, withMutation, audit, now, mskToday, projectId, cabinetBaseUrl, hardRateLimited, applyCors, corsPreflight } = deps
+  // summaryExtras — (db, contactId, today) => { upload, reports }: приём этапа и PDF-отчёты кабинета (server/uploads.js, ADR-025).
+  const { db, withMutation, audit, now, mskToday, projectId, cabinetBaseUrl, hardRateLimited, applyCors, corsPreflight, summaryExtras } = deps
 
   // Действия с тарифами клиентов — ТОЛЬКО admin (решение владельца 2026-10-15, ADR-020; раньше —
   // любой вошедший). Чтение (карточка, значки) остаётся у всех. Сверяем канонический шаблон роута,
@@ -531,8 +532,12 @@ export function registerEntitlementRoutes(app, deps) {
     // Клиент Free (ссылка со сроком, ни одного действующего тарифа): предлагаем пакет
     // по типу объекта целиком — засчитывать нечего (дополнение к контракту, 2026-10-13).
     if (!offer && link.expires_on && !entitlements.some((e) => isActiveOn(e, today))) offer = packageOffer(objectType, 0)
+    // Приём фото/видео этапа (null — не открыт) и PDF-отчёты кабинета (задание сайта 2026-10-20).
+    const extras = summaryExtras ? await summaryExtras(db, link.contact_id, today) : { upload: null, reports: [] }
     return {
       client: { name: link.name },
+      upload: extras.upload,
+      reports: extras.reports,
       entitlements: shown.map((e) => describeEntitlement(e, checks, today)),
       offer,
       link: { expiresOn: link.expires_on || null },

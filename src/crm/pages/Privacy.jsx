@@ -274,6 +274,8 @@ const ACTION_LABEL = {
   delete: 'удалено',
   anonymize: 'обезличено',
   merge: 'карточки объединены',
+  view: 'открыт файл',
+  send: 'письмо клиенту',
   import: 'импорт данных',
   'demo-clear': 'очистка демо',
 }

@@ -98,6 +98,11 @@ export function EntityModal({ entity, initial = {}, onSaved, onClose }) {
               <label>Email<input type="email" value={values.email ?? ''} onChange={set('email')} maxLength={200} /></label>
             </div>
             <label>Мессенджер (Telegram/WhatsApp)<input value={values.messenger ?? ''} onChange={set('messenger')} maxLength={100} /></label>
+            <label className="tariff-check">
+              <input type="checkbox" checked={Boolean(Number(values.email_opt_out))}
+                onChange={(e) => { dirty.current = true; setValues((v) => ({ ...v, email_opt_out: e.target.checked ? 1 : 0 })) }} />
+              Не писать клиенту на почту (он ответил на письмо, что не хочет их получать)
+            </label>
             <label>Заметка<textarea value={values.note ?? ''} onChange={set('note')} maxLength={2000} /></label>
           </>
         )}

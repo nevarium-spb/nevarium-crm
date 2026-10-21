@@ -321,7 +321,7 @@ describe('настройки администратора', () => {
   it('настройки входят в дамп; дамп без них текущие не стирает', async () => {
     await crm('PATCH', '/api/crm/settings', { freeLinkDays: 21 })
     const dump = (await crm('GET', '/api/crm/export')).json()
-    expect(dump.version).toBe(9)
+    expect(dump.version).toBe(10)
     expect(dump.settings).toEqual([expect.objectContaining({ key: 'free_link_days', value: '21' })])
     const imported = await crm('POST', '/api/crm/import', dump)
     expect(imported.statusCode, imported.body).toBe(200)

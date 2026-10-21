@@ -11,6 +11,8 @@ import { registerEntitlementRoutes, deleteEntitlementsForContact } from './entit
 import { createMailer } from './mailer.js'
 import { registerAccountRoutes, recordLogin } from './account.js'
 import { createS3, registerPhotoRoutes, queuePhotoDeletion } from './photos.js'
+import { createUploads } from './uploads.js'
+import { runClientMailQueue } from './client-mail.js'
 import { LEAD_PLANS, INVOICE_CHANNELS, INVOICE_CONTACT_MAX, normalizeLeadPlan, normalizeInvoice, invoiceMessengerValue, invoiceLabel, leadPlanTitle } from '../src/shared/lead-fields.js'
 
 const COOKIE = 'nv_session'
@@ -166,9 +168,9 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // теряется, если идемпотентность включена, см. ниже).
   const HARD_LIMIT_WINDOW_MS = 10 * 60_000
   const HARD_LIMIT_MAX = 30
-  const hardHits = { leads: new Map(), pd_requests: new Map(), client_summary: new Map(), auth_forgot: new Map(), auth_token: new Map(), lead_photos: new Map() }
+  const hardHits = { leads: new Map(), pd_requests: new Map(), client_summary: new Map(), auth_forgot: new Map(), auth_token: new Map(), lead_photos: new Map(), client_upload: new Map() }
   // Фото: до 10 файлов на заявку, поэтому потолок на IP выше, чем у заявок (30), но тоже конечный.
-  const HARD_LIMIT_MAX_BY_SCOPE = { lead_photos: 120 }
+  const HARD_LIMIT_MAX_BY_SCOPE = { lead_photos: 120, client_upload: 300 }
   // Массив на IP держим ОГРАНИЧЕННЫМ: раз решили «уже сверх лимита», новые метки
   // времени больше не добавляем — независимая проверка нашла, что без этого сам
   // счётчик становится усилителем атаки: при затяжном флуде массив растёт на каждый
@@ -639,8 +641,30 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // Тарифы клиентов (ADR-019, контракт nevarium_vizor/docs/SUBSCRIPTIONS.md): /api/nvizor/
   // entitlements/* под ключом приложения (хук nvizor.js), /api/crm/* под входом в CRM,
   // /api/client/summary — публичный, с тем же CORS и лимитом по IP, что приём заявок.
+  // OPTIONS для публичных маршрутов сайта: домены из projects.origins, метод POST, разрешённые заголовки — свои у каждого маршрута.
+  const corsPreflightFor = (allowHeaders) => async (req, reply) => {
+    if (!(await leadOriginAllowed(req.headers.origin))) return reply.header('vary', 'Origin').code(403).send()
+    return reply
+      .header('vary', 'Origin')
+      .header('access-control-allow-origin', req.headers.origin)
+      .header('access-control-allow-methods', 'POST, OPTIONS')
+      .header('access-control-allow-headers', allowHeaders)
+      .header('access-control-max-age', '86400')
+      .code(204)
+      .send()
+  }
+
+  // Приём фото/видео этапа по личной ссылке, PDF-отчёты в кабинете, выдача файлов NVizor (ADR-025, задание сайта 2026-10-20).
+  const uploads = createUploads({
+    db, s3, withMutation, audit, now, mskToday, hardRateLimited, enqueue, cabinetBaseUrl,
+    applyCors: (req, reply) => applyLeadCors(req, reply),
+    corsPreflight: corsPreflightFor,
+    projectId: async () => (await resolveProjectId('nevarium-vizor')) || DEFAULT_PROJECT_ID,
+  })
+
   registerEntitlementRoutes(app, {
     db, withMutation, audit, now, mskToday, cabinetBaseUrl,
+    summaryExtras: uploads.summaryExtras,
     projectId: async () => (await resolveProjectId('nevarium-vizor')) || DEFAULT_PROJECT_ID,
     hardRateLimited,
     applyCors: (req, reply) => applyLeadCors(req, reply),
@@ -662,6 +686,11 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   registerPhotoRoutes(app, {
     db, s3, withMutation, audit, now, hardRateLimited, enqueue,
     limitBytes: photoLimitBytes,
+    // Общий фоновый проход раз в минуту: очистка и уведомления приёма этапа + очередь писем клиентам (выключена настройкой).
+    extraSweep: async () => {
+      await uploads.sweep()
+      await runClientMailQueue(db, { mailer, now, mskToday, cabinetBaseUrl, audit, log: app.log })
+    },
     applyCors: (req, reply) => applyLeadCors(req, reply),
     corsPreflight: async (req, reply) => {
       if (!(await leadOriginAllowed(req.headers.origin))) return reply.header('vary', 'Origin').code(403).send()
@@ -675,6 +704,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         .send()
     },
   })
+  uploads.register(app)
 
   // ---------- auth ----------
   // bodyLimit занижен до 4 КБ: логин принимает только email+пароль, а стандартный
@@ -784,7 +814,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // ---------- generic CRUD ----------
   const ENTITIES = {
     contacts: {
-      fields: ['name', 'company', 'phone', 'email', 'messenger', 'note', 'source', 'suspicious', 'archived', 'project_id'],
+      fields: ['name', 'company', 'phone', 'email', 'messenger', 'note', 'source', 'suspicious', 'archived', 'project_id', 'email_opt_out'],
       required: ['name'],
     },
     deals: { fields: ['contact_id', 'title', 'stage', 'amount', 'note', 'project_id', 'plan', 'invoice_channel', 'invoice_contact'], required: ['contact_id', 'title'] },
@@ -1388,7 +1418,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     // сюда, иначе импорт своего же экспорта падает с «bad_file». Добавляя колонку
     // в миграции — дописывай её и здесь (и в тест раунд-трипа).
     const EXTRA_COLS = {
-      contacts: ['suspicious', 'archived', 'anonymized_at'],
+      contacts: ['suspicious', 'archived', 'anonymized_at', 'email_opt_out'],
       deals: ['closed_at'],
       tasks: ['done', 'done_at', 'winback_sequence_id'],
       interactions: ['happened_at'],
@@ -2089,7 +2119,8 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // Добавил таблицу со ссылкой на контакт — допиши её сюда (иначе удаление лишней карточки упадёт на внешнем ключе
   // либо, у таблиц без FK, запись останется висеть на несуществующем id).
   const MERGE_TABLES = ['deals', 'tasks', 'interactions', 'winback_sequences', 'pd_requests', 'consents',
-    'entitlements', 'entitlement_checks', 'client_links', 'lead_intake', 'lead_photos']
+    'entitlements', 'entitlement_checks', 'client_links', 'lead_intake', 'lead_photos',
+    'upload_requests', 'upload_files', 'reports', 'client_emails']
 
   // Кандидаты в дубли для карточки — теми же правилами, что дедуп при приёме заявки (findExistingContact):
   // точное совпадение телефона (нормализованного), почты или ника, внутри проекта, мимо обезличенных. Только чтение.
@@ -2163,12 +2194,17 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       if (kept.length) noteParts.push(`Другие данные объединённой карточки #${dropId} — ${kept.join('; ')}`)
       const ts = now()
       await tx.prepare(`UPDATE contacts SET company = ?, phone = ?, email = ?, messenger = ?, note = ?,
-        archived = ?, suspicious = ?, updated_at = ? WHERE id = ?`)
+        archived = ?, suspicious = ?, email_opt_out = ?, updated_at = ? WHERE id = ?`)
         .run(patch.company ?? keep.company ?? '', patch.phone ?? keep.phone ?? '', patch.email ?? keep.email ?? '',
           patch.messenger ?? keep.messenger ?? '', noteParts.filter(Boolean).join('\n'),
-          // в архиве остаётся, только если в архиве были обе; «подозрительный» — только если были обе
-          keep.archived && drop.archived ? 1 : 0, keep.suspicious && drop.suspicious ? 1 : 0, ts, keepId)
+          // в архиве остаётся, только если в архиве были обе; «подозрительный» — только если были обе;
+          // отказ от писем — если отказалась хоть одна карточка (человек просил не писать — это нельзя потерять)
+          keep.archived && drop.archived ? 1 : 0, keep.suspicious && drop.suspicious ? 1 : 0,
+          Number(keep.email_opt_out) || Number(drop.email_opt_out) ? 1 : 0, ts, keepId)
 
+      // Отчёт с тем же номером у обеих карточек: у reports уникальна пара (контакт, номер) — лишнюю копию убираем, объект в очередь.
+      await tx.prepare('INSERT INTO photo_deletions (storage_key, created_at) SELECT storage_key, CAST(? AS TEXT) FROM reports WHERE contact_id = ? AND number IN (SELECT number FROM reports WHERE contact_id = ?)').run(ts, dropId, keepId)
+      await tx.prepare('DELETE FROM reports WHERE contact_id = ? AND number IN (SELECT number FROM reports WHERE contact_id = ?)').run(dropId, keepId)
       for (const table of MERGE_TABLES) {
         const res = await tx.prepare(`UPDATE ${table} SET contact_id = ? WHERE contact_id = ?`).run(keepId, dropId)
         if (res?.changes) moved[table] = res.changes

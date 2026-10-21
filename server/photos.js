@@ -49,19 +49,22 @@ export function createS3(env = process.env, { fetchImpl = globalThis.fetch, cloc
   const secret = String(env.S3_SECRET_KEY || '').trim()
   const configured = Boolean(endpoint && bucket && keyId && secret)
 
-  async function call(method, key, { body = Buffer.alloc(0), mime } = {}) {
+  // extra — заголовки, которые НЕ подписываем (Range); timeoutMs — для потоковой отдачи видео нужен долгий.
+  // key '' — запрос к самому бакету; query — подресурс без значения ('cors'); signedExtra — заголовки, которые надо подписать (Content-MD5).
+  async function call(method, key, { body = Buffer.alloc(0), mime, extra = {}, timeoutMs = 60_000, query = '', signedExtra = {} } = {}) {
     if (!configured) throw Object.assign(new Error('s3_not_configured'), { code: 'S3_NOT_CONFIGURED' })
-    const url = new URL(`${endpoint}/${bucket}/${key}`)
+    const url = new URL(key ? `${endpoint}/${bucket}/${key}` : `${endpoint}/${bucket}`)
+    if (query) url.search = query
     const amzDate = clock().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '')
     const payloadHash = body.length ? sha256hex(body) : EMPTY_SHA
-    const signed = { host: url.host, 'x-amz-content-sha256': payloadHash, 'x-amz-date': amzDate }
+    const signed = { host: url.host, 'x-amz-content-sha256': payloadHash, 'x-amz-date': amzDate, ...signedExtra }
     if (mime) signed['content-type'] = mime
-    const authorization = signV4({ method, path: url.pathname, headers: signed, body, region, service: 's3', keyId, secret })
-    const headers = { 'X-Amz-Content-Sha256': payloadHash, 'X-Amz-Date': amzDate, Authorization: authorization }
+    const authorization = signV4({ method, path: url.pathname, query: query ? `${query}=` : '', headers: signed, body, region, service: 's3', keyId, secret })
+    const headers = { 'X-Amz-Content-Sha256': payloadHash, 'X-Amz-Date': amzDate, Authorization: authorization, ...signedExtra, ...extra }
     if (mime) headers['Content-Type'] = mime
     let res
     try {
-      res = await fetchImpl(url, { method, headers, body: method === 'PUT' ? body : undefined, signal: AbortSignal.timeout(60_000) })
+      res = await fetchImpl(url, { method, headers, body: method === 'PUT' ? body : undefined, signal: AbortSignal.timeout(timeoutMs) })
     } catch (err) {
       throw Object.assign(new Error(err?.message || 'network'), { code: err?.name === 'TimeoutError' ? 'ETIMEDOUT' : 'ECONNECTION' })
     }
@@ -85,7 +88,81 @@ export function createS3(env = process.env, { fetchImpl = globalThis.fetch, cloc
       const res = await call('DELETE', key)
       if (!res.ok && res.status !== 404) throw Object.assign(new Error(`S3 DELETE ${res.status}`), { code: `HTTP_${res.status}` })
     },
+    /** Текущие правила CORS бакета (XML) или null, если не заданы. */
+    async getCors() {
+      const res = await call('GET', '', { query: 'cors' })
+      if (res.status === 404) return null
+      if (!res.ok) throw Object.assign(new Error(`S3 GET cors ${res.status}`), { code: `HTTP_${res.status}` })
+      return await res.text()
+    },
+    /** Заменить правила CORS бакета целиком (S3 требует Content-MD5 тела). */
+    async putCors(xml) {
+      const body = Buffer.from(xml)
+      const md5 = crypto.createHash('md5').update(body).digest('base64')
+      const res = await call('PUT', '', { query: 'cors', body, mime: 'application/xml', signedExtra: { 'content-md5': md5 } })
+      if (!res.ok) throw Object.assign(new Error(`S3 PUT cors ${res.status}`), { code: `HTTP_${res.status}` })
+    },
+    /** Размер и тип объекта без скачивания; null — объекта нет. Для проверки видео, залитого клиентом прямо в бакет. */
+    async head(key) {
+      const res = await call('HEAD', key)
+      if (res.status === 404) return null
+      if (!res.ok) throw Object.assign(new Error(`S3 HEAD ${res.status}`), { code: `HTTP_${res.status}` })
+      return { size: Number(res.headers.get('content-length') || 0), mime: res.headers.get('content-type') || '' }
+    },
+    /** Первые байты объекта (по сигнатуре видно, что это действительно видео). null — объекта нет. */
+    async getRange(key, from, to) {
+      const res = await call('GET', key, { extra: { Range: `bytes=${from}-${to}` } })
+      if (res.status === 404) return null
+      if (!res.ok && res.status !== 206) throw Object.assign(new Error(`S3 GET ${res.status}`), { code: `HTTP_${res.status}` })
+      return Buffer.from(await res.arrayBuffer())
+    },
+    /** Потоковая отдача (видео до 300 МБ в память не грузим): { body: ReadableStream, size } либо null. */
+    async stream(key) {
+      const res = await call('GET', key, { timeoutMs: 15 * 60_000 })
+      if (res.status === 404) return null
+      if (!res.ok) throw Object.assign(new Error(`S3 GET ${res.status}`), { code: `HTTP_${res.status}` })
+      return { body: res.body, size: Number(res.headers.get('content-length')) || null }
+    },
+    /**
+     * Подписанная форма загрузки (POST policy, SigV4) — клиент заливает файл прямо в приватный бакет, мимо лимита тела
+     * хостинга. Политика жёстко ограничивает ключ, тип и размер (content-length-range), срок — expiresSec.
+     * Возвращает { url, fields }: сайт шлёт multipart/form-data с этими полями, файл — ПОСЛЕДНИМ полем `file`.
+     */
+    presignPost({ key, mime, maxBytes, expiresSec = 1800 }) {
+      if (!configured) throw Object.assign(new Error('s3_not_configured'), { code: 'S3_NOT_CONFIGURED' })
+      const at = clock()
+      const amzDate = at.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '')
+      const credential = `${keyId}/${amzDate.slice(0, 8)}/${region}/s3/aws4_request`
+      const policy = {
+        expiration: new Date(at.getTime() + expiresSec * 1000).toISOString(),
+        conditions: [
+          { bucket },
+          ['eq', '$key', key],
+          ['eq', '$Content-Type', mime],
+          ['content-length-range', 1, maxBytes],
+          { 'x-amz-algorithm': 'AWS4-HMAC-SHA256' },
+          { 'x-amz-credential': credential },
+          { 'x-amz-date': amzDate },
+        ],
+      }
+      const policyB64 = Buffer.from(JSON.stringify(policy)).toString('base64')
+      return {
+        url: `${endpoint}/${bucket}`,
+        fields: {
+          key, 'Content-Type': mime,
+          'x-amz-algorithm': 'AWS4-HMAC-SHA256', 'x-amz-credential': credential, 'x-amz-date': amzDate,
+          policy: policyB64, 'x-amz-signature': signPostPolicy(policyB64, { secret, day: amzDate.slice(0, 8), region }),
+        },
+      }
+    },
   }
+}
+
+/** Подпись политики формы загрузки (SigV4): HMAC от base64-политики ключом, выведенным из секрета, даты, региона и сервиса s3. */
+export function signPostPolicy(policyB64, { secret, day, region, service = 's3' }) {
+  const hmac = (k, d) => crypto.createHmac('sha256', k).update(d).digest()
+  const signingKey = hmac(hmac(hmac(hmac(`AWS4${secret}`, day), region), service), 'aws4_request')
+  return crypto.createHmac('sha256', signingKey).update(policyB64).digest('hex')
 }
 
 /**
@@ -96,6 +173,17 @@ export async function queuePhotoDeletion(tx, where, nowIso) {
   const [cond, args] = where.all ? ['1 = 1', []] : where.dealId !== undefined ? ['deal_id = ?', [where.dealId]] : ['contact_id = ?', [where.contactId]]
   await tx.prepare(`INSERT INTO photo_deletions (storage_key, created_at) SELECT storage_key, CAST(? AS TEXT) FROM lead_photos WHERE ${cond}`).run(nowIso, ...args)
   await tx.prepare(`DELETE FROM lead_photos WHERE ${cond}`).run(...args)
+  // Фото и видео этапа (ADR-025), PDF-отчёты и очередь писем клиенту привязаны к ЧЕЛОВЕКУ, а не к заявке: уходят вместе с
+  // контактом, при обезличивании и импорте дампа (id контактов после восстановления другие — иначе файл достался бы чужому).
+  // Удаление одной сделки их не трогает.
+  if (where.dealId === undefined) {
+    for (const table of ['upload_files', 'reports']) {
+      await tx.prepare(`INSERT INTO photo_deletions (storage_key, created_at) SELECT storage_key, CAST(? AS TEXT) FROM ${table} WHERE ${cond}`).run(nowIso, ...args)
+      await tx.prepare(`DELETE FROM ${table} WHERE ${cond}`).run(...args)
+    }
+    await tx.prepare(`DELETE FROM upload_requests WHERE ${cond}`).run(...args)
+    await tx.prepare(`DELETE FROM client_emails WHERE ${cond}`).run(...args)
+  }
 }
 
 const safeName = (v) => {
@@ -105,7 +193,7 @@ const safeName = (v) => {
   return s.replace(/[\u0000-\u001f\u007f/\\]/g, '').trim().slice(0, 200)
 }
 
-export function registerPhotoRoutes(app, { db, s3, withMutation, audit, now, hardRateLimited, applyCors, corsPreflight, enqueue, limitBytes }) {
+export function registerPhotoRoutes(app, { db, s3, withMutation, audit, now, hardRateLimited, applyCors, corsPreflight, enqueue, limitBytes, extraSweep }) {
   // Тело — сырые байты (НЕ multipart). Парсер ТОЛЬКО для этих типов; другие маршруты и их потолки не затронуты.
   app.addContentTypeParser(PHOTO_MIME_TYPES, { parseAs: 'buffer', bodyLimit: PHOTO_BODY_LIMIT }, (req, body, done) => done(null, body))
 
@@ -193,14 +281,25 @@ export function registerPhotoRoutes(app, { db, s3, withMutation, audit, now, har
 
   /** Занятое место — для «Настроек» (без запросов к S3: считаем по таблице). */
   app.decorate('photoUsage', async () => {
-    const r = await db.prepare('SELECT COUNT(*) c, COALESCE(SUM(size), 0) bytes FROM lead_photos').get()
-    return { count: Number(r.c), bytes: Number(r.bytes), limitBytes: limitBytes ?? null, configured: s3.configured }
+    // Фото заявок + файлы этапа + PDF-отчёты: всё лежит в одном бакете.
+    let count = 0
+    let bytes = 0
+    for (const table of ['lead_photos', 'upload_files', 'reports']) {
+      const r = await db.prepare(`SELECT COUNT(*) c, COALESCE(SUM(size), 0) bytes FROM ${table}`).get()
+      count += Number(r.c)
+      bytes += Number(r.bytes)
+    }
+    return { count, bytes, limitBytes: limitBytes ?? null, configured: s3.configured }
   })
 
   // ---------- фон: раз в минуту ----------
   /** Один проход: просроченные записи приёма, число фото в мессенджеры, очередь удаления объектов. */
   async function sweep() {
     const ts = Date.now()
+    // Проходы соседних модулей (приём этапа, почтовая очередь): сбой одного не должен останавливать остальное.
+    if (extraSweep) {
+      try { await extraSweep() } catch (err) { app.log?.warn?.(`photos: дополнительный проход не удался: ${err}`) }
+    }
     await db.prepare('DELETE FROM lead_intake WHERE created_at < ?').run(new Date(ts - INTAKE_KEEP_MS).toISOString())
 
     // «📷 5 фото» — одно уведомление на заявку, через пару минут после первого фото (чтобы посчитать все).
