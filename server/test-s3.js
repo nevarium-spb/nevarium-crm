@@ -109,42 +109,46 @@ if (isMain) {
   console.log(`  S3_ACCESS_KEY: ${cfg.accessKeySet ? 'задан' : '— не задан'}`)
   console.log(`  S3_SECRET_KEY: ${cfg.secretSet ? 'задан' : '— не задан'}`)
   console.log(`  PHOTO_STORAGE_LIMIT_MB: ${cfg.limitMb} (лимит тарифа хранилища для счётчика в «Настройках»)`)
-  const s3 = createS3()
-  if (!s3.configured) {
-    console.error(`\n${explainS3Error({ code: 'S3_NOT_CONFIGURED' })}`)
-    process.exit(1)
-  }
-  const mode = String(process.argv[2] || '').toLowerCase()
-  // `npm run test-s3 cors` — показать правила CORS бакета; `npm run test-s3 cors apply` — выставить (только домены сайта, только POST).
-  if (mode === 'cors') {
-    const origins = String(process.env.S3_CORS_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean)
-    try {
-      if (String(process.argv[3] || '').toLowerCase() === 'apply') {
-        await s3.putCors(corsXml(origins.length ? origins : DEFAULT_CORS_ORIGINS))
-        console.log(`\nПравило CORS выставлено: POST с ${(origins.length ? origins : DEFAULT_CORS_ORIGINS).join(', ')}`)
-      }
-      const current = await s3.getCors()
-      console.log(`\nТекущие правила CORS бакета:\n${current || '— не заданы (выставить: npm run test-s3 cors apply)'}`)
-      process.exit(0)
-    } catch (err) {
-      console.error(`\nОШИБКА: ${err?.code || err?.message}\n  что это значит: ${explainS3Error(err)}`)
-      process.exit(1)
+  // Код выхода — через process.exitCode, а не process.exit(): exit() обрывает процесс, не дождавшись, пока консоль Timeweb
+  // допишет вывод, и последняя строка («Текущие правила…», «Готово…») терялась.
+  process.exitCode = await (async () => {
+    const s3 = createS3()
+    if (!s3.configured) {
+      console.error(`\n${explainS3Error({ code: 'S3_NOT_CONFIGURED' })}`)
+      return 1
     }
-  }
-  let code = 0
-  const print = (steps) => {
-    for (const s of steps) {
-      console.log(`\n${s.name}: ${s.ok ? 'OK' : 'ОШИБКА'}`)
-      if (!s.ok) {
-        code = 1
-        console.error(`  код: ${s.err?.code || '—'}${s.err?.detail ? ` (${s.err.detail})` : ''}`)
-        console.error(`  что это значит: ${explainS3Error(s.err)}`)
+    const mode = String(process.argv[2] || '').toLowerCase()
+    // `npm run test-s3 cors` — показать правила CORS бакета; `npm run test-s3 cors apply` — выставить (только домены сайта, только POST).
+    if (mode === 'cors') {
+      const origins = String(process.env.S3_CORS_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean)
+      try {
+        if (String(process.argv[3] || '').toLowerCase() === 'apply') {
+          await s3.putCors(corsXml(origins.length ? origins : DEFAULT_CORS_ORIGINS))
+          console.log(`\nПравило CORS выставлено: POST с ${(origins.length ? origins : DEFAULT_CORS_ORIGINS).join(', ')}`)
+        }
+        const current = await s3.getCors()
+        console.log(`\nТекущие правила CORS бакета:\n${current || '— не заданы (выставить: npm run test-s3 cors apply)'}`)
+        return 0
+      } catch (err) {
+        console.error(`\nОШИБКА: ${err?.code || err?.message}\n  что это значит: ${explainS3Error(err)}`)
+        return 1
       }
     }
-  }
-  print(await checkS3(s3))
-  console.log('\n--- Видео с телефона клиента прямо в бакет (подписанная форма) ---')
-  print(await checkS3Presign(s3))
-  if (!code) console.log('\nГотово: хранилище работает — фото из заявок и фото/видео этапа можно принимать.')
-  process.exit(code)
+    let code = 0
+    const print = (steps) => {
+      for (const s of steps) {
+        console.log(`\n${s.name}: ${s.ok ? 'OK' : 'ОШИБКА'}`)
+        if (!s.ok) {
+          code = 1
+          console.error(`  код: ${s.err?.code || '—'}${s.err?.detail ? ` (${s.err.detail})` : ''}`)
+          console.error(`  что это значит: ${explainS3Error(s.err)}`)
+        }
+      }
+    }
+    print(await checkS3(s3))
+    console.log('\n--- Видео с телефона клиента прямо в бакет (подписанная форма) ---')
+    print(await checkS3Presign(s3))
+    if (!code) console.log('\nГотово: хранилище работает — фото из заявок и фото/видео этапа можно принимать.')
+    return code
+  })()
 }
