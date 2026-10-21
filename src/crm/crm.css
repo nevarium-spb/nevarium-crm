@@ -600,6 +600,11 @@
     backdrop-filter: blur(var(--glass-blur));
   }
   .crm-logo, .crm-neva-hint, .crm-user { display: none; }
+  /* Пункты меню лежат внутри <nav>: полоса раскладывает в ряд только СВОИХ детей, поэтому без этого правила ссылки внутри
+     <nav> вставали столбиком и вылезали над полосой поверх списка. */
+  .crm-rail nav { display: flex; flex: 1; align-items: center; justify-content: space-around; min-width: 0; }
+  /* Заголовок плитки с кнопками справа («История»: Всё/Действия/Задачи) шире экрана — кнопки переносятся на вторую строку. */
+  .tile-title { flex-wrap: wrap; row-gap: 8px; }
   .crm-nav { flex-direction: column; gap: 2px; font-size: 10px; padding: 6px 8px; min-height: auto; }
   .crm-nav svg { width: 20px; height: 20px; }
   .crm-main { padding: 18px 14px 90px; }
