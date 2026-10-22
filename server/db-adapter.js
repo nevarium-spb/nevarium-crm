@@ -353,9 +353,13 @@ export async function resyncIdentitySequence(queryable, table) {
          pg_get_serial_sequence('${table}', 'id'),
          GREATEST(
            COALESCE((SELECT MAX(id) FROM ${table}), 1),
-           COALESCE((SELECT last_value FROM pg_sequences
-                     WHERE format('%I.%I', schemaname, sequencename)::regclass
-                         = pg_get_serial_sequence('${table}', 'id')::regclass), 1)
+           -- Сравнение ТЕКСТОМ, не ::regclass: приведение выполнялось для КАЖДОЙ строки pg_sequences, то есть для
+          -- последовательностей всех схем базы, и падало «schema … does not exist», если чужую схему в этот момент
+          -- удаляли (так делают параллельные тесты на настоящем Postgres — у каждого своя схема). Обе стороны —
+          -- в одном формате quote_ident «схема.последовательность».
+          COALESCE((SELECT last_value FROM pg_sequences
+                     WHERE format('%I.%I', schemaname, sequencename)
+                         = pg_get_serial_sequence('${table}', 'id')), 1)
          )
        )`
     )

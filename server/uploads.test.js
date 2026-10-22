@@ -8,7 +8,7 @@ import { buildApp, mskToday } from './app.js'
 import { hashPassword, resetThrottle } from './auth.js'
 import { now } from './db.js'
 import { createS3, signPostPolicy } from './photos.js'
-import { composeClientMail, maskEmail } from './client-mail.js'
+import { composeClientMail, greetingName, maskEmail } from './client-mail.js'
 import { VIDEO_MAX_BYTES } from './uploads.js'
 import { checkS3Presign, corsXml, DEFAULT_CORS_ORIGINS } from './test-s3.js'
 
@@ -297,8 +297,8 @@ describe('сотрудник и NVizor видят файлы', () => {
     expect((await crm('GET', '/api/crm/upload-files/999999')).statusCode).toBe(404)
 
     // NVizor
-    expect((await app.inject({ method: 'GET', url: `/api/nvizor/uploads?phone=${encodeURIComponent(PHONE)}` })).statusCode).toBe(401)
-    const nvList = (await nv('GET', `/api/nvizor/uploads?phone=${encodeURIComponent('8 (921) 555-14-88')}`)).json()
+    expect((await app.inject({ method: 'GET', url: '/api/nvizor/uploads', headers: { 'x-client-phone': PHONE } })).statusCode).toBe(401)
+    const nvList = (await nv('GET', '/api/nvizor/uploads', undefined, { 'x-client-phone': '8 (921) 555-14-88' })).json()
     expect(nvList.items).toHaveLength(1)
     expect(nvList.items[0]).toMatchObject({ id: op.id, stage: 'Электрика', open: true })
     expect(nvList.items[0].files).toHaveLength(2)
@@ -306,12 +306,12 @@ describe('сотрудник и NVizor видят файлы', () => {
     const file = await nv('GET', `/api/nvizor/uploads/files/${nvList.items[0].files[1].id}`)
     expect(file.statusCode).toBe(200)
     expect(file.rawPayload.length).toBe(900)
-    expect((await nv('GET', `/api/nvizor/uploads?phone=${encodeURIComponent('+79990009999')}`)).statusCode).toBe(404)
+    expect((await nv('GET', '/api/nvizor/uploads', undefined, { 'x-client-phone': '+79990009999' })).statusCode).toBe(404)
     // закрытый приём виден как закрытый, а давно закрытый в выдачу не попадает
     await nv('POST', `/api/nvizor/uploads/${op.id}/close`)
-    expect((await nv('GET', `/api/nvizor/uploads?phone=${encodeURIComponent(PHONE)}`)).json().items[0].open).toBe(false)
+    expect((await nv('GET', '/api/nvizor/uploads', undefined, { 'x-client-phone': PHONE })).json().items[0].open).toBe(false)
     await app.db.prepare("UPDATE upload_requests SET closed_at = '2020-01-01T00:00:00Z'").run()
-    expect((await nv('GET', `/api/nvizor/uploads?phone=${encodeURIComponent(PHONE)}`)).json().items).toEqual([])
+    expect((await nv('GET', '/api/nvizor/uploads', undefined, { 'x-client-phone': PHONE })).json().items).toEqual([])
   })
 
   it('число загрузок уходит в мессенджеры через пару минут после первого файла — без персональных данных, один раз', async () => {
@@ -640,5 +640,93 @@ describe('хранилище: проверка формы загрузки и п
     expect(calls[0].init.headers.Authorization).toMatch(/SignedHeaders=content-md5;content-type;host;x-amz-content-sha256;x-amz-date/)
     expect(JSON.stringify(calls[0].init.headers)).not.toContain('very-secret-key')
     expect(await real.getCors()).toBe(xml)
+  })
+})
+
+describe('проверка безопасности 2026-10-22', () => {
+  const videoUrl = (uploadId, token, body) => clientPost(`/api/client/upload/${uploadId}/video-url`, token, body)
+  /** s3.put с крючком: выполнить действие, пока файл «летит» в хранилище. */
+  const duringPut = (hook) => {
+    const orig = s3.put.bind(s3)
+    s3.put = async (...a) => { await hook(); s3.put = orig; return orig(...a) }
+  }
+
+  it('NVizor: телефон в адресе запроса — 400 (адрес пишется в журнал), заголовком — работает', async () => {
+    await vizorClient()
+    const inUrl = await nv('GET', `/api/nvizor/uploads?phone=${encodeURIComponent(PHONE)}`)
+    expect(inUrl.statusCode).toBe(400)
+    expect(inUrl.json().error).toBe('phone_in_url')
+    expect((await nv('GET', '/api/nvizor/uploads', undefined, { 'x-client-phone': PHONE })).statusCode).toBe(200)
+  })
+
+  it('повторная форма для видео: прежний ключ удаляется только после истечения формы (иначе по ней зальют объект-сироту)', async () => {
+    const id = await vizorClient()
+    const op = await openUpload(id)
+    const first = (await videoUrl(op.id, op.token, { index: 0, size: 10, type: 'video/mp4' })).json().fields.key
+    await videoUrl(op.id, op.token, { index: 0, size: 10, type: 'video/mp4' })
+    const row = await one('SELECT not_before FROM photo_deletions WHERE storage_key = ?', first)
+    expect(Date.parse(row.not_before) - Date.now()).toBeGreaterThan(30 * 60_000)
+    // клиент успел залить по старой форме — объект не удаляется до срока…
+    s3.store.set(first, { body: MP4(100), mime: 'video/mp4' })
+    await app.photoSweep()
+    expect(s3.store.has(first)).toBe(true)
+    // …а после срока удаляется
+    await app.db.prepare('UPDATE photo_deletions SET not_before = ? WHERE storage_key = ?').run('2020-01-01T00:00:00Z', first)
+    await app.photoSweep()
+    expect(s3.store.has(first)).toBe(false)
+  })
+
+  it('отклонённое «видео» и удаление контакта с незавершённым видео — ключ тоже удаляется с задержкой; готовые файлы — сразу', async () => {
+    const id = await vizorClient()
+    const op = await openUpload(id)
+    const bad = (await videoUrl(op.id, op.token, { index: 0, size: 10, type: 'video/mp4' })).json().fields.key
+    s3.store.set(bad, { body: Buffer.from('это текст, а не видеофайл, совсем'), mime: 'video/mp4' })
+    expect((await clientPost(`/api/client/upload/${op.id}/video-done`, op.token, { index: 0 })).statusCode).toBe(415)
+    expect((await one('SELECT not_before FROM photo_deletions WHERE storage_key = ?', bad)).not_before).toBeTruthy()
+
+    const pending = (await videoUrl(op.id, op.token, { index: 1, size: 10, type: 'video/mp4' })).json().fields.key
+    await photo(op.id, op.token, JPEG(), { idx: 0 })
+    const photoKey = (await one("SELECT storage_key FROM upload_files WHERE kind = 'photo'")).storage_key
+    await crm('POST', `/api/crm/contacts/${id}/anonymize`)
+    expect((await one('SELECT not_before FROM photo_deletions WHERE storage_key = ?', pending)).not_before).toBeTruthy()
+    expect((await one('SELECT not_before FROM photo_deletions WHERE storage_key = ?', photoKey)).not_before).toBeNull()
+  })
+
+  it('фото этапа: контакт обезличили, пока файл летел в хранилище — 404, строки нет, объект в очереди удаления', async () => {
+    const id = await vizorClient()
+    const op = await openUpload(id)
+    duringPut(() => crm('POST', `/api/crm/contacts/${id}/anonymize`))
+    expect((await photo(op.id, op.token, JPEG(), { idx: 0 })).statusCode).toBe(404)
+    expect(await count('SELECT COUNT(*) c FROM upload_files')).toBe(0)
+    await app.photoSweep()
+    expect(s3.store.size).toBe(0)
+  })
+
+  it('отчёт: контакт обезличили во время загрузки PDF — 404, отчёта нет, объект удалён', async () => {
+    const id = await vizorClient()
+    duringPut(() => crm('POST', `/api/crm/contacts/${id}/anonymize`))
+    expect((await publishReport(PHONE, PDF())).statusCode).toBe(404)
+    expect(await count('SELECT COUNT(*) c FROM reports')).toBe(0)
+    await app.photoSweep()
+    expect(s3.store.size).toBe(0)
+  })
+
+  it('фото из заявки (ADR-022): контакт удалили во время загрузки — 404, фото не повисает на удалённом человеке', async () => {
+    const id = await vizorClient()
+    const requestId = `u-${seq}`
+    duringPut(() => crm('POST', `/api/crm/contacts/${id}/anonymize`))
+    const res = await app.inject({ method: 'POST', url: `/api/leads/${requestId}/photos`, payload: JPEG(), headers: { 'content-type': 'image/jpeg', 'x-photo-index': '0', 'idempotency-key': `${requestId}:0` } })
+    expect(res.statusCode).toBe(404)
+    expect(await count('SELECT COUNT(*) c FROM lead_photos')).toBe(0)
+    await app.photoSweep()
+    expect(s3.store.size).toBe(0)
+  })
+
+  it('имя в приветствии письма: без ссылок и адресов, не длиннее 60 символов', () => {
+    expect(greetingName('Иван')).toBe('Иван')
+    for (const bad of ['Иван, срочно зайдите на https://evil.example', 'www.evil.ru', 'Иван evil.ru/pay', 'a@b.ru', 'Иван //x', '']) expect(greetingName(bad), bad).toBe('клиент')
+    expect(greetingName('Анна\nМария\t ')).toBe('Анна Мария')
+    expect(greetingName('Я'.repeat(80))).toBe(`${'Я'.repeat(60)}…`)
+    expect(composeClientMail('report_ready', { name: 'Иван — переходите на evil.ru', link: 'L', number: 'N' }).text).toMatch(/^Здравствуйте, клиент!/)
   })
 })

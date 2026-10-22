@@ -9,7 +9,7 @@
 // попадает в журналы), для кабинета и скачивания отчёта — телом запроса, как у /api/client/summary.
 import crypto from 'node:crypto'
 import { Readable } from 'node:stream'
-import { PHOTO_BODY_LIMIT, PHOTO_MAX_BYTES, sniffImage } from './photos.js'
+import { FORM_GRACE_MS, PHOTO_BODY_LIMIT, PHOTO_MAX_BYTES, sniffImage } from './photos.js'
 import { addDays, contactsByPhone, hashToken, linkExpiryFor, mskDateOf, newToken } from './entitlements.js'
 import { enqueueClientMail } from './client-mail.js'
 import { LIMITS, STAGES } from './shared/plans.js'
@@ -111,8 +111,16 @@ export function createUploads({ db, s3, withMutation, audit, now, mskToday, hard
     return reply.send(Readable.fromWeb(got.body))
   }
 
-  async function queueKey(runner, key) {
-    await runner.prepare('INSERT INTO photo_deletions (storage_key, created_at) VALUES (?, ?)').run(key, now())
+  // later — ключ, на который ещё может действовать выданная клиенту форма загрузки: удалить только после её истечения, иначе по живой
+  // форме объект зальют заново, и он останется в бакете без строки и без очереди (проверка безопасности 2026-10-22).
+  async function queueKey(runner, key, { later = false } = {}) {
+    const notBefore = later ? new Date(Date.now() + FORM_GRACE_MS).toISOString() : null
+    await runner.prepare('INSERT INTO photo_deletions (storage_key, created_at, not_before) VALUES (?, ?, ?)').run(key, now(), notBefore)
+  }
+
+  /** Приём ещё открыт? Под блокировкой строки — против удаления контакта/закрытия приёма в этот же момент. */
+  async function stillOpen(tx, uploadId) {
+    return Boolean(await tx.prepare('SELECT 1 FROM upload_requests WHERE id = ? AND closed_at IS NULL AND expires_on >= ? FOR UPDATE').get(uploadId, mskToday()))
   }
 
   // ---------- маршруты ----------
@@ -163,13 +171,17 @@ export function createUploads({ db, s3, withMutation, audit, now, mskToday, hard
         return reply.code(503).send({ error: 'storage_unavailable' })
       }
       const ts = now()
-      await withMutation(async (tx) => {
+      const gone = await withMutation(async (tx) => {
+        // Пока файл летел в хранилище, контакт могли удалить/обезличить или приём закрыть — тогда строку не пишем.
+        if (!(await stillOpen(tx, up.id))) { await queueKey(tx, key); return true }
         const r = await tx.prepare(`INSERT INTO upload_files (upload_id, contact_id, kind, idx, state, storage_key, mime, size, sha256, original_name, created_at)
           VALUES (?, ?, 'photo', ?, 'ready', ?, ?, ?, ?, ?, ?) ON CONFLICT (upload_id, kind, idx) DO NOTHING`)
           .run(up.id, up.contact_id, idx, key, kind.mime, body.length, sha256hex(body), safeName(req.headers['x-file-name']), ts)
-        if (!r.changes) { await queueKey(tx, key); return }
+        if (!r.changes) { await queueKey(tx, key); return false }
         await tx.prepare('UPDATE upload_requests SET first_file_at = COALESCE(first_file_at, ?) WHERE id = ?').run(ts, up.id)
+        return false
       })
+      if (gone) return reply.code(404).send()
       req.log?.info?.({ contactId: up.contact_id, upload: up.id, idx, size: body.length }, 'stage photo accepted')
       return reply.code(204).send()
     })
@@ -192,13 +204,16 @@ export function createUploads({ db, s3, withMutation, audit, now, mskToday, hard
         return reply.code(503).send({ error: 'photos_unavailable' })
       }
       const taken = await withMutation(async (tx) => {
+        if (!(await stillOpen(tx, up.id))) return 'gone'
         const prev = await tx.prepare("SELECT id, state, storage_key FROM upload_files WHERE upload_id = ? AND kind = 'video' AND idx = ? FOR UPDATE").get(up.id, index)
         if (prev?.state === 'ready') return true
-        if (prev) { await queueKey(tx, prev.storage_key); await tx.prepare('DELETE FROM upload_files WHERE id = ?').run(prev.id) }
+        // Прежняя форма ещё может действовать — её ключ удаляем с задержкой.
+        if (prev) { await queueKey(tx, prev.storage_key, { later: true }); await tx.prepare('DELETE FROM upload_files WHERE id = ?').run(prev.id) }
         await tx.prepare("INSERT INTO upload_files (upload_id, contact_id, kind, idx, state, storage_key, mime, size, created_at) VALUES (?, ?, 'video', ?, 'pending', ?, ?, ?, ?)")
           .run(up.id, up.contact_id, index, key, String(b.type), size, now())
         return false
       })
+      if (taken === 'gone') return reply.code(404).send()
       if (taken) return reply.code(409).send({ error: 'exists' })
       return { url: form.url, fields: form.fields, expiresIn: 1800 }
     })
@@ -225,16 +240,20 @@ export function createUploads({ db, s3, withMutation, audit, now, mskToday, hard
       if (!head || head.size < 1) return reply.code(404).send()
       const sane = head.size <= VIDEO_MAX_BYTES && first && first.toString('latin1', 4, 8) === 'ftyp'
       if (!sane) {
-        // Не видео или больше лимита — объект в очередь удаления, строку убираем.
-        await withMutation(async (tx) => { await queueKey(tx, row.storage_key); await tx.prepare('DELETE FROM upload_files WHERE id = ?').run(row.id) })
+        // Не видео или больше лимита — строку убираем, объект в очередь удаления С ЗАДЕРЖКОЙ: форма ещё может действовать.
+        await withMutation(async (tx) => { await queueKey(tx, row.storage_key, { later: true }); await tx.prepare('DELETE FROM upload_files WHERE id = ?').run(row.id) })
         return reply.code(415).send({ error: 'not_video' })
       }
       const ts = now()
-      await withMutation(async (tx) => {
-        await tx.prepare("UPDATE upload_files SET state = 'ready', size = ? WHERE id = ?").run(head.size, row.id)
+      const accepted = await withMutation(async (tx) => {
+        if (!(await stillOpen(tx, up.id))) return false
+        // Строку могли убрать параллельно (повторный video-url, удаление контакта) — подтверждаем только существующую.
+        const r = await tx.prepare("UPDATE upload_files SET state = 'ready', size = ? WHERE id = ? AND state = 'pending'").run(head.size, row.id)
+        if (!r.changes) return false
         await tx.prepare('UPDATE upload_requests SET first_file_at = COALESCE(first_file_at, ?) WHERE id = ?').run(ts, up.id)
+        return true
       })
-      return reply.code(204).send()
+      return reply.code(accepted ? 204 : 404).send()
     })
 
     // Скачивание отчёта из кабинета: ключ — в теле (как у /api/client/summary); любая ошибка — один и тот же 404.
@@ -366,8 +385,11 @@ export function createUploads({ db, s3, withMutation, audit, now, mskToday, hard
     const nvReq = systemReq('NVizor')
 
     // Открытые и недавно закрытые (или истёкшие за последние 14 дней) приёмы клиента с файлами.
+    // Телефон — ТОЛЬКО заголовком X-Client-Phone (как у публикации отчёта): адрес запроса целиком пишется в журнал приложения, а
+    // телефон клиента — персональные данные (проверка безопасности 2026-10-22). Телефон в адресе — отказ, чтобы так не делали.
     app.get('/api/nvizor/uploads', async (req, reply) => {
-      const phone = String(req.query?.phone || '').slice(0, 40)
+      if (req.query?.phone !== undefined) return reply.code(400).send({ error: 'phone_in_url', hint: 'передайте телефон заголовком X-Client-Phone' })
+      const phone = String(req.headers['x-client-phone'] || '').slice(0, 40)
       const contacts = await contactsByPhone(db, phone, await projectId())
       if (!phone || !contacts.length) return reply.code(404).send({ error: 'client_not_found' })
       const today = mskToday()
@@ -443,6 +465,11 @@ export function createUploads({ db, s3, withMutation, audit, now, mskToday, hard
       const ts = now()
       const today = mskToday()
       const mail = await withMutation(async (tx) => {
+        // Пока PDF летел в хранилище, контакт могли удалить или обезличить — тогда отчёт не записываем (в нём данные клиента).
+        if (!(await tx.prepare('SELECT 1 FROM contacts WHERE id = ? AND anonymized_at IS NULL FOR UPDATE').get(contactId))) {
+          await queueKey(tx, key)
+          return 'gone'
+        }
         const cur = await tx.prepare('SELECT id, storage_key FROM reports WHERE contact_id = ? AND number = ? FOR UPDATE').get(contactId, number)
         if (cur) {
           await queueKey(tx, cur.storage_key)
@@ -457,6 +484,7 @@ export function createUploads({ db, s3, withMutation, audit, now, mskToday, hard
         // Письмо «отчёт готов» — только о НОВОМ отчёте, не о новой версии того же номера.
         return enqueueClientMail(tx, { kind: 'report_ready', contactId, params: { number }, now, today })
       })
+      if (mail === 'gone') return reply.code(404).send({ error: 'client_not_found' })
       return reply.code(201).send({ ok: true, mail })
     })
   }

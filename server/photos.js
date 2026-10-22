@@ -19,6 +19,8 @@ export const ATTACH_WINDOW_MS = 60 * 60_000
 const INTAKE_KEEP_MS = 2 * 60 * 60_000
 const NOTIFY_AFTER_MS = 2 * 60_000
 const DELETE_MAX_ATTEMPTS = 50
+/** Сколько ждать с удалением ключа, на который может действовать выданная клиенту подписанная форма (она живёт 30 минут). */
+export const FORM_GRACE_MS = 35 * 60_000
 export const PHOTO_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif']
 
 const sha256hex = (data) => crypto.createHash('sha256').update(data).digest('hex')
@@ -177,10 +179,13 @@ export async function queuePhotoDeletion(tx, where, nowIso) {
   // контактом, при обезличивании и импорте дампа (id контактов после восстановления другие — иначе файл достался бы чужому).
   // Удаление одной сделки их не трогает.
   if (where.dealId === undefined) {
-    for (const table of ['upload_files', 'reports']) {
-      await tx.prepare(`INSERT INTO photo_deletions (storage_key, created_at) SELECT storage_key, CAST(? AS TEXT) FROM ${table} WHERE ${cond}`).run(nowIso, ...args)
-      await tx.prepare(`DELETE FROM ${table} WHERE ${cond}`).run(...args)
-    }
+    // Незавершённое видео (state = 'pending'): на его ключ ещё может действовать выданная форма — удаляем после её истечения.
+    const later = new Date(Date.parse(nowIso) + FORM_GRACE_MS).toISOString()
+    await tx.prepare(`INSERT INTO photo_deletions (storage_key, created_at, not_before)
+      SELECT storage_key, CAST(? AS TEXT), CASE WHEN state = 'pending' THEN CAST(? AS TEXT) ELSE NULL END FROM upload_files WHERE ${cond}`).run(nowIso, later, ...args)
+    await tx.prepare(`DELETE FROM upload_files WHERE ${cond}`).run(...args)
+    await tx.prepare(`INSERT INTO photo_deletions (storage_key, created_at) SELECT storage_key, CAST(? AS TEXT) FROM reports WHERE ${cond}`).run(nowIso, ...args)
+    await tx.prepare(`DELETE FROM reports WHERE ${cond}`).run(...args)
     await tx.prepare(`DELETE FROM upload_requests WHERE ${cond}`).run(...args)
     await tx.prepare(`DELETE FROM client_emails WHERE ${cond}`).run(...args)
   }
@@ -235,6 +240,12 @@ export function registerPhotoRoutes(app, { db, s3, withMutation, audit, now, har
     }
     const ts = now()
     const inserted = await withMutation(async (tx) => {
+      // Пока файл летел в хранилище, контакт могли удалить или обезличить (это стирает lead_intake): тогда строку не пишем —
+      // иначе фото с координатами осталось бы висеть на несуществующем человеке. Блокировка — против того же удаления параллельно.
+      if (!(await tx.prepare('SELECT 1 FROM lead_intake WHERE request_id = ? FOR UPDATE').get(requestId))) {
+        await tx.prepare('INSERT INTO photo_deletions (storage_key, created_at) VALUES (?, ?)').run(key, ts)
+        return null
+      }
       const r = await tx.prepare('INSERT INTO lead_photos (contact_id, deal_id, request_id, idx, storage_key, mime, size, sha256, original_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (request_id, idx) DO NOTHING')
         .run(intake.contact_id, intake.deal_id, requestId, idx, key, kind.mime, body.length, sha256hex(body), safeName(req.headers['x-file-name']), ts)
       if (!r.changes) {
@@ -245,6 +256,7 @@ export function registerPhotoRoutes(app, { db, s3, withMutation, audit, now, har
       await tx.prepare('UPDATE lead_intake SET first_photo_at = COALESCE(first_photo_at, ?) WHERE request_id = ?').run(ts, requestId)
       return true
     })
+    if (inserted === null) return reply.code(404).send() // заявку удалили, пока шла загрузка: объект уже в очереди удаления
     req.log?.info?.({ contactId: intake.contact_id, idx, size: body.length, inserted }, 'lead photo accepted')
     return reply.code(204).send()
   })
@@ -314,7 +326,8 @@ export function registerPhotoRoutes(app, { db, s3, withMutation, audit, now, har
     }
 
     if (!s3.configured) return
-    const queue = await db.prepare('SELECT id, storage_key, attempts FROM photo_deletions WHERE attempts < ? ORDER BY id LIMIT 20').all(DELETE_MAX_ATTEMPTS)
+    const queue = await db.prepare('SELECT id, storage_key, attempts FROM photo_deletions WHERE attempts < ? AND (not_before IS NULL OR not_before < ?) ORDER BY id LIMIT 20')
+      .all(DELETE_MAX_ATTEMPTS, new Date(ts).toISOString())
     for (const row of queue) {
       try {
         await s3.del(row.storage_key)

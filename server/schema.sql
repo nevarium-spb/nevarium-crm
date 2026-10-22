@@ -326,6 +326,10 @@ CREATE TABLE IF NOT EXISTS upload_requests (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_upload_requests_contact ON upload_requests(contact_id);
+-- Отложенное удаление (проверка безопасности 2026-10-22): ключ видео, на который ещё может действовать выданная клиенту
+-- подписанная форма (30 минут), удаляем только после её истечения — иначе по живой форме залили бы объект заново, и он остался бы
+-- в бакете без строки и без очереди. NULL — удалять сразу.
+ALTER TABLE photo_deletions ADD COLUMN IF NOT EXISTS not_before TEXT;
 -- state: pending — видео ещё не подтверждено (клиент получил подписанную форму, объект может быть в бакете или нет);
 -- ready — файл принят. Незавершённые чистятся фоном через час.
 CREATE TABLE IF NOT EXISTS upload_files (

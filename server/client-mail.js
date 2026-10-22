@@ -22,9 +22,22 @@ const FOOTER = '—\nВы получили письмо, потому что о�
 
 const ruDate = (d) => (d ? `${String(d).slice(8, 10)}.${String(d).slice(5, 7)}.${String(d).slice(0, 4)}` : '')
 
+/**
+ * Имя для приветствия. Его вводит кто угодно в форме заявки, а письмо уходит с нашего адреса — поэтому имя не длиннее 60 символов
+ * и без ссылок/адресов: иначе «имя» вида «Иван, срочно перейдите на evil.example» превращало бы письмо CRM в чужую рассылку
+ * (проверка безопасности 2026-10-22). Подозрительное — нейтральное «клиент».
+ */
+export function greetingName(raw) {
+  // eslint-disable-next-line no-control-regex
+  const s = String(raw || '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim()
+  if (!s) return 'клиент'
+  if (/(https?:|\/\/|www\.|@|[a-z0-9-]+\.(ru|рф|com|net|org|io|me|info|xyz|online|site|top|club|pro|su|biz)\b)/iu.test(s)) return 'клиент'
+  return s.length > 60 ? `${s.slice(0, 60).trimEnd()}…` : s
+}
+
 /** Тексты писем (утверждены владельцем). Чистая функция — тест проверяет дословно. */
 export function composeClientMail(kind, { name, link, number = '', stage = '', until = '', guideUrl = '' }) {
-  const hello = `Здравствуйте, ${String(name || '').trim() || 'клиент'}!`
+  const hello = `Здравствуйте, ${greetingName(name)}!`
   if (kind === 'report_ready') {
     return {
       subject: 'Отчёт готов — Невариум Визор',
