@@ -12,6 +12,7 @@ import { createMailer } from './mailer.js'
 import { registerAccountRoutes, recordLogin } from './account.js'
 import { createS3, registerPhotoRoutes, queuePhotoDeletion } from './photos.js'
 import { createUploads } from './uploads.js'
+import { createIntake, INTAKE_ROUTES } from './intake.js'
 import { runClientMailQueue } from './client-mail.js'
 import { LEAD_PLANS, INVOICE_CHANNELS, INVOICE_CONTACT_MAX, normalizeLeadPlan, normalizeInvoice, invoiceMessengerValue, invoiceLabel, leadPlanTitle } from '../src/shared/lead-fields.js'
 
@@ -56,7 +57,9 @@ const CLIENT_CABINET_URL = (trim(process.env.CLIENT_CABINET_URL, 300) || 'https:
 // dbConfig (было dbFile — SQLite-путь; перевод на Postgres, план в nevarium-lab#3):
 // строка подключения (DATABASE_URL, прод) ИЛИ уже готовый Pool-совместимый объект
 // (тесты — pg-mem). Без аргумента openDb() сама берёт process.env.DATABASE_URL.
-export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true, logger = false, staticDir = null, trustProxy = TRUST_PROXY, appOrigin = APP_ORIGIN, nvizorToken = NVIZOR_APP_TOKEN, cabinetBaseUrl = CLIENT_CABINET_URL, mailer = createMailer(), s3 = createS3(), photoLimitBytes = (Number(process.env.PHOTO_STORAGE_LIMIT_MB) || 1024) * 1024 * 1024, forgotDelayMs = 700, crmBaseUrl = trim(process.env.CRM_BASE_URL, 300) || null } = {}) {
+export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true, logger = false, staticDir = null, trustProxy = TRUST_PROXY, appOrigin = APP_ORIGIN, nvizorToken = NVIZOR_APP_TOKEN, cabinetBaseUrl = CLIENT_CABINET_URL, mailer = createMailer(), s3 = createS3(), photoLimitBytes = (Number(process.env.PHOTO_STORAGE_LIMIT_MB) || 1024) * 1024 * 1024, forgotDelayMs = 700, crmBaseUrl = trim(process.env.CRM_BASE_URL, 300) || null, intakeMode = process.env.INTAKE_MODE, intakeAllowedOrigins = process.env.INTAKE_ALLOWED_ORIGINS } = {}) {
+  // Режим «приём закрыт» (ADR-026). Разбирается ДО открытия базы: опечатка в INTAKE_MODE — ошибка запуска, а не молча открытый приём.
+  const intake = createIntake({ mode: intakeMode, allowedRaw: intakeAllowedOrigins, devLocalhost: !secure })
   const db = await openDb(dbConfig)
   // trustProxy — число доверенных прокси-хопов, НЕ `true`. С `true` Fastify берёт
   // самый левый X-Forwarded-For как req.ip, а его подставляет клиент — тогда всё,
@@ -98,6 +101,18 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     // на Caddy, а до контейнера доходит http — заголовок всё равно валиден для клиента.
     reply.header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
     reply.header('Content-Security-Policy', CSP)
+  })
+
+  // Приём закрыт (INTAKE_MODE=closed, ADR-026): публичные маршруты приёма данных людей принимают только домены стендов.
+  // Именно onRequest: отказ приходит ДО разбора тела (фото — до 15 МБ) и до записи чего-либо, включая ключ идемпотентности.
+  // CORS-заголовок ставим, чтобы сайт мог прочитать отказ, а не получил слепую ошибку CORS. Маршрут — по шаблону (routeOptions.url),
+  // не по req.url: закодированный адрес (`/api/%6Ceads`) ведёт на тот же маршрут и мимо проверки не пройдёт.
+  app.addHook('onRequest', async (req, reply) => {
+    if (!intake.closed || req.method !== 'POST' || !INTAKE_ROUTES.has(req.routeOptions?.url)) return
+    if (intake.accepts(req.headers.origin)) return
+    intake.noteRefused(req.headers.origin, now())
+    await applyLeadCors(req, reply)
+    return reply.code(403).send({ error: 'intake_closed' })
   })
 
   // «Не дождались барьера обслуживания» — это НЕ сбой приложения, а «идёт
@@ -897,7 +912,8 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   let projectsOriginCache = []
   async function refreshProjectsOriginCache() {
     try {
-      projectsOriginCache = await db.prepare("SELECT id, slug, display_name, origins FROM projects WHERE archived = 0 AND origins != ''").all()
+      // Без условия на origins: проект стенда (INTAKE_ALLOWED_ORIGINS=…=slug) ищется по slug, даже если домены у него не заданы.
+      projectsOriginCache = await db.prepare('SELECT id, slug, display_name, origins FROM projects WHERE archived = 0').all()
     } catch (err) {
       // Транзиентный сбой БД не должен затирать последний РАБОЧИЙ кеш — оставляем
       // прежний список как есть, следующий тик (или явный вызов) попробует снова.
@@ -905,6 +921,10 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     }
   }
   await refreshProjectsOriginCache()
+  // Опечатка в slug у домена стенда не роняет запуск (проекты в базе, не в коде), но заявки со стенда ушли бы в проект по умолчанию — предупреждаем.
+  for (const a of intake.closed ? intake.allowed : []) {
+    if (a.project && !projectsOriginCache.some((p) => p.slug === a.project)) app.log?.warn?.({ origin: a.origin, project: a.project }, 'INTAKE_ALLOWED_ORIGINS: проект не найден, заявки с этого адреса уйдут в проект по умолчанию')
+  }
   const projectsCacheTimer = setInterval(refreshProjectsOriginCache, 60_000)
   projectsCacheTimer.unref?.()
   app.addHook('onClose', (_i, done) => {
@@ -919,6 +939,10 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   function projectByOrigin(origin) {
     const o = trim(origin, 200).toLowerCase().replace(/\/+$/, '')
     if (!o) return null
+    // Домен стенда из INTAKE_ALLOWED_ORIGINS (только в закрытом режиме) с указанным проектом.
+    const stand = intake.originEntry(o)
+    const standProject = stand?.project ? projectsOriginCache.find((p) => p.slug === stand.project) : null
+    if (standProject) return standProject
     return (
       projectsOriginCache.find((p) =>
         p.origins
@@ -2244,6 +2268,9 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     }
   })
 
+  // Режим приёма (ADR-026) — для плашки «Приём закрыт (стенд)» в «Настройках». Счётчик отказов — в памяти, с запуска процесса.
+  app.get('/api/crm/intake', async () => intake.status())
+
   // ---------- публичный приём лидов ----------
   // Единственная точка без авторизации, поэтому CORS ровно для неё и строго по
   // списку origins проектов (+ localhost в dev). Без этого браузер не даст сайтам
@@ -2252,6 +2279,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     const o = trim(origin, 200)
     if (!o) return false
     if (!secure && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(o)) return true
+    if (intake.originEntry(o)) return true
     return Boolean(await projectByOrigin(o))
   }
 

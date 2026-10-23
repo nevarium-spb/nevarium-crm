@@ -8,11 +8,13 @@ export default function Settings({ user }) {
   const [users, setUsers] = useState([])
   const [diag, setDiag] = useState(null)
   const [userModal, setUserModal] = useState(null) // {} для нового, user для сброса пароля
+  const [intake, setIntake] = useState(null)
   const fileRef = useRef(null)
 
   const load = useCallback(() => {
     api('/crm/users').then((r) => setUsers(r.items)).catch(apiErrorToast)
     repo.diagnostics().then(setDiag).catch(() => setDiag(null))
+    api('/crm/intake').then(setIntake).catch(() => setIntake(null))
   }, [])
   useEffect(load, [load])
 
@@ -82,6 +84,7 @@ export default function Settings({ user }) {
     <>
       <h1 className="crm-h1">Настройки</h1>
       <div className="crm-sub">Вы вошли как {user.name} ({user.role === 'admin' ? 'администратор' : 'участник'})</div>
+      {intake?.closed && <IntakeBanner intake={intake} />}
       <div className="settings-grid">
         <AccountSettings user={user} />
         <section className="tile" aria-label="Команда">
@@ -225,5 +228,28 @@ function UserModal({ existing, onDone, onClose }) {
         </div>
       </form>
     </Modal>
+  )
+}
+
+/** Приём закрыт (INTAKE_MODE=closed, ADR-026): какие домены стендов пропускаются и сколько запросов отклонено с запуска сервера. */
+function IntakeBanner({ intake }) {
+  const allowed = intake.allowedOrigins || []
+  const last = intake.lastRefused
+  return (
+    <div className="intake-banner" role="status">
+      <b>Приём закрыт (стенд)</b>
+      <div>
+        Заявки, запросы по персональным данным, фото и загрузки клиентов принимаются только с доменов стендов — данные настоящих
+        людей в CRM не попадают. Вход сотрудников, кабинеты и NVizor работают. Открыть приём — убрать переменную INTAKE_MODE в Timeweb
+        (на общем запуске, после удаления тестовых данных и уведомления в РКН).
+      </div>
+      <div>
+        Домены стендов: {allowed.length ? allowed.map((a) => (a.project ? `${a.origin} → ${a.project}` : a.origin)).join(', ') : 'не заданы — приём закрыт для всех'}
+      </div>
+      <div>
+        Отклонено с запуска сервера: {intake.refused}
+        {last ? ` (последний — ${new Date(last.at).toLocaleString('ru-RU')}, ${last.origin || 'без домена'})` : ''}
+      </div>
+    </div>
   )
 }
