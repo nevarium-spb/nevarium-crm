@@ -118,7 +118,7 @@ describe('открыть приём (сотрудник)', () => {
     expect(op.message).toContain(op.url)
     expect(op.mail).toBe('disabled')
     const s = await summary(op.token)
-    expect(s.upload).toEqual({ id: op.id, stage: 'Электрика', kind: 'primary', photos: { limit: 30, used: 0 }, videos: { limit: 2, used: 0 }, expiresOn: op.expiresOn })
+    expect(s.upload).toEqual({ id: op.id, stage: 'Электрика', kind: 'primary', photos: { limit: 30, used: 0, nextIndex: 0 }, videos: { limit: 2, used: 0, nextIndex: 0 }, expiresOn: op.expiresOn })
     expect(s.reports).toEqual([])
     expect((await one("SELECT detail FROM audit_log WHERE entity = 'upload_requests'")).detail).toContain('Электрика')
   })
@@ -166,7 +166,7 @@ describe('фото этапа по ссылке', () => {
     expect(await count("SELECT COUNT(*) c FROM upload_files WHERE kind = 'photo'")).toBe(2)
     expect([...s3.store.values()].some((o) => o.body.equals(buf))).toBe(true)
     expect((await one("SELECT original_name FROM upload_files WHERE idx = 0 AND kind = 'photo'")).original_name).toBe('IMG 1.jpg')
-    expect((await summary(op.token)).upload.photos).toEqual({ limit: 30, used: 2 })
+    expect((await summary(op.token)).upload.photos).toEqual({ limit: 30, used: 2, nextIndex: 2 })
   })
 
   it('ошибки: чужой/неверный ключ и чужой приём — 404; не картинка 415; большой 413; номер ≥ лимита 409; плохой номер 400', async () => {
@@ -235,7 +235,7 @@ describe('видео этапа: прямо в бакет', () => {
     s3.store.set(fields.key, { body: MP4(5000), mime: 'video/mp4' })
     expect((await videoDone(op.id, op.token, 0)).statusCode).toBe(204)
     expect((await videoDone(op.id, op.token, 0)).statusCode).toBe(204)
-    expect((await summary(op.token)).upload.videos).toEqual({ limit: 2, used: 1 })
+    expect((await summary(op.token)).upload.videos).toEqual({ limit: 2, used: 1, nextIndex: 1 })
     expect((await videoUrl(op.id, op.token, { index: 0, size: 10, type: 'video/mp4' })).statusCode).toBe(409)
     expect((await one("SELECT size FROM upload_files WHERE kind = 'video'")).size).toBe(5000)
   })
@@ -728,5 +728,29 @@ describe('проверка безопасности 2026-10-22', () => {
     expect(greetingName('Анна\nМария\t ')).toBe('Анна Мария')
     expect(greetingName('Я'.repeat(80))).toBe(`${'Я'.repeat(60)}…`)
     expect(composeClientMail('report_ready', { name: 'Иван — переходите на evil.ru', link: 'L', number: 'N' }).text).toMatch(/^Здравствуйте, клиент!/)
+  })
+})
+describe('кабинет: следующий свободный номер (nextIndex, предложение сайта 2026-10-23)', () => {
+  it('пропуски заполняются; незавершённое видео номер не занимает; всё занято — null', async () => {
+    const id = await vizorClient()
+    const op = await openUpload(id, { stage_title: 'Повтор', kind: 'recheck' }) // 10 фото, без видео
+    await photo(op.id, op.token, JPEG(), { idx: 0 })
+    await photo(op.id, op.token, JPEG(), { idx: 2 })
+    expect((await summary(op.token)).upload.photos).toEqual({ limit: 10, used: 2, nextIndex: 1 })
+    expect((await summary(op.token)).upload.videos).toEqual({ limit: 0, used: 0, nextIndex: null })
+    for (const i of [1, 3, 4, 5, 6, 7, 8, 9]) await photo(op.id, op.token, JPEG(), { idx: i })
+    expect((await summary(op.token)).upload.photos.nextIndex).toBeNull()
+
+    const prim = await openUpload(id, { stage_code: 'plumbing' })
+    await clientPost(`/api/client/upload/${prim.id}/video-url`, prim.token, { index: 0, size: 10, type: 'video/mp4' })
+    expect((await summary(prim.token)).upload.videos.nextIndex).toBe(0)
+  })
+
+  it('письмо «Пришлите фото этапа» по умолчанию содержит памятку сайта', async () => {
+    const id = await vizorClient()
+    await enableClientMail()
+    await openUpload(id)
+    await app.photoSweep()
+    expect(mailer.sent[0].text).toContain('Как снимать: https://nevarium-vizor.ru/photo-guide')
   })
 })

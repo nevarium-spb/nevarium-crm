@@ -67,6 +67,18 @@ export function createUploads({ db, s3, withMutation, audit, now, mskToday, hard
       .get(uploadId, contactId, mskToday(), mskToday())) || null
   }
 
+  /**
+   * Следующий свободный номер фото и видео (предложение сайта 2026-10-23): сайт сам считал номер как used + порядковый, и после
+   * неудачной загрузки и повторного открытия кабинета номер совпадал с занятым — CRM отвечала 204 (повтор) и новый файл не сохраняла.
+   * Занятым считается номер с принятым файлом; у видео незавершённая форма (pending) номер не занимает — её заменит новая. null — всё занято.
+   */
+  async function nextIndexes(up, runner = db) {
+    const rows = await runner.prepare('SELECT kind, idx, state FROM upload_files WHERE upload_id = ?').all(up.id)
+    const busy = (kind) => new Set(rows.filter((r) => r.kind === kind && (kind === 'photo' || r.state === 'ready')).map((r) => Number(r.idx)))
+    const first = (limit, taken) => { for (let i = 0; i < limit; i++) if (!taken.has(i)) return i; return null }
+    return { photo: first(up.photos_limit, busy('photo')), video: first(up.videos_limit, busy('video')) }
+  }
+
   async function usageOf(uploadId, runner = db) {
     const rows = await runner.prepare("SELECT kind, COUNT(*) c FROM upload_files WHERE upload_id = ? AND state = 'ready' GROUP BY kind").all(uploadId)
     const by = Object.fromEntries(rows.map((r) => [r.kind, Number(r.c)]))
@@ -79,9 +91,11 @@ export function createUploads({ db, s3, withMutation, audit, now, mskToday, hard
     let upload = null
     if (up) {
       const used = await usageOf(up.id, runner)
+      const next = await nextIndexes(up, runner)
       upload = {
         id: up.id, stage: up.stage_title, kind: up.kind,
-        photos: { limit: up.photos_limit, used: used.photos }, videos: { limit: up.videos_limit, used: used.videos },
+        photos: { limit: up.photos_limit, used: used.photos, nextIndex: next.photo },
+        videos: { limit: up.videos_limit, used: used.videos, nextIndex: next.video },
         expiresOn: up.expires_on,
       }
     }

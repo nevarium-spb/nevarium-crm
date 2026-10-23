@@ -17,6 +17,8 @@ export const CLIENT_MAIL_KINDS = ['report_ready', 'upload_request']
 const MAX_ATTEMPTS = 10
 const DEFAULT_FROM_NAME = 'Невариум Визор'
 const DEFAULT_REPLY_TO = 'nvizor-spb@yandex.ru'
+// Памятка «Как снимать» на сайте Визора (сообщение сайта 2026-10-23). CLIENT_GUIDE_URL переопределяет; пустая строка — без фразы.
+const DEFAULT_GUIDE_URL = 'https://nevarium-vizor.ru/photo-guide'
 
 const FOOTER = '—\nВы получили письмо, потому что оставили заявку на nevarium-vizor.ru. Не хотите получать письма — ответьте на это письмо.'
 
@@ -137,7 +139,7 @@ export async function runClientMailQueue(db, { mailer, now, mskToday, cabinetBas
     const linkRow = await db.prepare('INSERT INTO client_links (contact_id, token_hash, created_at, expires_on) VALUES (?, ?, ?, ?) RETURNING id')
       .run(row.contact_id, hashToken(token), now(), expiresOn)
     const { subject, text } = composeClientMail(row.kind, {
-      name: target.name, link: `${cabinetBaseUrl}/#/c/${token}`, number: params.number, stage: params.stage, until: params.until, guideUrl: String(env.CLIENT_GUIDE_URL || '').trim(),
+      name: target.name, link: `${cabinetBaseUrl}/#/c/${token}`, number: params.number, stage: params.stage, until: params.until, guideUrl: String(env.CLIENT_GUIDE_URL ?? DEFAULT_GUIDE_URL).trim(),
     })
     try {
       await mailer.send({

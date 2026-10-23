@@ -190,8 +190,8 @@ CRM каждый канал можно отдельно включить и вы
 3. Сессии сайта: видео грузится на `https://s3.twcstorage.ru/nevarium-crm-photo`, в CSP `connect-src` — `https://s3.twcstorage.ru`.
 4. Письма клиенту («Отчёт готов», «Пришлите фото этапа») — **выключены** до подтверждения сайта, что новая политика ПДн выложена;
    включаются в «Настройках» CRM («Письма клиентам»). Отправитель — тот же `SMTP_FROM` (Postbox) с именем «Невариум Визор», ответ на
-   `nvizor-spb@yandex.ru`; переопределить — `CLIENT_MAIL_FROM_NAME`, `CLIENT_MAIL_REPLY_TO`. `CLIENT_GUIDE_URL` — ссылка на памятку
-   «как снимать» в письме о фото этапа (не задана — этой фразы в письме нет).
+   `nvizor-spb@yandex.ru`; переопределить — `CLIENT_MAIL_FROM_NAME`, `CLIENT_MAIL_REPLY_TO`. Памятка «как снимать» в письме о фото
+   этапа — по умолчанию `https://nevarium-vizor.ru/photo-guide`; другая — `CLIENT_GUIDE_URL`, пустое значение убирает фразу.
 
 ### Запасной путь: сбросить пароль из консоли (`npm run reset-admin`)
 
