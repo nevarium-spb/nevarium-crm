@@ -117,6 +117,15 @@ CREATE TABLE IF NOT EXISTS deals (
 ALTER TABLE deals ADD COLUMN IF NOT EXISTS plan TEXT DEFAULT '';
 ALTER TABLE deals ADD COLUMN IF NOT EXISTS invoice_channel TEXT DEFAULT '';
 ALTER TABLE deals ADD COLUMN IF NOT EXISTS invoice_contact TEXT DEFAULT '';
+-- Источник заявки (ADR-027, src/shared/attribution.js): канал (код из CHANNELS, '' — не указан; сотрудник может поправить),
+-- метки utm, сайт-источник и страница входа — как прислал сайт. Метки — свободный текст с публичного приёма:
+-- обезличивание их затирает; канал и сайт-источник остаются, как стадия и сумма (иначе поедет отчёт по каналам).
+ALTER TABLE deals ADD COLUMN IF NOT EXISTS channel TEXT DEFAULT '';
+ALTER TABLE deals ADD COLUMN IF NOT EXISTS utm_source TEXT DEFAULT '';
+ALTER TABLE deals ADD COLUMN IF NOT EXISTS utm_medium TEXT DEFAULT '';
+ALTER TABLE deals ADD COLUMN IF NOT EXISTS utm_campaign TEXT DEFAULT '';
+ALTER TABLE deals ADD COLUMN IF NOT EXISTS ref_host TEXT DEFAULT '';
+ALTER TABLE deals ADD COLUMN IF NOT EXISTS landing TEXT DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS winback_sequences (
   id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -521,3 +530,31 @@ CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity, entity_id);
 CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_keys(created_at);
 CREATE INDEX IF NOT EXISTS idx_consents_contact ON consents(contact_id);
 CREATE INDEX IF NOT EXISTS idx_nvizor_free_phone ON nvizor_free_reports(phone_key);
+
+-- Посещения сайтов (ADR-027, server/analytics.js) — свой счётчик вместо Яндекс Метрики. Только СУММЫ за день по странице и
+-- источнику: ни IP, ни cookie, ни времени отдельного захода — ничего, что относится к конкретному человеку (не ПДн). views —
+-- просмотры страниц, visits — заходы (первая страница сессии вкладки). Вне дампа: статистика, не данные клиентов.
+CREATE TABLE IF NOT EXISTS site_visits (
+  project_id INTEGER NOT NULL REFERENCES projects(id),
+  day TEXT NOT NULL,
+  path TEXT NOT NULL DEFAULT '',
+  channel TEXT NOT NULL DEFAULT '',
+  ref_host TEXT NOT NULL DEFAULT '',
+  utm_source TEXT NOT NULL DEFAULT '',
+  utm_campaign TEXT NOT NULL DEFAULT '',
+  views INTEGER NOT NULL DEFAULT 0,
+  visits INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (project_id, day, path, channel, ref_host, utm_source, utm_campaign)
+);
+CREATE INDEX IF NOT EXISTS idx_site_visits_day ON site_visits(project_id, day);
+
+-- Маршруты заходов (ADR-027): сколько раз за день встречался маршрут «страница → страница → …» (до 10 шагов). Без метки
+-- посетителя: браузер сам помнит свой маршрут во вкладке и с каждой новой страницей сообщает его целиком; каждый заход даёт +1
+-- каждому своему началу (префиксу). «Заходов, закончившихся ровно этим маршрутом» = hits маршрута − сумма hits его продолжений.
+CREATE TABLE IF NOT EXISTS site_routes (
+  project_id INTEGER NOT NULL REFERENCES projects(id),
+  day TEXT NOT NULL,
+  route TEXT NOT NULL,
+  hits INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (project_id, day, route)
+);

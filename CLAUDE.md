@@ -16,9 +16,9 @@
   «заменено», план в `nevarium-lab#3`), фронт: React + react-router + Vite (`src/crm/`).
 - `node server/dev.js` — бэкенд :3001 (требует `DATABASE_URL` в окружении — SQLite-файла по
   умолчанию больше нет). `npm run dev` — фронт :5173 (прокси `/api`→:3001).
-- `npm test` — 456 тестов на `pg-mem` (`server/api.test.js`, `server/nvizor.test.js`, `server/merge.test.js`, `server/uploads.test.js`,
+- `npm test` — 470 тестов на `pg-mem` (`server/api.test.js`, `server/nvizor.test.js`, `server/merge.test.js`, `server/uploads.test.js`,
   `server/entitlements.test.js`, `server/account.test.js`, `server/lead-fields.test.js`, `server/photos.test.js`,
-  `server/intake.test.js`, `src/crm/neva/parser.test.js`): 449 зелёный + 7
+  `server/intake.test.js`, `server/analytics.test.js`, `src/crm/neva/parser.test.js`): 463 зелёный + 7
   намеренно пропущенных (все в `api.test.js`; сверено 2026-10-17). Пропущенные проверяют то,
   чего `pg-mem` не эмулирует: реальный откат транзакции, принадлежность запроса
   соединению (его connect() отдаёт сам пул), SQLSTATE у ошибок и ожидание блокировок.
@@ -51,6 +51,11 @@
   из `INTAKE_ALLOWED_ORIGINS`, остальным `403 intake_closed` ДО разбора тела и записи. В CRM — только вымышленные данные, поэтому
   уведомление в РКН — перед общим запуском (сайт + CRM + NVizor вместе). **Новый публичный маршрут приёма — допиши в `INTAKE_ROUTES`.**
   На запуске: «Импорт JSON» `deploy/launch-empty-dump.json`, убрать переменные (`deploy/README.md`).
+- **Свой счётчик посещений и источник заявки** (`server/analytics.js`, `src/shared/attribution.js`, ADR-027): `/nv.js` для сайтов,
+  `POST /api/collect`, страница «Аналитика». **Не ПДн — так и держать:** без cookie, IP и метки посетителя, в базе только суммы
+  за день (`site_visits`, `site_routes`); НЕ добавляй туда ни идентификатор посетителя, ни время захода, ни связь с заявкой —
+  иначе это станет ПДн (баннер, политика, РКН). Источник заявки — `deals.channel` + `utm_*`/`ref_host`/`landing` (дамп v11);
+  обезличивание стирает `utm_*` и `landing`, канал оставляет.
 - Публичные `POST /api/leads` и `POST /api/pd-requests` — приём с сайтов, общая защита
   (ADR-015, по ТЗ `nevarium_vizor/docs/CRM-REQUIREMENTS.md`): **honeypot** (поле `website`)
   для лидов — молчаливый дроп (204/успех, НЕ сохраняет и НЕ уведомляет); для ПДн-запросов —

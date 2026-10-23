@@ -7,6 +7,8 @@ const NAV = [
   { to: '/crm/deals', label: 'Сделки', icon: 'M4 4h4v16H4zM10 8h4v12h-4zM16 5h4v15h-4z' },
   { to: '/crm/contacts', label: 'Контакты', icon: 'M12 12a4 4 0 100-8 4 4 0 000 8zm0 2c-4 0-7 2-7 5v1h14v-1c0-3-3-5-7-5z' },
   { to: '/crm/tasks', label: 'Задачи', icon: 'M9 11l3 3 8-8M4 6h4M4 12h4M4 18h10' },
+  // Свой счётчик посещений сайтов и источники заявок (ADR-027).
+  { to: '/crm/analytics', label: 'Аналитика', icon: 'M4 20V10h3v10H4zm6.5 0V4h3v16h-3zM17 20v-7h3v7h-3z' },
   { to: '/crm/privacy', label: 'Права ПДн', icon: 'M12 3l7 3v6c0 4-3 7-7 9-4-2-7-5-7-9V6l7-3zm0 6a2 2 0 00-2 2v4h4v-4a2 2 0 00-2-2z' },
   // История тарифа Free приложения NVizor (ADR-016) — ПДн клиентов, только admin.
   { to: '/crm/nvizor-free', label: 'NVizor Free', adminOnly: true, icon: 'M6 3h9l4 4v14H6V3zm9 0v4h4M9 12h7M9 16h7M9 8h3' },

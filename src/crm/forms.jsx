@@ -3,6 +3,7 @@ import { repo } from './api.js'
 import { Modal, toast, apiErrorToast, emitRefresh } from './ui.jsx'
 import { STAGES } from '../shared/stages.js'
 import { LEAD_PLANS, INVOICE_CHANNELS, INVOICE_CHANNEL_LABEL, INVOICE_CONTACT_MAX, leadPlanTitle } from '../shared/lead-fields.js'
+import { CHANNELS } from '../shared/attribution.js'
 
 export { STAGES }
 export const INTERACTION_TYPES = ['звонок', 'встреча', 'письмо', 'сообщение', 'другое']
@@ -118,12 +119,20 @@ export function EntityModal({ entity, initial = {}, onSaved, onClose }) {
               </label>
               <label>Сумма, ₽<input type="number" min="0" value={values.amount ?? ''} onChange={set('amount')} /></label>
             </div>
-            <label>Тариф из заявки
-              <select value={values.plan ?? ''} onChange={set('plan')}>
-                <option value="">— не указан —</option>
-                {LEAD_PLANS.map((p) => <option key={p} value={p}>{leadPlanTitle(p)}</option>)}
-              </select>
-            </label>
+            <div className="crm-form-row">
+              <label>Тариф из заявки
+                <select value={values.plan ?? ''} onChange={set('plan')}>
+                  <option value="">— не указан —</option>
+                  {LEAD_PLANS.map((p) => <option key={p} value={p}>{leadPlanTitle(p)}</option>)}
+                </select>
+              </label>
+              <label>Откуда пришёл
+                <select value={values.channel ?? ''} onChange={set('channel')}>
+                  <option value="">— не указан —</option>
+                  {Object.entries(CHANNELS).map(([code, title]) => <option key={code} value={code}>{title}</option>)}
+                </select>
+              </label>
+            </div>
             <div className="crm-form-row">
               <label>Куда прислать счёт
                 <select value={values.invoice_channel ?? ''} onChange={set('invoice_channel')}>

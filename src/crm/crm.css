@@ -723,3 +723,35 @@
   color: var(--accent-2);
   border-color: rgba(34, 211, 238, 0.35);
 }
+
+/* ---------- Аналитика (ADR-027) ---------- */
+.an-filters { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
+.an-stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
+.an-stat { padding: 14px 16px; }
+.an-stat-label { color: var(--text-3); font-size: 12px; }
+.an-stat-value { font-size: 26px; font-weight: 700; color: var(--text-1); margin-top: 4px; }
+.an-stat-hint { color: var(--text-3); font-size: 12px; margin-top: 2px; }
+.an-days { display: flex; align-items: flex-end; gap: 2px; height: 120px; }
+.an-day { flex: 1; height: 100%; display: flex; align-items: flex-end; min-width: 2px; cursor: default; }
+.an-day-fill { width: 100%; background: var(--accent-1); border-radius: 4px 4px 0 0; min-height: 1px; }
+.an-day:hover .an-day-fill { filter: brightness(1.25); }
+.an-days-axis { display: flex; justify-content: space-between; color: var(--text-3); font-size: 12px; margin-top: 6px; }
+.an-table-wrap { overflow-x: auto; }
+.an-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.an-table th { text-align: left; color: var(--text-3); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid rgba(255, 255, 255, 0.08); white-space: nowrap; }
+.an-table td { padding: 8px; border-top: 1px solid rgba(255, 255, 255, 0.06); color: var(--text-2); white-space: nowrap; }
+.an-table td:first-child { color: var(--text-1); }
+.an-bar { display: flex; align-items: center; gap: 8px; min-width: 120px; }
+.an-bar-fill { display: block; height: 8px; background: var(--accent-1); border-radius: 0 4px 4px 0; max-width: 100px; }
+.an-bar-num { color: var(--text-1); }
+.an-route { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; min-width: 0; }
+.an-step { font-size: 12.5px; color: var(--text-2); background: rgba(255, 255, 255, 0.05); border: 1px solid var(--glass-border); border-radius: 6px; padding: 2px 6px; overflow-wrap: anywhere; }
+.an-route-part { display: inline-flex; align-items: center; gap: 4px; min-width: 0; }
+.an-arrow { color: var(--text-3); }
+.an-step.goal { color: var(--accent-2); }
+.an-key { font-size: 13px; color: var(--text-2); overflow-wrap: anywhere; min-width: 0; }
+.an-count { color: var(--text-1); font-weight: 600; white-space: nowrap; }
+@media (max-width: 900px) {
+  .an-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+.an-block { margin-bottom: 16px; }

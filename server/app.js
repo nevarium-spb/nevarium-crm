@@ -13,6 +13,8 @@ import { registerAccountRoutes, recordLogin } from './account.js'
 import { createS3, registerPhotoRoutes, queuePhotoDeletion } from './photos.js'
 import { createUploads } from './uploads.js'
 import { createIntake, INTAKE_ROUTES } from './intake.js'
+import { registerAnalyticsRoutes } from './analytics.js'
+import { CHANNEL_CODES, channelTitle, normalizeAttribution } from '../src/shared/attribution.js'
 import { runClientMailQueue } from './client-mail.js'
 import { LEAD_PLANS, INVOICE_CHANNELS, INVOICE_CONTACT_MAX, normalizeLeadPlan, normalizeInvoice, invoiceMessengerValue, invoiceLabel, leadPlanTitle } from '../src/shared/lead-fields.js'
 
@@ -29,6 +31,8 @@ export function mskToday(offsetDays = 0, nowMs = Date.now()) {
 }
 
 const trim = (v, max = 500) => String(v ?? '').trim().slice(0, max)
+// Колонки источника у сделки (ADR-027) — в том же порядке, что attrArgs в POST /api/leads.
+const ATTR_COLS = 'channel, utm_source, utm_medium, utm_campaign, ref_host, landing'
 // Тот же экранировщик, что в telegram.js (leadMessage) — уведомления
 // идут с format: 'html', и непроверенный текст в них ломает разметку. Нужен здесь
 // отдельно: kind в /api/pd-requests теперь сохраняется как прислано (см. ниже), и
@@ -183,9 +187,10 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // теряется, если идемпотентность включена, см. ниже).
   const HARD_LIMIT_WINDOW_MS = 10 * 60_000
   const HARD_LIMIT_MAX = 30
-  const hardHits = { leads: new Map(), pd_requests: new Map(), client_summary: new Map(), auth_forgot: new Map(), auth_token: new Map(), lead_photos: new Map(), client_upload: new Map() }
+  const hardHits = { leads: new Map(), pd_requests: new Map(), client_summary: new Map(), auth_forgot: new Map(), auth_token: new Map(), lead_photos: new Map(), client_upload: new Map(), site_visits: new Map() }
   // Фото: до 10 файлов на заявку, поэтому потолок на IP выше, чем у заявок (30), но тоже конечный.
-  const HARD_LIMIT_MAX_BY_SCOPE = { lead_photos: 120, client_upload: 300 }
+  // Счётчик посещений (ADR-027): каждая открытая страница — запрос; за общим IP (CGNAT) много людей.
+  const HARD_LIMIT_MAX_BY_SCOPE = { lead_photos: 120, client_upload: 300, site_visits: 600 }
   // Массив на IP держим ОГРАНИЧЕННЫМ: раз решили «уже сверх лимита», новые метки
   // времени больше не добавляем — независимая проверка нашла, что без этого сам
   // счётчик становится усилителем атаки: при затяжном флуде массив растёт на каждый
@@ -313,7 +318,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // видимость есть, приём не рвётся. Значения полей не логируем (свободный текст,
   // потенциально ПДн) — только имена ключей.
   const LEAD_FIELDS = new Set(['name', 'contact', 'task', 'note', 'source', 'website', 'consent', 'project', 'request_id', 'scale', 'detail', 'transcript',
-    'plan', 'invoice_channel', 'invoice_contact'])
+    'plan', 'invoice_channel', 'invoice_contact', 'attribution'])
   const PD_REQUEST_FIELDS = new Set(['contact', 'kind', 'note', 'website', 'project', 'request_id'])
   const CONSENT_FIELDS = new Set(['version', 'text', 'accepted_at'])
   // Ограничения на сам лог (независимая проверка, раунд 27): ключи JSON-объекта —
@@ -832,7 +837,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       fields: ['name', 'company', 'phone', 'email', 'messenger', 'note', 'source', 'suspicious', 'archived', 'project_id', 'email_opt_out'],
       required: ['name'],
     },
-    deals: { fields: ['contact_id', 'title', 'stage', 'amount', 'note', 'project_id', 'plan', 'invoice_channel', 'invoice_contact'], required: ['contact_id', 'title'] },
+    deals: { fields: ['contact_id', 'title', 'stage', 'amount', 'note', 'project_id', 'plan', 'invoice_channel', 'invoice_contact', 'channel'], required: ['contact_id', 'title'] },
     tasks: { fields: ['title', 'contact_id', 'deal_id', 'due_date', 'done'], required: ['title'] },
     interactions: { fields: ['contact_id', 'deal_id', 'type', 'note', 'happened_at'], required: ['contact_id'] },
   }
@@ -981,6 +986,8 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
 
   /** Тариф и счёт сделки при ручной правке: только коды из списка (src/shared/lead-fields.js). Мутирует data. */
   function dealLeadFieldsError(data) {
+    // Канал (ADR-027) — только код из списка или пусто («не указан»): сотрудник правит источник, например «пришёл по рекомендации».
+    if (data.channel !== undefined && data.channel !== null && data.channel !== '' && !CHANNEL_CODES.includes(data.channel)) return 'bad_channel'
     if (data.plan !== undefined && data.plan !== null && data.plan !== '' && !LEAD_PLANS.includes(data.plan)) return 'bad_plan'
     if (data.invoice_channel !== undefined && data.invoice_channel !== null && data.invoice_channel !== '' && !INVOICE_CHANNELS.includes(data.invoice_channel)) return 'bad_invoice_channel'
     if (data.invoice_contact !== undefined) {
@@ -1443,7 +1450,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     // в миграции — дописывай её и здесь (и в тест раунд-трипа).
     const EXTRA_COLS = {
       contacts: ['suspicious', 'archived', 'anonymized_at', 'email_opt_out'],
-      deals: ['closed_at'],
+      deals: ['closed_at', 'utm_source', 'utm_medium', 'utm_campaign', 'ref_host', 'landing'],
       tasks: ['done', 'done_at', 'winback_sequence_id'],
       interactions: ['happened_at'],
     }
@@ -1866,7 +1873,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       await tx.prepare("UPDATE interactions SET note = '', updated_at = ? WHERE contact_id = ?").run(ts, contactId)
       // 3. Сделки: заметки и контакт для счёта (почта/ник/телефон — задание сайта 2026-10-16)
       //    содержат ПДн, затираем; стадия, сумма и тариф остаются — по ним статистика
-      await tx.prepare("UPDATE deals SET note = '', invoice_channel = '', invoice_contact = '', updated_at = ? WHERE contact_id = ?").run(ts, contactId)
+      await tx.prepare("UPDATE deals SET note = '', invoice_channel = '', invoice_contact = '', utm_source = '', utm_medium = '', utm_campaign = '', landing = '', updated_at = ? WHERE contact_id = ?").run(ts, contactId)
       // 4. Задачи удаляем целиком: во-первых, в заголовке может стоять имя, во-вторых,
       //    человек потребовал прекратить обработку — напоминание «позвонить ему» этому
       //    прямо противоречит. Вместе с ними закрываем воронку возврата.
@@ -2271,6 +2278,9 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // Режим приёма (ADR-026) — для плашки «Приём закрыт (стенд)» в «Настройках». Счётчик отказов — в памяти, с запуска процесса.
   app.get('/api/crm/intake', async () => intake.status())
 
+  // Свой счётчик посещений (/nv.js, /api/collect) и отчёт «Аналитика» (ADR-027).
+  registerAnalyticsRoutes(app, { db, audit, mskToday, hardRateLimited, projectByOrigin, resolveProjectId, paidStage: 'Оплачено' })
+
   // ---------- публичный приём лидов ----------
   // Единственная точка без авторизации, поэтому CORS ровно для неё и строго по
   // списку origins проектов (+ localhost в dev). Без этого браузер не даст сайтам
@@ -2446,6 +2456,9 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       const invMessenger = invoiceMessengerValue(invoice.channel, invoice.contact)
       const invLine = invoice.channel ? `Счёт: ${invoiceLabel(invoice.channel, invoice.contact)}` : ''
       const planLine = leadPlan.plan ? `Тариф: ${leadPlanTitle(leadPlan.plan)}` : ''
+      // Откуда пришёл человек (ADR-027): сайт берёт из window.nvAttribution() счётчика. Нет — канал пустой («не указан»).
+      const attr = normalizeAttribution(b.attribution)
+      const attrArgs = [attr.channel, attr.utm_source, attr.utm_medium, attr.utm_campaign, attr.ref_host, attr.landing]
       // Слепок согласия (ТЗ сайта Визор, раздел «Про consent»; 152-ФЗ ст.9 в редакции
       // с 2026-09-01 требует, чтобы оператор МОГ ДОКАЗАТЬ согласие). Сайт шлёт
       // {version, text, accepted_at} в каждой заявке — сохраняем как прислано, без
@@ -2549,8 +2562,9 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         const dealNote = invoiceOverflow ? [note, invLine].filter(Boolean).join('\n') : note
         const cid = (await tx.prepare('INSERT INTO contacts (name, email, phone, messenger, note, source, suspicious, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id')
           .run(name, email, phone, messenger, '', isChat ? 'site-chat' : 'site-form', suspicious ? 1 : 0, projectId, ts, ts)).lastInsertRowid
-        const did = (await tx.prepare('INSERT INTO deals (contact_id, title, stage, note, project_id, plan, invoice_channel, invoice_contact, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id')
-          .run(cid, title, 'Новый', dealNote, projectId, leadPlan.plan, invoice.channel, invoice.contact, ts, ts)).lastInsertRowid
+        const did = (await tx.prepare(`INSERT INTO deals (contact_id, title, stage, note, project_id, plan, invoice_channel, invoice_contact, ${ATTR_COLS}, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`)
+          .run(cid, title, 'Новый', dealNote, projectId, leadPlan.plan, invoice.channel, invoice.contact, ...attrArgs, ts, ts)).lastInsertRowid
         if (transcript) {
           await tx.prepare('INSERT INTO interactions (contact_id, type, note, happened_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(cid, 'сообщение', transcript, ts, ts, ts)
         }
@@ -2579,10 +2593,16 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
           // Тариф и счёт в сделке — последние присланные; прежний тариф остаётся в истории.
           if (leadPlan.plan) await tx.prepare('UPDATE deals SET plan = ? WHERE id = ?').run(leadPlan.plan, dealId)
           if (invoice.channel) await tx.prepare('UPDATE deals SET invoice_channel = ?, invoice_contact = ? WHERE id = ?').run(invoice.channel, invoice.contact, dealId)
+          // Источник сделки — первый известный: повторная заявка его не перезаписывает, только заполняет пустой.
+          if (attr.channel) {
+            await tx.prepare("UPDATE deals SET channel = ?, utm_source = ?, utm_medium = ?, utm_campaign = ?, ref_host = ?, landing = ? WHERE id = ? AND COALESCE(channel, '') = ''")
+              .run(...attrArgs, dealId)
+          }
         } else {
           // Все сделки закрыты — человек вернулся с новой задачей, это новая сделка.
-          dealId = (await tx.prepare('INSERT INTO deals (contact_id, title, stage, note, project_id, plan, invoice_channel, invoice_contact, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id')
-            .run(cid, title, 'Новый', note, projectId, leadPlan.plan, invoice.channel, invoice.contact, ts, ts)).lastInsertRowid
+          dealId = (await tx.prepare(`INSERT INTO deals (contact_id, title, stage, note, project_id, plan, invoice_channel, invoice_contact, ${ATTR_COLS}, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`)
+            .run(cid, title, 'Новый', note, projectId, leadPlan.plan, invoice.channel, invoice.contact, ...attrArgs, ts, ts)).lastInsertRowid
         }
         const prevPlan = openDeal?.plan && leadPlan.plan && openDeal.plan !== leadPlan.plan ? `(в сделке был тариф: ${leadPlanTitle(openDeal.plan)})` : ''
 
@@ -2595,6 +2615,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
           invLine,
           note ? `Заметка: ${note}` : '',
           `Источник: ${isChat ? 'чат Невы' : 'форма на сайте'}`,
+          attr.channel ? `Откуда пришёл: ${channelTitle(attr.channel)}${attr.utm_campaign ? ` (кампания ${attr.utm_campaign})` : ''}` : '',
         ].filter(Boolean).join('\n')
         await tx.prepare('INSERT INTO interactions (contact_id, deal_id, type, note, happened_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
           .run(cid, dealId, 'сообщение', lines, ts, ts, ts)

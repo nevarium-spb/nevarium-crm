@@ -2,6 +2,7 @@
 // Режим «приём закрыт» (INTAKE_MODE=closed, ADR-026): до общего запуска сайта, CRM и NVizor данные настоящих людей в CRM
 // не попадают — публичный приём пропускает только домены стендов, остальным 403 intake_closed и НИЧЕГО не сохраняется.
 import fs from 'node:fs'
+import pg from 'pg'
 import { newDb } from 'pg-mem'
 import { afterEach, describe, expect, it } from 'vitest'
 import { buildApp } from './app.js'
@@ -30,11 +31,31 @@ function fakeS3() {
   }
 }
 
-let app, s3, cookie
+let app, s3, cookie, pool
+const REAL_PG = process.env.TEST_DATABASE_URL || ''
+let schemaSeq = 0
+// TEST_DATABASE_URL — тот же набор на настоящем Postgres, своя схема на тест (как в uploads.test.js).
+async function makePool() {
+  if (!REAL_PG) return new (newDb().adapters.createPg()).Pool()
+  const schema = `i${process.pid}_${process.env.VITEST_WORKER_ID ?? 0}_${++schemaSeq}`
+  const admin = new pg.Pool({ connectionString: REAL_PG, max: 1 })
+  await admin.query(`CREATE SCHEMA "${schema}"`)
+  await admin.end()
+  const pool = new pg.Pool({ connectionString: REAL_PG, options: `-c search_path="${schema}" -c lock_timeout=5000ms`, max: 4 })
+  pool.__schema = schema
+  return pool
+}
+async function dropPool(pool) {
+  if (!REAL_PG || !pool?.__schema) return
+  await pool.end()
+  const admin = new pg.Pool({ connectionString: REAL_PG, max: 1 })
+  await admin.query(`DROP SCHEMA "${pool.__schema}" CASCADE`)
+  await admin.end()
+}
 async function build(opts = {}) {
   resetThrottle()
   s3 = fakeS3()
-  const pool = new (newDb().adapters.createPg()).Pool()
+  pool = await makePool()
   app = await buildApp({ dbConfig: pool, secure: false, nvizorToken: TOKEN, s3, ...opts })
   await app.db.prepare('INSERT INTO users (name,email,password_hash,role,created_at) VALUES (?,?,?,?,?)')
     .run('Владелец', 'owner@example.ru', await hashPassword('password123'), 'admin', now())
@@ -43,7 +64,7 @@ async function build(opts = {}) {
   return app
 }
 const closed = () => build({ intakeMode: 'closed', intakeAllowedOrigins: ALLOWED })
-afterEach(async () => { await app?.close?.(); app = null })
+afterEach(async () => { try { await app?.close?.() } finally { await dropPool(pool); app = null; pool = null } })
 
 let seq = 0
 const lead = (origin, body = {}) => app.inject({

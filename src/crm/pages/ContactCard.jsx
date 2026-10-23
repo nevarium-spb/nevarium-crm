@@ -7,6 +7,7 @@ import { TariffBlock } from '../tariffs.jsx'
 import { MergeModal } from '../merge.jsx'
 import { UploadsBlock } from '../uploads.jsx'
 import { invoiceLabel, leadPlanTitle } from '../../shared/lead-fields.js'
+import { channelTitle } from '../../shared/attribution.js'
 import { formatBytes } from './AccountSettings.jsx'
 
 export default function ContactCard({ user }) {
@@ -143,6 +144,13 @@ export default function ContactCard({ user }) {
                     {d.plan ? `Тариф: ${leadPlanTitle(d.plan)}` : ''}
                     {d.plan && d.invoice_channel ? ' · ' : ''}
                     {d.invoice_channel ? `Счёт: ${invoiceLabel(d.invoice_channel, d.invoice_contact)}` : ''}
+                  </div>
+                )}
+                {d.channel && (
+                  <div className="row-meta">
+                    Откуда пришёл: {channelTitle(d.channel)}
+                    {d.ref_host && d.channel !== 'direct' ? ` (${d.ref_host})` : ''}
+                    {d.utm_campaign ? ` · кампания «${d.utm_campaign}»` : ''}
                   </div>
                 )}
               </div>
