@@ -2,7 +2,7 @@
 //
 // Привязка — только из кабинета по личной ссылке: клиент открывает `#/c/<ключ>`, жмёт «Привязать Яндекс ID», входит в Яндекс — CRM
 // запоминает пару «аккаунт ↔ клиент». Дальше на странице входа «Яндекс ID» открывает его кабинет без ссылки. От Яндекса нужен только
-// идентификатор аккаунта (`id`): права доступа (scope) не запрашиваются, логин, имя, почта, телефон и токены Яндекса НЕ сохраняются.
+// идентификатор аккаунта (`id`): запрашивается единственное право `login:avatar` (Яндекс не регистрирует приложение без прав; самое нейтральное), логин, имя, почта, телефон и токены Яндекса НЕ сохраняются.
 //
 // Маршруты (CORS — домены сайта, как у остальных `/api/client/*`):
 //   POST /api/client/auth/yandex/start     {intent: 'link'|'login', token?} → {url} на oauth.yandex.ru
@@ -72,6 +72,7 @@ export function registerYandexAuth(app, { db, withMutation, audit, now, mskToday
       response_type: 'code',
       client_id: config.clientId,
       redirect_uri: config.redirectUri,
+      scope: 'login:avatar',
       state,
       code_challenge: sha256url(verifier),
       code_challenge_method: 'S256',

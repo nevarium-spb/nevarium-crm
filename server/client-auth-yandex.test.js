@@ -122,7 +122,7 @@ describe('не настроено', () => {
 })
 
 describe('start', () => {
-  it('отдаёт адрес Яндекса: PKCE S256, точный redirect_uri, без scope; в базе только хеш state', async () => {
+  it('отдаёт адрес Яндекса: PKCE S256, точный redirect_uri, scope только login:avatar; в базе только хеш state', async () => {
     await vizorClient()
     const res = await post('/api/client/auth/yandex/start', { intent: 'link', token: await linkKey() })
     expect(res.statusCode).toBe(200)
@@ -131,7 +131,7 @@ describe('start', () => {
     expect(Object.fromEntries(url.searchParams)).toMatchObject({
       response_type: 'code', client_id: 'test-client-id', redirect_uri: 'https://crm-nevarium.ru/api/client/auth/yandex/callback', code_challenge_method: 'S256',
     })
-    expect(url.searchParams.has('scope')).toBe(false)
+    expect(url.searchParams.get('scope')).toBe('login:avatar')
     expect(url.searchParams.get('state').length).toBeGreaterThanOrEqual(43) // ≥ 128 бит
     const row = await app.db.prepare('SELECT * FROM oauth_states').get()
     expect(row.hash).toMatch(/^[0-9a-f]{64}$/)
