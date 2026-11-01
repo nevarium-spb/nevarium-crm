@@ -16,10 +16,10 @@
   «заменено», план в `nevarium-lab#3`), фронт: React + react-router + Vite (`src/crm/`).
 - `node server/dev.js` — бэкенд :3001 (требует `DATABASE_URL` в окружении — SQLite-файла по
   умолчанию больше нет). `npm run dev` — фронт :5173 (прокси `/api`→:3001).
-- `npm test` — 470 тестов на `pg-mem` (`server/api.test.js`, `server/nvizor.test.js`, `server/merge.test.js`, `server/uploads.test.js`,
+- `npm test` — 457 тестов на `pg-mem` (`server/api.test.js`, `server/nvizor.test.js`, `server/merge.test.js`, `server/uploads.test.js`,
   `server/entitlements.test.js`, `server/account.test.js`, `server/lead-fields.test.js`, `server/photos.test.js`,
-  `server/intake.test.js`, `server/analytics.test.js`, `src/crm/neva/parser.test.js`): 463 зелёный + 7
-  намеренно пропущенных (все в `api.test.js`; сверено 2026-10-17). Пропущенные проверяют то,
+  `server/launch-dump.test.js`, `server/analytics.test.js`, `src/crm/neva/parser.test.js`): 450 зелёный + 7
+  намеренно пропущенных (все в `api.test.js`; сверено 2026-11-01). Пропущенные проверяют то,
   чего `pg-mem` не эмулирует: реальный откат транзакции, принадлежность запроса
   соединению (его connect() отдаёт сам пул), SQLSTATE у ошибок и ожидание блокировок.
 - **`TEST_DATABASE_URL` — прогон того же набора на настоящем Postgres**, где эти семь
@@ -46,11 +46,10 @@
   заменяет `db.transaction(fn)()`; функция, уже открывшая транзакцию, обязана передать свой
   `tx` дальше явным параметром — вложенных транзакций (SAVEPOINT) адаптер не поддерживает
   (см. `anonymizeContact`, `audit()` в `app.js` — обе принимают опциональный `tx`).
-- **Приём закрыт до общего запуска** (`server/intake.js`, ADR-026, решение владельца 2026-10-23): на проде `INTAKE_MODE=closed` —
-  публичный приём данных людей (`INTAKE_ROUTES`: заявки, запросы ПДн, фото заявок, загрузки клиента) принимает только адреса стендов
-  из `INTAKE_ALLOWED_ORIGINS`, остальным `403 intake_closed` ДО разбора тела и записи. В CRM — только вымышленные данные, поэтому
-  уведомление в РКН — перед общим запуском (сайт + CRM + NVizor вместе). **Новый публичный маршрут приёма — допиши в `INTAKE_ROUTES`.**
-  На запуске: «Импорт JSON» `deploy/launch-empty-dump.json`, убрать переменные (`deploy/README.md`).
+- **Режима «приём закрыт» и стендов больше нет** (ADR-028, решение владельца 2026-11-01; был ADR-026 — не воскрешай без решения
+  владельца): публичный приём открыт для доменов из `projects.origins`. Пока РКН не подано, настоящие ПДн в CRM попадать не должны —
+  это забота владельца и порядка выкладки (сайт, CRM и NVizor — вместе), а не кода. Перед общим запуском: «Импорт JSON»
+  `deploy/launch-empty-dump.json` стирает тестовые данные (тест — `server/launch-dump.test.js`), `deploy/README.md`.
 - **Свой счётчик посещений и источник заявки** (`server/analytics.js`, `src/shared/attribution.js`, ADR-027): `/nv.js` для сайтов,
   `POST /api/collect`, страница «Аналитика». **Не ПДн — так и держать:** без cookie, IP и метки посетителя, в базе только суммы
   за день (`site_visits`, `site_routes`); НЕ добавляй туда ни идентификатор посетителя, ни время захода, ни связь с заявкой —
