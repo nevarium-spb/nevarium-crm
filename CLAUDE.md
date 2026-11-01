@@ -16,10 +16,10 @@
   «заменено», план в `nevarium-lab#3`), фронт: React + react-router + Vite (`src/crm/`).
 - `node server/dev.js` — бэкенд :3001 (требует `DATABASE_URL` в окружении — SQLite-файла по
   умолчанию больше нет). `npm run dev` — фронт :5173 (прокси `/api`→:3001).
-- `npm test` — 457 тестов на `pg-mem` (`server/api.test.js`, `server/nvizor.test.js`, `server/merge.test.js`, `server/uploads.test.js`,
+- `npm test` — 484 теста на `pg-mem` (`server/api.test.js`, `server/nvizor.test.js`, `server/merge.test.js`, `server/uploads.test.js`,
   `server/entitlements.test.js`, `server/account.test.js`, `server/lead-fields.test.js`, `server/photos.test.js`,
-  `server/launch-dump.test.js`, `server/analytics.test.js`, `src/crm/neva/parser.test.js`): 450 зелёный + 7
-  намеренно пропущенных (все в `api.test.js`; сверено 2026-11-01). Пропущенные проверяют то,
+  `server/launch-dump.test.js`, `server/analytics.test.js`, `server/client-auth-yandex.test.js`, `src/crm/neva/parser.test.js`): 477 зелёный + 7
+  намеренно пропущенных (все в `api.test.js`; сверено 2026-11-01 после слияния `feat/yandex-id`). Пропущенные проверяют то,
   чего `pg-mem` не эмулирует: реальный откат транзакции, принадлежность запроса
   соединению (его connect() отдаёт сам пул), SQLSTATE у ошибок и ожидание блокировок.
 - **`TEST_DATABASE_URL` — прогон того же набора на настоящем Postgres**, где эти семь
@@ -211,6 +211,13 @@
   настройкой `client_mail.enabled`, пока сайт не подтвердит новую политику ПДн; включает владелец.** Письмо — только имя и ссылка,
   только при адресе от клиента, согласии (`accepted_at`) и без `email_opt_out`; в очереди нет ключа ссылки. Проверка хранилища и
   CORS бакета на проде — `npm run test-s3`, `npm run test-s3 cors apply`.
+- **Вход клиента в кабинет через Яндекс ID** (`server/client-auth-yandex.js`, ADR-029, задание сайта 2026-11-01). Привязка — только из кабинета по
+  ключу ссылки; `start`/`callback`/`exchange`/`unlink` под `/api/client/auth/yandex/`. От Яндекса храним ТОЛЬКО `id` аккаунта (`client_identities.subject` —
+  ПДн: уходит с контактом при удалении и обезличивании, входит в дамп v12, переезжает при слиянии) — НЕ логин, имя, почту, токены; `code`/`state`/`ticket`/
+  токены/`id` не пишем ни в журнал, ни в лог. **Сессия кабинета — строка `client_links` с `kind='session'`** (12 часов, хеш): ключ кабинета везде разбирает
+  `resolveClientKey` (`entitlements.js`) — НЕ пиши новый SELECT по `client_links` для клиентских маршрутов, иначе забудешь про срок сессии; в карточке
+  сотрудника ссылки — только `kind='link'`. Сессия не живёт дольше доступа (`clientAccessFor`: действующий тариф или живая ссылка), «Отозвать все ссылки»
+  гасит сессии и снимает привязку. `YANDEX_OAUTH_CLIENT_ID/SECRET` — только окружение Timeweb; нет — `start` 503 и в `summary` нет поля `auth`.
 - **Слияние дублей контактов** (ADR-023, только admin): `POST /api/crm/contacts/:id/merge {from_id}`, кандидаты —
   `GET …/duplicates`. Всё, что держится за `contact_id`, переезжает по списку `MERGE_TABLES` в `server/app.js` —
   **заводишь новую таблицу со ссылкой на контакт — допиши её туда** (и в удаление/обезличивание, как раньше). Отказы:

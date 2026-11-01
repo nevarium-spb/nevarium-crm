@@ -175,6 +175,8 @@ export const DEFAULT_PROJECT_ID = 1
 export const DUMP_TABLES = ['contacts', 'deals', 'consents', 'tasks', 'interactions', 'pd_requests', 'audit_log', 'nvizor_free_reports',
   // Тарифы клиентов (v6, ADR-019): порядок важен — родители раньше детей (FK).
   'entitlements', 'entitlement_checks', 'client_links',
+  // Привязки входа клиента через Яндекс ID (v12, ADR-029): после client_links, до настроек; ссылаются на contacts.
+  'client_identities',
   // Настройки CRM (v7, ADR-020).
   'settings']
 
@@ -205,7 +207,8 @@ const DEMO_FILTERED = new Set()
  */
 // v8 (2026-10-17): у deals колонки plan/invoice_channel/invoice_contact (заявка сайта Визора).
 // v11 (2026-10-23): у deals колонки источника channel/utm_source/utm_medium/utm_campaign/ref_host/landing (ADR-027).
-export const DUMP_VERSION = 11
+// v12 (2026-11-01): таблица client_identities и колонки client_links.kind/expires_at (вход клиента через Яндекс ID, ADR-029).
+export const DUMP_VERSION = 12
 
 /**
  * Дамп — ОДИН согласованный снимок базы, не серия независимых чтений

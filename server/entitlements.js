@@ -367,6 +367,32 @@ async function objectTypeOf(runner, contactId) {
 export const hashToken = (token) => crypto.createHash('sha256').update(String(token)).digest('hex')
 export const newToken = () => crypto.randomBytes(32).toString('base64url')
 
+/**
+ * Ключ кабинета (личная ссылка ИЛИ сессия после входа через Яндекс ID, ADR-029) → строка либо null. Неверный, отозванный, истёкший
+ * (по дню Free или по сроку сессии) и обезличенный — одно и то же. Единственное место, где ключ превращается в клиента.
+ */
+export async function resolveClientKey(runner, tokenRaw, today, nowIso) {
+  const token = typeof tokenRaw === 'string' ? tokenRaw.trim() : ''
+  if (!token || token.length > 200) return null
+  return (await runner.prepare(`SELECT l.id, l.contact_id, l.expires_on, l.kind, c.name FROM client_links l JOIN contacts c ON c.id = l.contact_id
+    WHERE l.token_hash = ? AND l.revoked_at IS NULL AND (l.expires_on IS NULL OR l.expires_on >= ?) AND (l.expires_at IS NULL OR l.expires_at > ?)
+      AND c.anonymized_at IS NULL`).get(hashToken(token), today, nowIso)) || null
+}
+
+/**
+ * Есть ли у клиента доступ в кабинет сейчас — вход через Яндекс ID выдаёт сессию только при доступе (сессия не живёт дольше него).
+ * Доступ — действующий тариф (тогда без срока) либо живая ссылка (срок — самый поздний у ссылок; без срока, если хоть одна бессрочная).
+ */
+export async function clientAccessFor(runner, contactId, today) {
+  const { entitlements } = await loadClientState(runner, [contactId])
+  if (entitlements.some((e) => isActiveOn(e, today))) return { ok: true, expiresOn: null }
+  const links = await runner.prepare("SELECT expires_on FROM client_links WHERE contact_id = ? AND kind = 'link' AND revoked_at IS NULL AND (expires_on IS NULL OR expires_on >= ?)")
+    .all(contactId, today)
+  if (!links.length) return { ok: false, expiresOn: null }
+  if (links.some((l) => !l.expires_on)) return { ok: true, expiresOn: null }
+  return { ok: true, expiresOn: links.map((l) => l.expires_on).sort().pop() }
+}
+
 // Кабинет клиента Free живёт 7 календарных дней от выдачи ссылки (решение владельца
 // 2026-10-13): последний день включительно = сегодня + 6, по тому же правилу, что
 // «30 дней = оплата + 29». null — без срока (у клиента есть действующий тариф).
@@ -392,6 +418,9 @@ export async function liftLinkExpiry(tx, contactId, today) {
 /** Удаление вместе с контактом (152-ФЗ): вызывается внутри транзакции удаления/обезличивания. */
 export async function deleteEntitlementsForContact(tx, contactId, phones = []) {
   await tx.prepare('DELETE FROM client_links WHERE contact_id = ?').run(contactId)
+  // Вход через Яндекс ID (ADR-029): идентификатор аккаунта — ПДн; незавершённые входы этого клиента тоже.
+  await tx.prepare('DELETE FROM client_identities WHERE contact_id = ?').run(contactId)
+  await tx.prepare('DELETE FROM oauth_states WHERE contact_id = ?').run(contactId)
   await tx.prepare('DELETE FROM entitlement_checks WHERE contact_id = ? OR entitlement_id IN (SELECT id FROM entitlements WHERE contact_id = ?)').run(contactId, contactId)
   // Проверки «вне тарифа», пришедшие до того, как клиента завели в CRM: привязаны только ключом телефона.
   for (const key of new Set(phones.map(nvizorPhoneKey).filter(Boolean))) {
@@ -427,7 +456,8 @@ function checkInput(b) {
  */
 export function registerEntitlementRoutes(app, deps) {
   // summaryExtras — (db, contactId, today) => { upload, reports }: приём этапа и PDF-отчёты кабинета (server/uploads.js, ADR-025).
-  const { db, withMutation, audit, now, mskToday, projectId, cabinetBaseUrl, hardRateLimited, applyCors, corsPreflight, summaryExtras } = deps
+  // yandexEnabled — вход через Яндекс ID настроен (ADR-029): только тогда summary отдаёт поле `auth` (нет поля — сайт прячет блок).
+  const { db, withMutation, audit, now, mskToday, projectId, cabinetBaseUrl, hardRateLimited, applyCors, corsPreflight, summaryExtras, yandexEnabled = false } = deps
 
   // Действия с тарифами клиентов — ТОЛЬКО admin (решение владельца 2026-10-15, ADR-020; раньше —
   // любой вошедший). Чтение (карточка, значки) остаётся у всех. Сверяем канонический шаблон роута,
@@ -521,8 +551,7 @@ export function registerEntitlementRoutes(app, deps) {
     const today = mskToday()
     // Истёкшая ссылка Free — тот же 404, что неверная и отозванная (не оракул), даже
     // если ночная уборка её ещё не удалила.
-    const link = await db.prepare(`SELECT l.id, l.contact_id, l.expires_on, c.name FROM client_links l JOIN contacts c ON c.id = l.contact_id
-      WHERE l.token_hash = ? AND l.revoked_at IS NULL AND (l.expires_on IS NULL OR l.expires_on >= ?) AND c.anonymized_at IS NULL`).get(hashToken(token), today)
+    const link = await resolveClientKey(db, token, today, now())
     if (!link) return notFound()
     await db.prepare('UPDATE client_links SET last_used_at = ? WHERE id = ?').run(now(), link.id)
     const { entitlements, checks } = await loadClientState(db, [link.contact_id])
@@ -534,8 +563,12 @@ export function registerEntitlementRoutes(app, deps) {
     if (!offer && link.expires_on && !entitlements.some((e) => isActiveOn(e, today))) offer = packageOffer(objectType, 0)
     // Приём фото/видео этапа (null — не открыт) и PDF-отчёты кабинета (задание сайта 2026-10-20).
     const extras = summaryExtras ? await summaryExtras(db, link.contact_id, today) : { upload: null, reports: [] }
+    const auth = yandexEnabled
+      ? { yandex: { linked: Boolean(await db.prepare("SELECT 1 FROM client_identities WHERE contact_id = ? AND provider = 'yandex'").get(link.contact_id)) } }
+      : null
     return {
       client: { name: link.name },
+      ...(auth ? { auth } : {}),
       upload: extras.upload,
       reports: extras.reports,
       entitlements: shown.map((e) => describeEntitlement(e, checks, today)),
@@ -563,7 +596,7 @@ export function registerEntitlementRoutes(app, deps) {
     const today = mskToday()
     const { entitlements, checks } = await loadClientState(runner, [contactId])
     // Живые ссылки: не отозваны и не истекли (истёкшую Free ночная уборка ещё могла не удалить).
-    const live = await runner.prepare('SELECT created_at, expires_on, last_used_at FROM client_links WHERE contact_id = ? AND revoked_at IS NULL AND (expires_on IS NULL OR expires_on >= ?) ORDER BY id DESC')
+    const live = await runner.prepare("SELECT created_at, expires_on, last_used_at FROM client_links WHERE contact_id = ? AND kind = 'link' AND revoked_at IS NULL AND (expires_on IS NULL OR expires_on >= ?) ORDER BY id DESC")
       .all(contactId, today)
     const links = { c: live.length, last: live[0]?.created_at || null }
     return {
@@ -797,7 +830,9 @@ export function registerEntitlementRoutes(app, deps) {
     const n = await withMutation(async (tx) => {
       const res = await tx.prepare('UPDATE client_links SET revoked_at = ? WHERE contact_id = ? AND revoked_at IS NULL').run(now(), contactId)
       const count = res?.changes ?? 0
-      await audit(req, 'update', 'client_links', contactId, `ссылки в кабинет отозваны: ${count} действующих → 0`, tx)
+      // Отозвать всё = закрыть доступ полностью: привязка Яндекс ID тоже снимается, иначе по ней можно войти заново (ADR-029).
+      const unlinked = (await tx.prepare('DELETE FROM client_identities WHERE contact_id = ?').run(contactId))?.changes ?? 0
+      await audit(req, 'update', 'client_links', contactId, `ссылки в кабинет отозваны: ${count} действующих → 0${unlinked ? `; вход через Яндекс ID отвязан: ${unlinked}` : ''}`, tx)
       return count
     })
     return { ok: true, revoked: n }
@@ -850,6 +885,9 @@ export async function runEntitlementReminders(db, { withMutation, enqueue, now, 
  */
 export async function purgeExpiredClientLinks(db, { withMutation, now, today }) {
   return withMutation(async (tx) => {
+    // Истёкшие сессии входа через Яндекс ID (ADR-029) и записи входа, которые никто не довёл до конца — тихо, без журнала.
+    await tx.prepare("DELETE FROM client_links WHERE kind = 'session' AND expires_at IS NOT NULL AND expires_at < ?").run(now())
+    await tx.prepare('DELETE FROM oauth_states WHERE expires_at < ?').run(now())
     const rows = await tx.prepare('SELECT id, contact_id, expires_on FROM client_links WHERE expires_on IS NOT NULL AND expires_on < ? FOR UPDATE').all(today)
     if (!rows.length) return 0
     const ts = now()

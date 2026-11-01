@@ -8,6 +8,7 @@ import { hashPassword, verifyPassword, fakeVerifyDelay, verifyOrFake, signToken,
 import { enqueue } from './telegram.js'
 import { registerNvizorRoutes, registerNvizorAdminRoutes, deleteNvizorFreeReportsForPhone } from './nvizor.js'
 import { registerEntitlementRoutes, deleteEntitlementsForContact } from './entitlements.js'
+import { registerYandexAuth } from './client-auth-yandex.js'
 import { createMailer } from './mailer.js'
 import { registerAccountRoutes, recordLogin } from './account.js'
 import { createS3, registerPhotoRoutes, queuePhotoDeletion } from './photos.js'
@@ -172,7 +173,8 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // теряется, если идемпотентность включена, см. ниже).
   const HARD_LIMIT_WINDOW_MS = 10 * 60_000
   const HARD_LIMIT_MAX = 30
-  const hardHits = { leads: new Map(), pd_requests: new Map(), client_summary: new Map(), auth_forgot: new Map(), auth_token: new Map(), lead_photos: new Map(), client_upload: new Map(), site_visits: new Map() }
+  const hardHits = { leads: new Map(), pd_requests: new Map(), client_summary: new Map(), auth_forgot: new Map(), auth_token: new Map(), lead_photos: new Map(), client_upload: new Map(), site_visits: new Map(),
+    yandex_start: new Map(), yandex_callback: new Map(), yandex_exchange: new Map(), yandex_unlink: new Map() }
   // Фото: до 10 файлов на заявку, поэтому потолок на IP выше, чем у заявок (30), но тоже конечный.
   // Счётчик посещений (ADR-027): каждая открытая страница — запрос; за общим IP (CGNAT) много людей.
   const HARD_LIMIT_MAX_BY_SCOPE = { lead_photos: 120, client_upload: 300, site_visits: 600 }
@@ -667,8 +669,18 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     projectId: async () => (await resolveProjectId('nevarium-vizor')) || DEFAULT_PROJECT_ID,
   })
 
+  // Вход клиента в кабинет через Яндекс ID (ADR-029). Ключи приложения — только в окружении Timeweb; без них маршрут start
+  // отвечает 503, а /api/client/summary не отдаёт поле `auth` (сайт прячет блок). Адрес возврата зарегистрирован в Яндексе точно.
+  const yandexBase = String(crmBaseUrl || appOrigin || '').trim().replace(/\/+$/, '')
+  const yandexId = trim(process.env.YANDEX_OAUTH_CLIENT_ID, 200)
+  const yandexSecret = trim(process.env.YANDEX_OAUTH_CLIENT_SECRET, 300)
+  const yandexConfig = yandexId && yandexSecret && yandexBase
+    ? { clientId: yandexId, clientSecret: yandexSecret, redirectUri: `${yandexBase}/api/client/auth/yandex/callback` }
+    : null
+
   registerEntitlementRoutes(app, {
     db, withMutation, audit, now, mskToday, cabinetBaseUrl,
+    yandexEnabled: Boolean(yandexConfig),
     summaryExtras: uploads.summaryExtras,
     projectId: async () => (await resolveProjectId('nevarium-vizor')) || DEFAULT_PROJECT_ID,
     hardRateLimited,
@@ -684,6 +696,16 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         .code(204)
         .send()
     },
+  })
+
+  registerYandexAuth(app, {
+    db, withMutation, audit, now, mskToday, hardRateLimited, cabinetBaseUrl,
+    config: yandexConfig,
+    originAllowed: (origin) => leadOriginAllowed(origin),
+    applyCors: (req, reply) => applyLeadCors(req, reply),
+    corsPreflight: corsPreflightFor('content-type'),
+    // Позднее связывание: тесты подменяют globalThis.fetch, живой Яндекс им не нужен.
+    fetchImpl: (...args) => globalThis.fetch(...args),
   })
 
   // Фото объекта из формы заявки (ADR-022, задание сайта 2026-10-16, часть Б): приём по request_id
@@ -1440,7 +1462,8 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         'parent_report', 'paid_amount', 'credited_from', 'status', 'note', 'reminded_for', 'created_at', 'updated_at'],
       entitlement_checks: ['entitlement_id', 'contact_id', 'phone_key', 'record_id', 'object_ref', 'stage_code', 'kind', 'photos', 'videos', 'report_number',
         'parent_report_number', 'urgent', 'weekend', 'issued_at', 'created_at'],
-      client_links: ['contact_id', 'token_hash', 'created_at', 'revoked_at', 'last_used_at', 'expires_on'],
+      client_links: ['contact_id', 'token_hash', 'created_at', 'revoked_at', 'last_used_at', 'expires_on', 'kind', 'expires_at'],
+      client_identities: ['contact_id', 'provider', 'subject', 'created_at', 'last_login_at'],
       settings: ['key', 'value', 'updated_at', 'updated_by'],
     }
     const allowedCols = (n) =>
@@ -1507,6 +1530,9 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         // и застаёт (воркер ретраит до 20 раз). Потерять неотправленное уведомление здесь
         // дешевле, чем отправить чужие ПДн (найдено независимым ревью).
         await tx.prepare('DELETE FROM outbox').run()
+        // Незавершённые входы через Яндекс ID (ADR-029) — вне дампа и привязаны к id контактов, которые после
+        // восстановления другие: как idempotency_keys, чистятся безусловно (клиент просто нажмёт кнопку ещё раз).
+        await tx.prepare('DELETE FROM oauth_states').run()
         // Таблицы восстанавливаем те, что есть в дампе: из старого файла (v1)
         // запросы ПДн и журнал не придут, и стирать существующие мы не станем.
         // consents младше даже pd_requests: дамп может иметь pd_requests (hasCompliance),
@@ -1530,8 +1556,12 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
           .filter((n) => n !== 'consents' || hasConsents)
           .filter((n) => n !== 'nvizor_free_reports' || hasFreeReports)
           .filter((n) => !ENTITLEMENT_TABLES.includes(n) || hasEntitlements)
+          // Привязки входа через Яндекс ID (v12, ADR-029) — отдельно от ENTITLEMENT_TABLES: дамп v6–v11 их не несёт, но тарифы в нём есть.
+          .filter((n) => n !== 'client_identities' || Array.isArray(data.client_identities))
           // Настройки (v7, ADR-020) — как Free: дамп до их появления их не несёт, и текущие не стираем.
           .filter((n) => n !== 'settings' || Array.isArray(data.settings))
+        // Привязки входа — дети контактов (FK), а дамп их мог не нести: стираем до удаления контактов (id всё равно другие).
+        if (!tables.includes('client_identities')) await tx.prepare('DELETE FROM client_identities').run()
         if (!tables.includes('entitlements')) {
           for (const n of [...ENTITLEMENT_TABLES].reverse()) await tx.prepare(`DELETE FROM ${n}`).run()
         }
@@ -2126,7 +2156,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // Добавил таблицу со ссылкой на контакт — допиши её сюда (иначе удаление лишней карточки упадёт на внешнем ключе
   // либо, у таблиц без FK, запись останется висеть на несуществующем id).
   const MERGE_TABLES = ['deals', 'tasks', 'interactions', 'winback_sequences', 'pd_requests', 'consents',
-    'entitlements', 'entitlement_checks', 'client_links', 'lead_intake', 'lead_photos',
+    'entitlements', 'entitlement_checks', 'client_links', 'client_identities', 'lead_intake', 'lead_photos',
     'upload_requests', 'upload_files', 'reports', 'client_emails']
 
   // Кандидаты в дубли для карточки — теми же правилами, что дедуп при приёме заявки (findExistingContact):
@@ -2212,6 +2242,9 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       // Отчёт с тем же номером у обеих карточек: у reports уникальна пара (контакт, номер) — лишнюю копию убираем, объект в очередь.
       await tx.prepare('INSERT INTO photo_deletions (storage_key, created_at) SELECT storage_key, CAST(? AS TEXT) FROM reports WHERE contact_id = ? AND number IN (SELECT number FROM reports WHERE contact_id = ?)').run(ts, dropId, keepId)
       await tx.prepare('DELETE FROM reports WHERE contact_id = ? AND number IN (SELECT number FROM reports WHERE contact_id = ?)').run(dropId, keepId)
+      // Вход через сторонний аккаунт (ADR-029): один аккаунт у провайдера на клиента. Если привязка есть у обеих карточек —
+      // остаётся основная, присоединяемая снимается (слияние не блокируем); иначе она переезжает как есть.
+      await tx.prepare('DELETE FROM client_identities WHERE contact_id = ? AND provider IN (SELECT provider FROM client_identities WHERE contact_id = ?)').run(dropId, keepId)
       for (const table of MERGE_TABLES) {
         const res = await tx.prepare(`UPDATE ${table} SET contact_id = ? WHERE contact_id = ?`).run(keepId, dropId)
         if (res?.changes) moved[table] = res.changes

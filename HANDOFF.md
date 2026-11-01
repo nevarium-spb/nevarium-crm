@@ -107,6 +107,24 @@ Timeweb, гнать тесты на настоящем Postgres, сообщит�
 
 ---
 
+## 🔐 Вход через Яндекс ID — ветка `feat/yandex-id` (2026-11-01, ADR-029), НЕ влита и НЕ задеплоена
+
+Задание сайта: `G:\nevarium_vizor\docs\tasks\2026-11-01-crm-yandex-id.md`. Сделано в отдельном worktree `.claude/worktrees/yandex-id` от `4344f16`
+(по просьбе владельца — чтобы не мешать незакоммиченному удалению режима «приём закрыт» в основной копии). Ничего не закоммичено и не запушено.
+Правки: `server/client-auth-yandex.js` (новый), `server/client-auth-yandex.test.js` (27 тестов), `server/schema.sql`, `server/entitlements.js`,
+`server/uploads.js`, `server/app.js`, `server/db.js` (дамп v12), `docs/DECISIONS.md` (ADR-029), `CLAUDE.md`, `deploy/.env.example`.
+Тесты: **497/497 на PostgreSQL 16.15** (Docker `nevarium-pg`) и 490 + 7 пропущенных на `pg-mem`; мутации (срок сессии, одноразовость state) ловятся.
+
+**Что нужно от владельца до включения:** (1) зарегистрировать приложение на `oauth.yandex.ru` («Веб-сервисы», БЕЗ прав доступа, Callback URI
+`https://crm-nevarium.ru/api/client/auth/yandex/callback`); (2) задать в Timeweb `YANDEX_OAUTH_CLIENT_ID` и `YANDEX_OAUTH_CLIENT_SECRET` (не в чат);
+(3) политика ПДн на сайте с фразой про Яндекс ID (сессия сайта; формулировку подтверждает юрист) → только потом `VITE_YANDEX_ID=1` на сайте.
+**Перед влитием в `main`:** в основной копии лежит незакоммиченное удаление режима (ADR-028) — правит те же `app.js`, `CLAUDE.md`, `HANDOFF.md`,
+`DECISIONS.md`: ожидается слияние с мелкими конфликтами (строка `buildApp(...)`, список `hardHits`, номера тестов). После деплоя ответить сайту:
+контракт принят; сессионный ключ равноправен ключу ссылки, 12 часов; `state` 10 минут, ticket 60 с; лимиты по IP; «Отозвать все ссылки» снимает привязку;
+вход при истёкшем Free и без тарифа — `not_linked`. **Не проверено вживую:** что `login.yandex.ru/info` без прав отдаёт `id` — первый настоящий вход покажет.
+
+---
+
 ## 🧭 Где вы сейчас (карта на 2026-10-03)
 
 **Вся работа в `main`, работайте в корне репозитория `G:\nevarium-crm`.** CRM в проде:
