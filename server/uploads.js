@@ -10,7 +10,7 @@
 import crypto from 'node:crypto'
 import { Readable } from 'node:stream'
 import { FORM_GRACE_MS, PHOTO_BODY_LIMIT, PHOTO_MAX_BYTES, sniffImage } from './photos.js'
-import { addDays, contactsByPhone, hashToken, linkExpiryFor, mskDateOf, newToken } from './entitlements.js'
+import { addDays, contactsByPhone, hashToken, linkExpiryFor, mskDateOf, newToken, resolveClientKey } from './entitlements.js'
 import { enqueueClientMail } from './client-mail.js'
 import { LIMITS, STAGES } from './shared/plans.js'
 
@@ -55,10 +55,9 @@ export function createUploads({ db, s3, withMutation, audit, now, mskToday, hard
 
   /** Личная ссылка по ключу → { contact_id } либо null. Неверный, отозванный, истёкший и обезличенный — одно и то же. */
   async function clientAuth(tokenRaw, runner = db) {
-    const token = typeof tokenRaw === 'string' ? tokenRaw.trim() : ''
-    if (!token || token.length > 200) return null
-    return (await runner.prepare(`SELECT l.id link_id, l.contact_id FROM client_links l JOIN contacts c ON c.id = l.contact_id
-      WHERE l.token_hash = ? AND l.revoked_at IS NULL AND (l.expires_on IS NULL OR l.expires_on >= ?) AND c.anonymized_at IS NULL`).get(hashToken(token), mskToday())) || null
+    // Ключ ссылки или сессии после входа через Яндекс ID (ADR-029) — общий разбор в entitlements.js.
+    const row = await resolveClientKey(runner, tokenRaw, mskToday(), now())
+    return row ? { link_id: row.id, contact_id: row.contact_id } : null
   }
 
   /** Открытый приём этого клиента по id: не закрыт, срок не вышел, приём его (иначе — как будто его нет). */
