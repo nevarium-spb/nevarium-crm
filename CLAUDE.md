@@ -16,9 +16,9 @@
   «заменено», план в `nevarium-lab#3`), фронт: React + react-router + Vite (`src/crm/`).
 - `node server/dev.js` — бэкенд :3001 (требует `DATABASE_URL` в окружении — SQLite-файла по
   умолчанию больше нет). `npm run dev` — фронт :5173 (прокси `/api`→:3001).
-- `npm test` — 484 теста на `pg-mem` (`server/api.test.js`, `server/nvizor.test.js`, `server/merge.test.js`, `server/uploads.test.js`,
+- `npm test` — 511 тестов на `pg-mem` (`server/api.test.js`, `server/nvizor.test.js`, `server/merge.test.js`, `server/uploads.test.js`,
   `server/entitlements.test.js`, `server/account.test.js`, `server/lead-fields.test.js`, `server/photos.test.js`,
-  `server/launch-dump.test.js`, `server/analytics.test.js`, `server/client-auth-yandex.test.js`, `src/crm/neva/parser.test.js`): 477 зелёный + 7
+  `server/launch-dump.test.js`, `server/analytics.test.js`, `server/client-auth.test.js`, `server/client-auth-vk.test.js`, `src/crm/neva/parser.test.js`): 504 зелёный + 7
   намеренно пропущенных (все в `api.test.js`; сверено 2026-11-01 после слияния `feat/yandex-id`). Пропущенные проверяют то,
   чего `pg-mem` не эмулирует: реальный откат транзакции, принадлежность запроса
   соединению (его connect() отдаёт сам пул), SQLSTATE у ошибок и ожидание блокировок.
@@ -214,7 +214,12 @@
   настройкой `client_mail.enabled`, пока сайт не подтвердит новую политику ПДн; включает владелец.** Письмо — только имя и ссылка,
   только при адресе от клиента, согласии (`accepted_at`) и без `email_opt_out`; в очереди нет ключа ссылки. Проверка хранилища и
   CORS бакета на проде — `npm run test-s3`, `npm run test-s3 cors apply`.
-- **Вход клиента в кабинет через Яндекс ID** (`server/client-auth-yandex.js`, ADR-029, задание сайта 2026-11-01). Привязка — только из кабинета по
+- **Вход клиента в кабинет через VK ID — второй провайдер той же схемы** (ADR-031, задание сайта 2026-11-02): один модуль `server/client-auth.js` на двух
+  провайдеров (`PROVIDERS`: адрес авторизации, права, обмен кода), маршруты `/api/client/auth/vk/…`, возврат на `#/vk`. Приложение VK «Публичное» — секрета нет, в
+  окружении только `VK_OAUTH_CLIENT_ID`; хост VK — `id.vk.ru`; scope не передаётся (по умолчанию `vkid.personal_info`: имя, пол, фото, дата рождения — клиент видит это на
+  экране согласия, CRM читает только `user_id`). Обмен: `device_id` из адреса возврата + `state` обязательны, `state` в ответе сверяется. `oauth_states.provider` — значение
+  одного провайдера у другого не принимается. Новый провайдер = запись в `PROVIDERS` + настройка в `buildApp` + строка в `authProviders`; идентификатор аккаунта VK — тоже ПДн.
+- **Вход клиента в кабинет через Яндекс ID** (`server/client-auth.js`, ADR-029, задание сайта 2026-11-01). Привязка — только из кабинета по
   ключу ссылки; `start`/`callback`/`exchange`/`unlink` под `/api/client/auth/yandex/`. От Яндекса храним ТОЛЬКО `id` аккаунта (`client_identities.subject` —
   ПДн: уходит с контактом при удалении и обезличивании, входит в дамп v12, переезжает при слиянии) — НЕ логин, имя, почту, токены; `code`/`state`/`ticket`/
   токены/`id` не пишем ни в журнал, ни в лог. **Сессия кабинета — строка `client_links` с `kind='session'`** (12 часов, хеш): ключ кабинета везде разбирает

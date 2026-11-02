@@ -456,8 +456,8 @@ function checkInput(b) {
  */
 export function registerEntitlementRoutes(app, deps) {
   // summaryExtras — (db, contactId, today) => { upload, reports }: приём этапа и PDF-отчёты кабинета (server/uploads.js, ADR-025).
-  // yandexEnabled — вход через Яндекс ID настроен (ADR-029): только тогда summary отдаёт поле `auth` (нет поля — сайт прячет блок).
-  const { db, withMutation, audit, now, mskToday, projectId, cabinetBaseUrl, hardRateLimited, applyCors, corsPreflight, summaryExtras, yandexEnabled = false } = deps
+  // authProviders — настроенные провайдеры входа клиента ('yandex' ADR-029, 'vk' ADR-031): summary отдаёт поле `auth` только для них (нет поля — сайт прячет блок).
+  const { db, withMutation, audit, now, mskToday, projectId, cabinetBaseUrl, hardRateLimited, applyCors, corsPreflight, summaryExtras, authProviders = [] } = deps
 
   // Действия с тарифами клиентов — ТОЛЬКО admin (решение владельца 2026-10-15, ADR-020; раньше —
   // любой вошедший). Чтение (карточка, значки) остаётся у всех. Сверяем канонический шаблон роута,
@@ -563,8 +563,9 @@ export function registerEntitlementRoutes(app, deps) {
     if (!offer && link.expires_on && !entitlements.some((e) => isActiveOn(e, today))) offer = packageOffer(objectType, 0)
     // Приём фото/видео этапа (null — не открыт) и PDF-отчёты кабинета (задание сайта 2026-10-20).
     const extras = summaryExtras ? await summaryExtras(db, link.contact_id, today) : { upload: null, reports: [] }
-    const auth = yandexEnabled
-      ? { yandex: { linked: Boolean(await db.prepare("SELECT 1 FROM client_identities WHERE contact_id = ? AND provider = 'yandex'").get(link.contact_id)) } }
+    // Поле `auth.<провайдер>` есть только у настроенных; нет поля — сайт прячет блок этого провайдера.
+    const auth = authProviders.length
+      ? Object.fromEntries(await Promise.all(authProviders.map(async (p) => [p, { linked: Boolean(await db.prepare('SELECT 1 FROM client_identities WHERE contact_id = ? AND provider = ?').get(link.contact_id, p)) }])))
       : null
     return {
       client: { name: link.name },
