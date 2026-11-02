@@ -306,6 +306,8 @@ CREATE TABLE IF NOT EXISTS oauth_states (
   created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL
 );
+-- Провайдер входа (yandex | vk, ADR-031): значение из потока одного провайдера у другого не принимается. Пустое — записи до ADR-031, живут минуты.
+ALTER TABLE oauth_states ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT '';
 
 -- Фото объекта из формы заявки сайта Визора (ADR-022). Файлы — в приватном бакете S3 Timeweb, здесь только
 -- описание; в дамп НЕ входят (файлы слишком велики), а импорт дампа удаляет все фото (id контактов

@@ -8,7 +8,7 @@ import { hashPassword, verifyPassword, fakeVerifyDelay, verifyOrFake, signToken,
 import { enqueue } from './telegram.js'
 import { registerNvizorRoutes, registerNvizorAdminRoutes, deleteNvizorFreeReportsForPhone } from './nvizor.js'
 import { registerEntitlementRoutes, deleteEntitlementsForContact } from './entitlements.js'
-import { registerYandexAuth } from './client-auth-yandex.js'
+import { registerYandexAuth, registerVkAuth } from './client-auth.js'
 import { createMailer } from './mailer.js'
 import { registerAccountRoutes, recordLogin } from './account.js'
 import { createS3, registerPhotoRoutes, queuePhotoDeletion } from './photos.js'
@@ -189,7 +189,8 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   const HARD_LIMIT_WINDOW_MS = 10 * 60_000
   const HARD_LIMIT_MAX = 30
   const hardHits = { leads: new Map(), pd_requests: new Map(), client_summary: new Map(), auth_forgot: new Map(), auth_token: new Map(), lead_photos: new Map(), client_upload: new Map(), site_visits: new Map(),
-    yandex_start: new Map(), yandex_callback: new Map(), yandex_exchange: new Map(), yandex_unlink: new Map() }
+    yandex_start: new Map(), yandex_callback: new Map(), yandex_exchange: new Map(), yandex_unlink: new Map(),
+    vk_start: new Map(), vk_callback: new Map(), vk_exchange: new Map(), vk_unlink: new Map() }
   // Фото: до 10 файлов на заявку, поэтому потолок на IP выше, чем у заявок (30), но тоже конечный.
   // Счётчик посещений (ADR-027): каждая открытая страница — запрос; за общим IP (CGNAT) много людей.
   const HARD_LIMIT_MAX_BY_SCOPE = { lead_photos: 120, client_upload: 300, site_visits: 600 }
@@ -692,10 +693,15 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   const yandexConfig = yandexId && yandexSecret && yandexBase
     ? { clientId: yandexId, clientSecret: yandexSecret, redirectUri: `${yandexBase}/api/client/auth/yandex/callback` }
     : null
+  // VK ID (ADR-031): приложение «Публичное» — секрета при обмене кода нет, нужен только ID приложения. Адрес возврата зарегистрирован в VK точно.
+  const vkId = trim(process.env.VK_OAUTH_CLIENT_ID, 200)
+  const vkConfig = vkId && yandexBase
+    ? { clientId: vkId, redirectUri: `${yandexBase}/api/client/auth/vk/callback` }
+    : null
 
   registerEntitlementRoutes(app, {
     db, withMutation, audit, now, mskToday, cabinetBaseUrl,
-    yandexEnabled: Boolean(yandexConfig),
+    authProviders: [yandexConfig && 'yandex', vkConfig && 'vk'].filter(Boolean),
     summaryExtras: uploads.summaryExtras,
     projectId: async () => (await resolveProjectId('nevarium-vizor')) || DEFAULT_PROJECT_ID,
     hardRateLimited,
@@ -713,15 +719,16 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
     },
   })
 
-  registerYandexAuth(app, {
+  const clientAuthDeps = {
     db, withMutation, audit, now, mskToday, hardRateLimited, cabinetBaseUrl,
-    config: yandexConfig,
     originAllowed: (origin) => leadOriginAllowed(origin),
     applyCors: (req, reply) => applyLeadCors(req, reply),
     corsPreflight: corsPreflightFor('content-type'),
-    // Позднее связывание: тесты подменяют globalThis.fetch, живой Яндекс им не нужен.
+    // Позднее связывание: тесты подменяют globalThis.fetch, живой провайдер им не нужен.
     fetchImpl: (...args) => globalThis.fetch(...args),
-  })
+  }
+  registerYandexAuth(app, { ...clientAuthDeps, config: yandexConfig })
+  registerVkAuth(app, { ...clientAuthDeps, config: vkConfig })
 
   // Фото объекта из формы заявки (ADR-022, задание сайта 2026-10-16, часть Б): приём по request_id
   // заявки (окно 60 минут), хранение в приватном S3, просмотр — только вошедшим.
