@@ -36,6 +36,9 @@
 - `server/app.js` — `buildApp()`: все роуты. **Generic CRUD** через конфиг `ENTITIES`
   (contacts/deals/tasks/interactions): добавление поля в `fields` протаскивает его через
   create/list/update автоматически — этим дёшево добавляется мультипроектность.
+- **Режим «приём закрыт» возвращён (ADR-030, решение владельца 2026-11-02; был удалён ADR-028):** `INTAKE_MODE=closed` — `server/intake.js`,
+  публичные маршруты приёма (`INTAKE_ROUTES`: заявки, запросы ПДн, фото, загрузки клиента) принимают только `Origin` из `INTAKE_ALLOWED_ORIGINS`, иначе 403
+  `intake_closed`. Без переменной приём открыт для `projects.origins`. Новый публичный маршрут приёма данных людей — допиши в `INTAKE_ROUTES`.
 - `server/db.js` — `openDb()` применяет `server/schema.sql` (одна цельная, идемпотентная
   схема — не массив миграций: перевод на Postgres убрал понятие «применить только
   недостающее», см. ADR-003) и сидирует `projects`. Новое поле/таблица = правь `schema.sql`

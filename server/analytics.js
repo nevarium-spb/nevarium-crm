@@ -1,6 +1,7 @@
 // Свой счётчик посещений сайтов и отчёт «канал → посещения → заявки → оплаты» (ADR-027) — вместо Яндекс Метрики.
 // Без cookie и без IP: скрипт /nv.js помнит источник захода в sessionStorage вкладки и шлёт только страницу и источник;
-// сервер хранит СУММЫ за день (site_visits), а не отдельные заходы. Ничего из этого не относится к конкретному человеку.
+// сервер хранит СУММЫ за день (site_visits), а не отдельные заходы. Ничего из этого не относится к конкретному человеку,
+// поэтому /api/collect не входит в INTAKE_ROUTES (ADR-026): режим «приём закрыт» его не трогает.
 import { cleanPath, cleanTag, normalizeAttribution } from '../src/shared/attribution.js'
 
 // Потолок строк на проект за день: случайные адреса и метки от бота не должны растить таблицу без предела.
@@ -162,7 +163,7 @@ export function registerAnalyticsRoutes(app, { db, audit, mskToday, hardRateLimi
     .send(COUNTER_JS))
 
   // Скрипт шлёт text/plain в режиме no-cors (без предварительного запроса), ответ ему не нужен — всегда 204.
-  // Чужой домен, бот, мусор — молча не считаем. Проект — только по Origin (projects.origins).
+  // Чужой домен, бот, мусор — молча не считаем. Проект — только по Origin (projects.origins или стенд, ADR-026).
   app.post('/api/collect', { bodyLimit: 4096 }, async (req, reply) => {
     reply.code(204)
     if (hardRateLimited('site_visits', req.ip)) return reply.send()

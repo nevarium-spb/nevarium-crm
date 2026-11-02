@@ -109,6 +109,12 @@ describe('счётчик посещений: /nv.js и /api/collect', () => {
     expect(await visits()).toEqual([])
   })
 
+  it('режим «приём закрыт» счётчик не трогает: данных людей в нём нет', async () => {
+    await build({ intakeMode: 'closed', intakeAllowedOrigins: '' })
+    await collect({ path: '/', attribution: TG, first: true })
+    expect((await visits()).length).toBe(1)
+  })
+
   it('сверх потолка строк за день новые сочетания складываются в «(прочее)»', async () => {
     await build()
     const day = '2026-10-23'
