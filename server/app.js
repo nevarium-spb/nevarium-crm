@@ -17,7 +17,7 @@ import { createIntake, INTAKE_ROUTES } from './intake.js'
 import { registerAnalyticsRoutes } from './analytics.js'
 import { CHANNEL_CODES, channelTitle, normalizeAttribution } from '../src/shared/attribution.js'
 import { runClientMailQueue } from './client-mail.js'
-import { LEAD_PLANS, INVOICE_CHANNELS, INVOICE_CONTACT_MAX, normalizeLeadPlan, normalizeInvoice, invoiceMessengerValue, invoiceLabel, leadPlanTitle } from '../src/shared/lead-fields.js'
+import { LEAD_PLANS, INVOICE_CHANNELS, INVOICE_CONTACT_MAX, normalizeLeadPlan, normalizeInvoice, normalizeLeadEmail, invoiceMessengerValue, invoiceLabel, leadPlanTitle } from '../src/shared/lead-fields.js'
 
 const COOKIE = 'nv_session'
 const MSK = 'Europe/Moscow'
@@ -51,6 +51,9 @@ const TRUST_PROXY = Number(process.env.TRUST_PROXY_HOPS) || 1
 // единственного правильного значения нет — там остаётся прежний, менее строгий
 // путь сравнения с X-Forwarded-Host.
 const APP_ORIGIN = trim(process.env.APP_ORIGIN, 300) || null
+
+// Потолок заметки заявки из формы сайта (символов). Чат (`detail`) остаётся на 1000.
+const LEAD_NOTE_MAX = 2000
 
 // Ключ настольного приложения NVizor для /api/nvizor/* (server/nvizor.js). Не задан —
 // эти эндпоинты отвечают 503. Задаётся в настройках деплоя, как APP_ORIGIN.
@@ -321,7 +324,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
   // видимость есть, приём не рвётся. Значения полей не логируем (свободный текст,
   // потенциально ПДн) — только имена ключей.
   const LEAD_FIELDS = new Set(['name', 'contact', 'task', 'note', 'source', 'website', 'consent', 'project', 'request_id', 'scale', 'detail', 'transcript',
-    'plan', 'invoice_channel', 'invoice_contact', 'attribution'])
+    'plan', 'invoice_channel', 'invoice_contact', 'attribution', 'email'])
   const PD_REQUEST_FIELDS = new Set(['contact', 'kind', 'note', 'website', 'project', 'request_id'])
   const CONSENT_FIELDS = new Set(['version', 'text', 'accepted_at'])
   // Ограничения на сам лог (независимая проверка, раунд 27): ключи JSON-объекта —
@@ -2480,7 +2483,13 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
       const isChat = b.source === 'chat' || (!b.name && b.detail !== undefined)
       const name = trim(b.name, 200) || (contactInfo ? contactInfo.split(/[,;]/)[0].trim() : '') || 'Без имени'
       const title = isChat ? trim(b.task, 300) || 'Заявка из чата' : [trim(b.task, 200), b.scale ? `масштаб: ${trim(b.scale, 100)}` : ''].filter(Boolean).join(', ') || 'Заявка с сайта'
-      const note = isChat ? trim(b.detail, 1000) : trim(b.note, 1000)
+      // Форма сайта шлёт сводку мастера расчёта плюс комментарий — не помещались в 1000 (задание сайта Tectum 2026-11-19, ADR-032).
+      const note = isChat ? trim(b.detail, 1000) : trim(b.note, LEAD_NOTE_MAX)
+      // Второй контакт: почта рядом с телефоном в `contact` (необязательное поле `email`). В лог — только факт, не адрес (ПДн).
+      const leadEmailIn = normalizeLeadEmail(b.email)
+      if (leadEmailIn.warn) app.log?.warn?.({ field: 'email' }, 'lead: почта отброшена — не похожа на адрес')
+      const leadEmail = leadEmailIn.email
+      const leadEmailLine = leadEmail ? `E-mail: ${leadEmail}` : ''
       // Полная переписка с «Невой» — отдельной записью во взаимодействия, а не в note
       // сделки: так карточка сделки остаётся короткой сутью, а весь диалог всё равно
       // виден на карточке контакта. ПДн тут можно — CRM на РФ-сервере, доступ только у сотрудников.
@@ -2597,9 +2606,12 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         // Контакт для счёта — в карточку, если поле пустое; занято другим — не затираем,
         // а дописываем в заметку заявки (задание сайта 2026-10-16, п. 2).
         let invoiceOverflow = false
+        // Почта из поля `email` — раньше контакта для счёта; уже занята другой почтой (контакт — почта) — строкой в заметку сделки.
+        let emailOverflow = false
+        if (leadEmail) { if (!email) email = leadEmail; else if (email.toLowerCase() !== leadEmail) emailOverflow = true }
         if (invEmail) { if (!email) email = invEmail; else if (email.toLowerCase() !== invEmail) invoiceOverflow = true }
         if (invMessenger) { if (!messenger) messenger = invMessenger; else if (messenger !== invMessenger) invoiceOverflow = true }
-        const dealNote = invoiceOverflow ? [note, invLine].filter(Boolean).join('\n') : note
+        const dealNote = invoiceOverflow || emailOverflow ? [note, invoiceOverflow ? invLine : '', emailOverflow ? leadEmailLine : ''].filter(Boolean).join('\n') : note
         const cid = (await tx.prepare('INSERT INTO contacts (name, email, phone, messenger, note, source, suspicious, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id')
           .run(name, email, phone, messenger, '', isChat ? 'site-chat' : 'site-form', suspicious ? 1 : 0, projectId, ts, ts)).lastInsertRowid
         const did = (await tx.prepare(`INSERT INTO deals (contact_id, title, stage, note, project_id, plan, invoice_channel, invoice_contact, ${ATTR_COLS}, created_at, updated_at)
@@ -2617,6 +2629,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
         else await tx.prepare('UPDATE contacts SET updated_at = ? WHERE id = ?').run(ts, cid)
         // Контакт для счёта — в пустые поля карточки; занятые не трогаем (строка «Счёт:»
         // всё равно попадает в историю ниже и в саму сделку).
+        if (leadEmail && !existing.email) await tx.prepare("UPDATE contacts SET email = ? WHERE id = ? AND COALESCE(email, '') = ''").run(leadEmail, cid)
         if (invEmail && !existing.email) await tx.prepare("UPDATE contacts SET email = ? WHERE id = ? AND COALESCE(email, '') = ''").run(invEmail, cid)
         if (invMessenger && !existing.messenger) await tx.prepare("UPDATE contacts SET messenger = ? WHERE id = ? AND COALESCE(messenger, '') = ''").run(invMessenger, cid)
 
@@ -2653,6 +2666,7 @@ export async function buildApp({ dbConfig, secret = 'dev-secret', secure = true,
           title ? `Задача: ${title}` : '',
           planLine ? `${planLine}${prevPlan ? ` ${prevPlan}` : ''}` : '',
           invLine,
+          leadEmailLine,
           note ? `Заметка: ${note}` : '',
           `Источник: ${isChat ? 'чат Невы' : 'форма на сайте'}`,
           attr.channel ? `Откуда пришёл: ${channelTitle(attr.channel)}${attr.utm_campaign ? ` (кампания ${attr.utm_campaign})` : ''}` : '',

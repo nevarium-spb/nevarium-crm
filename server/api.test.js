@@ -2455,10 +2455,10 @@ describe('мультипроектность', () => {
   // которые они попутно проверяли (проекты сидируются, seed-данные на месте),
   // покрыты тестом «список проектов отдаёт оба бизнеса» ниже и сидом в db.js.
 
-  it('список проектов отдаёт оба бизнеса', async () => {
+  it('список проектов отдаёт все три сайта', async () => {
     const res = await app.inject({ method: 'GET', url: '/api/crm/projects', headers: { cookie } })
     expect(res.statusCode).toBe(200)
-    expect(JSON.parse(res.body).items.map((p) => p.slug)).toEqual(['nevarium1', 'nevarium-vizor'])
+    expect(JSON.parse(res.body).items.map((p) => p.slug)).toEqual(['nevarium1', 'nevarium-vizor', 'nevarium-tectum'])
   })
 
   it('фильтр отдаёт только свой проект, «all» — всё', async () => {

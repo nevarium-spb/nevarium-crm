@@ -40,6 +40,9 @@ export const LOCK_WAIT_MS = 10000
 const SEED_PROJECTS = [
   { id: 1, slug: 'nevarium1', displayName: 'Невариум Лаб ИИ', origins: 'https://nevarium-lab.ru,https://www.nevarium-lab.ru,https://nevarium1.vercel.app' },
   { id: 2, slug: 'nevarium-vizor', displayName: 'Невариум Визор', origins: 'https://nevarium-vizor.ru,https://www.nevarium-vizor.ru' },
+  // Третий сайт оператора (задание 2026-11-19, ADR-032). Домены пустые: стенд находится по INTAKE_ALLOWED_ORIGINS=…=nevarium-tectum,
+  // боевой домен владелец назовёт отдельно.
+  { id: 3, slug: 'nevarium-tectum', displayName: 'Nevarium Tectum', origins: '' },
 ]
 
 /**
@@ -94,20 +97,33 @@ export async function openDb(dbConfig) {
   // сид был одним INSERT-ом с двумя строками внутри транзакции миграции, то есть
   // атомарным даром; при переводе на pg эта атомарность потерялась и её нужно
   // вернуть явно.
-  const existing = await db.prepare('SELECT COUNT(*) c FROM projects').get()
-  if (Number(existing.c) === 0) {
-    const ts = now()
-    await withTransaction(pool, async (tx) => {
-      for (const p of SEED_PROJECTS) {
-        await tx
-          .prepare('INSERT INTO projects (id, slug, display_name, origins, created_at) VALUES (?, ?, ?, ?, ?)')
-          .run(p.id, p.slug, p.displayName, p.origins, ts)
-      }
-    })
-    await resyncIdentitySequence(pool, 'projects')
-  }
+  // Не «только в пустой таблице», а «каждый недостающий проект по slug» (ADR-032): на проде таблица уже заполнена,
+  // и новый сайт иначе не появился бы вовсе. Существующие строки не трогаем (переименованный, заархивированный
+  // проект и правки origins остаются как есть). id — из сида, если свободен, иначе следующий за максимальным
+  // (явно, а не через IDENTITY: pg-mem не двигает счётчик после явных id; на Postgres resync ниже подстраховывает).
+  await ensureSeedProjects(db, pool)
 
   return db
+}
+
+/** Добавляет недостающие проекты из SEED_PROJECTS (см. комментарий в openDb). Отдельной функцией — чтобы тест мог вызвать её на «старой» базе. */
+export async function ensureSeedProjects(db, pool) {
+  const have = await db.prepare('SELECT slug FROM projects').all()
+  const haveSlugs = new Set(have.map((r) => r.slug))
+  const missing = SEED_PROJECTS.filter((p) => !haveSlugs.has(p.slug))
+  if (missing.length === 0) return []
+  const ts = now()
+  await withTransaction(pool, async (tx) => {
+    for (const p of missing) {
+      const taken = await tx.prepare('SELECT id FROM projects WHERE id = ?').get(p.id)
+      const id = taken ? Number((await tx.prepare('SELECT MAX(id) m FROM projects').get()).m) + 1 : p.id
+      await tx
+        .prepare('INSERT INTO projects (id, slug, display_name, origins, created_at) VALUES (?, ?, ?, ?, ?)')
+        .run(id, p.slug, p.displayName, p.origins, ts)
+    }
+  })
+  await resyncIdentitySequence(pool, 'projects')
+  return missing.map((p) => p.slug)
 }
 
 export function now() {

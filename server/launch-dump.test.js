@@ -92,7 +92,7 @@ describe('очистка тестовых данных на общем запу�
     // В журнале — ровно одна запись: сама очистка.
     expect((await app.db.prepare('SELECT action FROM audit_log').all()).map((r) => r.action)).toEqual(['import'])
     expect(await count('users')).toBe(1)
-    expect(await count('projects')).toBe(2)
+    expect(await count('projects')).toBe(3)
     expect(await count('settings')).toBe(settingsBefore)
     // Объект фото — в очереди на удаление из бакета (фоновый проход), строки уже нет.
     expect(await count('photo_deletions')).toBe(1)
