@@ -44,6 +44,21 @@ export function normalizeInvoice(channelRaw, contactRaw) {
   return { channel, contact: channel === 'email' ? contactIn.toLowerCase() : contactIn }
 }
 
+/** Потолок длины адреса почты (RFC 5321). */
+export const LEAD_EMAIL_MAX = 254
+
+/**
+ * Необязательный второй контакт заявки — почта рядом с `contact` (задание сайта Tectum 2026-11-19, ADR-032).
+ * Проверка та же, что у почты в `contact`: «что-то@что-то.что-то» без пробелов; в нижний регистр.
+ * Кривое значение — не отказ (заявку не отвергаем), а пустая строка + `warn` (значение в лог не пишем — это ПДн).
+ */
+export function normalizeLeadEmail(raw) {
+  if (raw === undefined || raw === null || raw === '') return { email: '' }
+  const s = typeof raw === 'string' ? raw.trim().toLowerCase() : ''
+  if (s && s.length <= LEAD_EMAIL_MAX && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(s)) return { email: s }
+  return { email: '', warn: 'invalid_email' }
+}
+
 /** «Telegram: @nick» / «MAX: +7…» / «WhatsApp: +7…» — формат поля «Мессенджер» контакта. */
 export function invoiceMessengerValue(channel, contact) {
   return channel && channel !== 'email' && contact ? `${INVOICE_CHANNEL_LABEL[channel]}: ${contact}` : ''
