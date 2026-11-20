@@ -29,6 +29,7 @@ export const COUNTER_JS = `/* Счётчик посещений Невариум
   function page() {
     var h = (location.hash || '').split('?')[0]
     if (/^#\\/c(\\/|$)/.test(h)) h = '#/c'
+    if (h.indexOf('#/') !== 0 || h === '#/') h = '' // простой якорь (#master) — не страница
     return location.pathname + h
   }
   function params() {

@@ -64,7 +64,11 @@ describe('источник: нормализация (общая для серв
     expect(channelOf({})).toBe('direct')
     expect(cleanHost('https://www.T.me/some/path?x=1')).toBe('t.me')
     expect(cleanHost('not a host')).toBe('')
-    expect(cleanPath('/tariffs?phone=79001234567#x')).toBe('/tariffs#x')
+    expect(cleanPath('/tariffs?phone=79001234567#x')).toBe('/tariffs')
+    // Простой якорь — не страница; маршрут вида #/… (сайт Визора) сохраняется.
+    expect(cleanPath('/raschet/#master')).toBe('/raschet/')
+    expect(cleanPath('/raschet/#')).toBe('/raschet/')
+    expect(cleanPath('/#/tariffs')).toBe('/#/tariffs')
     // Ключ личной ссылки кабинета не оседает нигде.
     expect(cleanPath('/#/c/SECRETKEY123')).toBe('/#/c')
     expect(cleanPath('https://evil')).toBe('')
